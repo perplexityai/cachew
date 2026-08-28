@@ -81,6 +81,26 @@ artifactory "example.jfrog.io" {
 }
 ```
 
+### AWS CodeArtifact
+
+Proxies read-only package requests to an AWS CodeArtifact repository. Cachew
+assumes the configured IAM role and refreshes CodeArtifact authorization tokens
+without exposing them to clients. Requests use host-based routing.
+
+```hcl
+codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
+  target       = "https://example-111122223333.d.codeartifact.us-east-1.amazonaws.com"
+  domain       = "example"
+  domain-owner = "111122223333"
+  region       = "us-east-1"
+  role-arn     = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
+}
+```
+
+The role needs `codeartifact:GetAuthorizationToken` and its underlying principal
+needs `sts:GetServiceBearerToken`. Repository read permissions remain governed by
+the CodeArtifact resource policy.
+
 ### Host
 
 Generic reverse-proxy caching for arbitrary HTTP hosts, with optional custom headers.
