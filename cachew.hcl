@@ -3,6 +3,15 @@
 #   target = "https://example.jfrog.io"
 # }
 
+# Authenticated read-only AWS CodeArtifact proxy strategy
+# strategy codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
+#   target       = "https://example-111122223333.d.codeartifact.us-east-1.amazonaws.com"
+#   domain       = "example"
+#   domain-owner = "111122223333"
+#   region       = "us-east-1"
+#   role-arn     = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
+# }
+
 state = "./state"
 url = "http://127.0.0.1:8080"
 log {

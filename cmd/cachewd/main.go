@@ -266,6 +266,7 @@ func newRegistries(
 	sr := strategy.NewRegistry()
 	strategy.RegisterAPIV1(sr)
 	strategy.RegisterArtifactory(sr)
+	strategy.RegisterCodeArtifact(sr)
 	strategy.RegisterGitHubReleases(sr, tokenManagerProvider)
 	strategy.RegisterHermit(sr)
 	strategy.RegisterHost(sr)
