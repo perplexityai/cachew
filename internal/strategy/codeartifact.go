@@ -26,15 +26,16 @@ type CodeArtifactConfig struct {
 	RoleARN     string `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
 }
 
-// CodeArtifact proxies authenticated reads without caching them. Cacheability
-// is deliberately introduced separately so unknown or mutable package paths
-// never become availability failures or stale durable entries.
+// CodeArtifact caches reviewed immutable assets and passes all other
+// authenticated reads through so classifier gaps cannot break package access.
 type CodeArtifact struct {
 	target *url.URL
 	prefix string
 	tokens codeArtifactTokenSource
+	cache  cache.Cache
 	client *http.Client
 	logger *slog.Logger
+	metric codeArtifactMetricRecorder
 }
 
 var _ Strategy = (*CodeArtifact)(nil)
@@ -50,7 +51,7 @@ func RegisterCodeArtifact(r *Registry) {
 	Register(r, "codeartifact", "Authenticated read-only proxy for AWS CodeArtifact.", NewCodeArtifact)
 }
 
-func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, _ cache.Cache, mux Mux) (*CodeArtifact, error) {
+func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredCache cache.Cache, mux Mux) (*CodeArtifact, error) {
 	if _, err := validateCodeArtifactConfig(config, false); err != nil {
 		return nil, err
 	}
@@ -58,7 +59,7 @@ func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, _ cache.Cac
 	if err != nil {
 		return nil, err
 	}
-	return newCodeArtifact(ctx, config, mux, tokens, false)
+	return newCodeArtifact(ctx, config, mux, tokens, configuredCache, false)
 }
 
 func newCodeArtifact(
@@ -66,6 +67,7 @@ func newCodeArtifact(
 	config CodeArtifactConfig,
 	mux Mux,
 	tokens codeArtifactTokenSource,
+	configuredCache cache.Cache,
 	allowHTTP bool,
 ) (*CodeArtifact, error) {
 	target, err := validateCodeArtifactConfig(config, allowHTTP)
@@ -80,6 +82,7 @@ func newCodeArtifact(
 		target: target,
 		prefix: "/" + target.Host,
 		tokens: tokens,
+		cache:  configuredCache.Namespace(cache.Namespace("codeartifact")),
 		client: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -87,6 +90,7 @@ func newCodeArtifact(
 			},
 		},
 		logger: logging.FromContext(ctx),
+		metric: newCodeArtifactMetrics(),
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
@@ -140,11 +144,22 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host }
 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	mode := classifyCodeArtifactRequest(r, c.prefix)
+	c.metric.recordRequest(r.Context(), mode)
+	if mode == codeArtifactCacheImmutable && c.serveCached(w, r) {
+		return
+	}
+	c.serveOrigin(w, r, mode)
+}
+
+func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
 	token, err := c.tokens.Token(r.Context(), 0)
 	if err != nil {
+		c.metric.recordAuth(r.Context(), codeArtifactAuthFailure)
 		c.writeError(w, r, errors.Wrap(err, "obtain CodeArtifact authorization"))
 		return
 	}
+	c.metric.recordAuth(r.Context(), token.event)
 
 	resp, err := c.do(r, token.value)
 	if err != nil {
@@ -158,9 +173,11 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		refreshed, refreshErr := c.tokens.Token(r.Context(), token.generation)
 		if refreshErr != nil {
+			c.metric.recordAuth(r.Context(), codeArtifactAuthFailure)
 			c.writeError(w, r, errors.Wrap(refreshErr, "refresh CodeArtifact authorization"))
 			return
 		}
+		c.metric.recordAuth(r.Context(), refreshed.event)
 		resp, err = c.do(r, refreshed.value)
 		if err != nil {
 			c.writeError(w, r, err)
@@ -168,6 +185,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	responseHeaders := endToEndHeaders(resp.Header)
+	responseHeaders.Del(codeArtifactOriginValidatorsHeader)
 	if location := responseHeaders.Get("Location"); location != "" {
 		rewritten, ok := c.rewriteSameOriginLocation(resp.Request.URL, location)
 		if ok {
@@ -201,18 +219,17 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodHead {
 		return
 	}
+	if mode == codeArtifactCacheImmutable && resp.StatusCode == http.StatusOK {
+		c.streamAndCache(w, r, resp, responseHeaders)
+		return
+	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		c.logger.ErrorContext(r.Context(), "Failed to stream CodeArtifact response", "error", err)
 	}
 }
 
 func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error) {
-	target := *c.target
-	target.Path = strings.TrimPrefix(r.URL.Path, c.prefix)
-	if escapedPath := r.URL.EscapedPath(); escapedPath != r.URL.Path {
-		target.RawPath = strings.TrimPrefix(escapedPath, c.prefix)
-	}
-	target.RawQuery = r.URL.RawQuery
+	target := c.originURL(r)
 
 	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
 	if err != nil {
@@ -228,6 +245,16 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 		return nil, errors.New("request CodeArtifact origin")
 	}
 	return resp, nil
+}
+
+func (c *CodeArtifact) originURL(r *http.Request) url.URL {
+	target := *c.target
+	target.Path = strings.TrimPrefix(r.URL.Path, c.prefix)
+	if escapedPath := r.URL.EscapedPath(); escapedPath != r.URL.Path {
+		target.RawPath = strings.TrimPrefix(escapedPath, c.prefix)
+	}
+	target.RawQuery = r.URL.RawQuery
+	return target
 }
 
 func (c *CodeArtifact) rewriteSameOriginLocation(requestURL *url.URL, location string) (string, bool) {

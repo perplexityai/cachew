@@ -37,6 +37,7 @@ type codeArtifactTokenManager struct {
 type codeArtifactToken struct {
 	value      string
 	generation uint64
+	event      codeArtifactAuthEvent
 }
 
 func newCodeArtifactTokenManager(ctx context.Context, config CodeArtifactConfig) (*codeArtifactTokenManager, error) {
@@ -63,7 +64,7 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 	defer m.mu.Unlock()
 
 	if m.usableToken(rejectedGeneration) {
-		return codeArtifactToken{value: m.token, generation: m.generation}, nil
+		return codeArtifactToken{value: m.token, generation: m.generation, event: codeArtifactAuthReuse}, nil
 	}
 
 	output, err := m.client.GetAuthorizationToken(ctx, &awscodeartifact.GetAuthorizationTokenInput{
@@ -72,7 +73,7 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 	})
 	if err != nil {
 		if rejectedGeneration == 0 && m.token != "" && m.now().Before(m.expiresAt) {
-			return codeArtifactToken{value: m.token, generation: m.generation}, nil
+			return codeArtifactToken{value: m.token, generation: m.generation, event: codeArtifactAuthReuse}, nil
 		}
 		return codeArtifactToken{}, errors.Wrap(err, "mint CodeArtifact authorization token")
 	}
@@ -83,7 +84,11 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 	m.token = *output.AuthorizationToken
 	m.expiresAt = *output.Expiration
 	m.generation++
-	return codeArtifactToken{value: m.token, generation: m.generation}, nil
+	event := codeArtifactAuthRefresh
+	if rejectedGeneration != 0 {
+		event = codeArtifactAuthForcedRefresh
+	}
+	return codeArtifactToken{value: m.token, generation: m.generation, event: event}, nil
 }
 
 func (m *codeArtifactTokenManager) usableToken(rejectedGeneration uint64) bool {

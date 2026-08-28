@@ -101,6 +101,11 @@ The role needs `codeartifact:GetAuthorizationToken` and its underlying principal
 needs `sts:GetServiceBearerToken`. Repository read permissions remain governed by
 the CodeArtifact resource policy.
 
+Cachew stores reviewed immutable Maven assets and generic package assets whose
+versions are canonical stable semantic versions. Metadata, aliases, prereleases,
+build-qualified versions, ranges, and unknown package paths remain authenticated
+pass-through requests.
+
 ### Host
 
 Generic reverse-proxy caching for arbitrary HTTP hosts, with optional custom headers.
