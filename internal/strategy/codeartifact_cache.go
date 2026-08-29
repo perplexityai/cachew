@@ -23,7 +23,7 @@ const (
 	codeArtifactOriginValidatorsHeader                       = "X-Cachew-Codeartifact-Origin-Validators"
 )
 
-func classifyCodeArtifactRequest(r *http.Request, prefix string) codeArtifactCacheMode {
+func classifyCodeArtifactRequest(r *http.Request, prefix, routePrefix string) codeArtifactCacheMode {
 	if r.Method != http.MethodGet || r.Header.Get("Range") != "" {
 		return codeArtifactCachePassthrough
 	}
@@ -33,11 +33,37 @@ func classifyCodeArtifactRequest(r *http.Request, prefix string) codeArtifactCac
 	}
 
 	path := strings.TrimPrefix(r.URL.Path, prefix)
+	if routePrefix != "" {
+		path = strings.TrimPrefix(r.URL.Path, routePrefix)
+	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if isImmutableMavenAsset(parts) || isImmutableGenericAsset(parts) {
+	registryAsset := (routePrefix == "/npm" && isImmutableNPMAsset(parts)) ||
+		(routePrefix == "/pypi" && isImmutablePyPIAsset(parts))
+	if isImmutableMavenAsset(parts) || isImmutableGenericAsset(parts) || registryAsset {
 		return codeArtifactCacheImmutable
 	}
 	return codeArtifactCachePassthrough
+}
+
+func isImmutableNPMAsset(parts []string) bool {
+	if len(parts) < 3 || parts[len(parts)-2] != "-" {
+		return false
+	}
+	filename := parts[len(parts)-1]
+	return filename != "" && strings.HasSuffix(strings.ToLower(filename), ".tgz")
+}
+
+func isImmutablePyPIAsset(parts []string) bool {
+	if len(parts) < 2 || !slices.Contains(parts[:len(parts)-1], "packages") {
+		return false
+	}
+	filename := strings.ToLower(parts[len(parts)-1])
+	for _, suffix := range []string{".whl", ".tar.gz", ".tar.bz2", ".tar.xz", ".zip"} {
+		if strings.HasSuffix(filename, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func isImmutableMavenAsset(parts []string) bool {

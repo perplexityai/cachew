@@ -226,6 +226,221 @@ func TestCodeArtifactCachesReviewedImmutableAssets(t *testing.T) {
 	}
 }
 
+func TestCodeArtifactCachesSocketAllowedRegistryAssets(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		assert.Equal(t, "/npm/@scope/tool/-/tool-1.2.3.tgz", r.URL.Path)
+		assert.Equal(t, "Bearer token", r.Header.Get("Authorization"))
+		w.Header().Set("ETag", testCodeArtifactETag)
+		w.Header().Set("X-Socket-Decision", "allowed")
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	}))
+	t.Cleanup(upstream.Close)
+
+	tokenServer := newLocalTokenServer(t, tokenResponse{token: "token", expiresAt: time.Now().Add(time.Hour)})
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.Upstream = upstream.URL
+	config.RoutePrefix = "/npm"
+	config.AuthorizationScheme = "bearer"
+	config.CacheRequiredHeader = "X-Socket-Decision"
+	config.CacheRequiredValue = "allowed"
+	config.CacheRejectedHeader = "X-Socket-Unscanned"
+	config.CacheRejectedValue = "true"
+	mux := http.NewServeMux()
+	_, err = newCodeArtifact(ctx, config, mux, tokenServer.tokenManager(time.Now), memory, true)
+	assert.NoError(t, err)
+
+	for range 2 {
+		w := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/@scope/tool/-/tool-1.2.3.tgz", nil).WithContext(ctx)
+		mux.ServeHTTP(w, request)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, testCodeArtifactBody, w.Body.String())
+		assert.Equal(t, "allowed", w.Header().Get("X-Socket-Decision"))
+	}
+
+	assert.Equal(t, int32(1), requests.Load(), "the second allowed request should hit Cachew")
+	assert.Equal(t, 1, tokenServer.requestCount(), "a cache hit should not mint another token")
+}
+
+func TestCodeArtifactDoesNotCacheUnapprovedRegistryAssets(t *testing.T) {
+	tests := []struct {
+		name      string
+		decision  string
+		unscanned string
+	}{
+		{name: "missing decision"},
+		{name: "fail open", decision: "fail_open"},
+		{name: "unscanned", decision: "allowed", unscanned: "true"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				w.Header().Set("X-Socket-Decision", test.decision)
+				w.Header().Set("X-Socket-Unscanned", test.unscanned)
+				_, _ = w.Write([]byte(testCodeArtifactBody))
+			}))
+			t.Cleanup(upstream.Close)
+
+			tokenServer := newLocalTokenServer(t, tokenResponse{token: "token", expiresAt: time.Now().Add(time.Hour)})
+			_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+			memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+			assert.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, memory.Close()) })
+			config := testCodeArtifactConfig("https://codeartifact.example.com")
+			config.Upstream = upstream.URL
+			config.RoutePrefix = "/npm"
+			config.CacheRequiredHeader = "X-Socket-Decision"
+			config.CacheRequiredValue = "allowed"
+			config.CacheRejectedHeader = "X-Socket-Unscanned"
+			config.CacheRejectedValue = "true"
+			mux := http.NewServeMux()
+			_, err = newCodeArtifact(ctx, config, mux, tokenServer.tokenManager(time.Now), memory, true)
+			assert.NoError(t, err)
+
+			for range 2 {
+				w := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, "/npm/tool/-/tool-1.2.3.tgz", nil).WithContext(ctx)
+				mux.ServeHTTP(w, request)
+				assert.Equal(t, http.StatusOK, w.Code)
+				assert.Equal(t, testCodeArtifactBody, w.Body.String())
+			}
+
+			assert.Equal(t, int32(2), requests.Load())
+		})
+	}
+}
+
+func TestCodeArtifactDoesNotTreatSocketBlockAsRejectedOriginToken(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("X-Socket-Decision", "blocked")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(upstream.Close)
+
+	tokenServer := newLocalTokenServer(
+		t,
+		tokenResponse{token: "token-1", expiresAt: time.Now().Add(time.Hour)},
+		tokenResponse{token: "token-2", expiresAt: time.Now().Add(2 * time.Hour)},
+	)
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.Upstream = upstream.URL
+	config.RoutePrefix = "/npm"
+	config.CacheRequiredHeader = "X-Socket-Decision"
+	config.CacheRequiredValue = "allowed"
+	mux := http.NewServeMux()
+	_, err := newCodeArtifact(ctx, config, mux, tokenServer.tokenManager(time.Now), cache.NoOpCache(), true)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/npm/tool/-/tool-1.2.3.tgz", nil).WithContext(ctx)
+	mux.ServeHTTP(w, request)
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, int32(1), requests.Load())
+	assert.Equal(t, 1, tokenServer.requestCount())
+}
+
+func TestCodeArtifactCachesSocketAllowedPyPIAssets(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		assert.Equal(t, "/pypi/packages/ab/cd/tool-1.2.3-py3-none-any.whl", r.URL.Path)
+		password, ok := decodeBasicPassword(r.Header.Get("Authorization"))
+		assert.True(t, ok)
+		assert.Equal(t, "token", password)
+		w.Header().Set("X-Socket-Decision", "allowed")
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	}))
+	t.Cleanup(upstream.Close)
+
+	tokenServer := newLocalTokenServer(t, tokenResponse{token: "token", expiresAt: time.Now().Add(time.Hour)})
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.Upstream = upstream.URL
+	config.RoutePrefix = "/pypi"
+	config.CacheRequiredHeader = "X-Socket-Decision"
+	config.CacheRequiredValue = "allowed"
+	mux := http.NewServeMux()
+	_, err = newCodeArtifact(ctx, config, mux, tokenServer.tokenManager(time.Now), memory, true)
+	assert.NoError(t, err)
+
+	for range 2 {
+		w := httptest.NewRecorder()
+		request := httptest.NewRequest(
+			http.MethodGet,
+			"/pypi/packages/ab/cd/tool-1.2.3-py3-none-any.whl",
+			nil,
+		).WithContext(ctx)
+		mux.ServeHTTP(w, request)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, testCodeArtifactBody, w.Body.String())
+	}
+
+	assert.Equal(t, int32(1), requests.Load(), "the second allowed request should hit Cachew")
+}
+
+func TestCodeArtifactRewritesValidationProxyRedirectsToPathMountedRoute(t *testing.T) {
+	var upstreamURL string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, upstreamURL+"/npm/tool/-/tool-1.2.3.tgz?download=1", http.StatusFound)
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL = upstream.URL
+
+	tokenServer := newLocalTokenServer(t, tokenResponse{token: "token", expiresAt: time.Now().Add(time.Hour)})
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.Upstream = upstream.URL
+	config.RoutePrefix = "/npm"
+	mux := http.NewServeMux()
+	_, err := newCodeArtifact(ctx, config, mux, tokenServer.tokenManager(time.Now), cache.NoOpCache(), true)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/npm/tool", nil).WithContext(ctx)
+	mux.ServeHTTP(w, request)
+
+	assert.Equal(t, http.StatusFound, w.Code)
+	assert.Equal(t, "/npm/tool/-/tool-1.2.3.tgz?download=1", w.Header().Get("Location"))
+}
+
+func TestCodeArtifactAllowsOnlyHTTPSOrLoopbackValidationProxy(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream string
+		wantErr  bool
+	}{
+		{name: "HTTPS", upstream: "https://socket.example.com"},
+		{name: "IPv4 loopback HTTP", upstream: "http://127.0.0.1:8081"},
+		{name: "IPv6 loopback HTTP", upstream: "http://[::1]:8081"},
+		{name: "remote HTTP", upstream: "http://socket.example.com", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := validateCodeArtifactUpstream(test.upstream, false)
+			if test.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
 func TestCodeArtifactPreservesValidatorsAcrossCacheHits(t *testing.T) {
 	var requests atomic.Int32
 	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

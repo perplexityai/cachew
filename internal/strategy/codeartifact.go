@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,25 +18,44 @@ import (
 
 const codeArtifactUsername = "aws"
 
+const (
+	codeArtifactAuthorizationBasic  = "basic"
+	codeArtifactAuthorizationBearer = "bearer"
+)
+
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	Target      string `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	Domain      string `hcl:"domain" help:"The CodeArtifact domain name."`
-	DomainOwner string `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
-	Region      string `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
-	RoleARN     string `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	Target              string `hcl:"target,label" help:"The logical CodeArtifact origin represented by this route."`
+	Domain              string `hcl:"domain" help:"The CodeArtifact domain name."`
+	DomainOwner         string `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
+	Region              string `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
+	RoleARN             string `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	Upstream            string `hcl:"upstream,optional" help:"An optional HTTPS validation proxy that receives origin requests."`
+	RoutePrefix         string `hcl:"route-prefix,optional" help:"An optional public path prefix instead of the target hostname."`
+	AuthorizationScheme string `hcl:"authorization-scheme,optional" help:"The upstream CodeArtifact token scheme: basic or bearer."`
+	CacheRequiredHeader string `hcl:"cache-required-header,optional" help:"A response header required before an immutable response may be cached."`
+	CacheRequiredValue  string `hcl:"cache-required-value,optional" help:"The exact required cache response header value."`
+	CacheRejectedHeader string `hcl:"cache-rejected-header,optional" help:"A response header that prevents caching when it has the rejected value."`
+	CacheRejectedValue  string `hcl:"cache-rejected-value,optional" help:"The exact response header value that prevents caching."`
 }
 
 // CodeArtifact caches reviewed immutable assets and passes all other
 // authenticated reads through so classifier gaps cannot break package access.
 type CodeArtifact struct {
-	target *url.URL
-	prefix string
-	tokens codeArtifactTokenSource
-	cache  cache.Cache
-	client *http.Client
-	logger *slog.Logger
-	metric codeArtifactMetricRecorder
+	target              *url.URL
+	upstream            *url.URL
+	prefix              string
+	routePrefix         string
+	authorizationScheme string
+	cacheRequiredHeader string
+	cacheRequiredValue  string
+	cacheRejectedHeader string
+	cacheRejectedValue  string
+	tokens              codeArtifactTokenSource
+	cache               cache.Cache
+	client              *http.Client
+	logger              *slog.Logger
+	metric              codeArtifactMetricRecorder
 }
 
 var _ Strategy = (*CodeArtifact)(nil)
@@ -74,15 +94,37 @@ func newCodeArtifact(
 	if err != nil {
 		return nil, err
 	}
+	upstream, err := validateCodeArtifactUpstream(config.Upstream, allowHTTP)
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := codeArtifactRoutePrefix(config.RoutePrefix, target)
+	if err != nil {
+		return nil, err
+	}
+	authorizationScheme, err := codeArtifactAuthorization(config.AuthorizationScheme)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCodeArtifactCacheHeaders(config); err != nil {
+		return nil, err
+	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DisableCompression = true
 
 	c := &CodeArtifact{
-		target: target,
-		prefix: "/" + target.Host,
-		tokens: tokens,
-		cache:  configuredCache.Namespace(cache.Namespace("codeartifact")),
+		target:              target,
+		upstream:            upstream,
+		prefix:              prefix,
+		routePrefix:         config.RoutePrefix,
+		authorizationScheme: authorizationScheme,
+		cacheRequiredHeader: config.CacheRequiredHeader,
+		cacheRequiredValue:  config.CacheRequiredValue,
+		cacheRejectedHeader: config.CacheRejectedHeader,
+		cacheRejectedValue:  config.CacheRejectedValue,
+		tokens:              tokens,
+		cache:               configuredCache.Namespace(cache.Namespace("codeartifact")),
 		client: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -100,6 +142,56 @@ func newCodeArtifact(
 	}
 
 	return c, nil
+}
+
+func validateCodeArtifactUpstream(raw string, allowHTTP bool) (*url.URL, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	upstream, err := url.Parse(raw)
+	if err != nil {
+		return nil, errors.Errorf("codeartifact: invalid upstream URL: %w", err)
+	}
+	loopbackHTTP := upstream.Scheme == "http" && net.ParseIP(upstream.Hostname()).IsLoopback()
+	validScheme := upstream.Scheme == "https" || loopbackHTTP || (allowHTTP && upstream.Scheme == "http")
+	if upstream.Host == "" || !validScheme {
+		return nil, errors.New("codeartifact: upstream must be an HTTPS or loopback HTTP origin")
+	}
+	if upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" || (upstream.Path != "" && upstream.Path != "/") {
+		return nil, errors.New("codeartifact: upstream must not contain credentials, a path, query, or fragment")
+	}
+	upstream.Path = ""
+	return upstream, nil
+}
+
+func codeArtifactRoutePrefix(configured string, target *url.URL) (string, error) {
+	if configured == "" {
+		return "/" + target.Host, nil
+	}
+	if configured == "/" || !strings.HasPrefix(configured, "/") || strings.HasSuffix(configured, "/") {
+		return "", errors.New("codeartifact: route-prefix must start with one slash and must not end with a slash")
+	}
+	return configured, nil
+}
+
+func codeArtifactAuthorization(configured string) (string, error) {
+	if configured == "" {
+		return codeArtifactAuthorizationBasic, nil
+	}
+	if configured != codeArtifactAuthorizationBasic && configured != codeArtifactAuthorizationBearer {
+		return "", errors.Errorf("codeartifact: authorization-scheme must be %q or %q", codeArtifactAuthorizationBasic, codeArtifactAuthorizationBearer)
+	}
+	return configured, nil
+}
+
+func validateCodeArtifactCacheHeaders(config CodeArtifactConfig) error {
+	if (config.CacheRequiredHeader == "") != (config.CacheRequiredValue == "") {
+		return errors.New("codeartifact: cache-required-header and cache-required-value must be configured together")
+	}
+	if (config.CacheRejectedHeader == "") != (config.CacheRejectedValue == "") {
+		return errors.New("codeartifact: cache-rejected-header and cache-rejected-value must be configured together")
+	}
+	return nil
 }
 
 func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, error) {
@@ -144,7 +236,7 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host }
 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	mode := classifyCodeArtifactRequest(r, c.prefix)
+	mode := classifyCodeArtifactRequest(r, c.prefix, c.routePrefix)
 	c.metric.recordRequest(r.Context(), mode)
 	if mode == codeArtifactCacheImmutable && c.serveCached(w, r) {
 		return
@@ -167,7 +259,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 		return
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+	if c.shouldRefreshToken(resp) {
 		if err := resp.Body.Close(); err != nil {
 			c.logger.ErrorContext(r.Context(), "Failed to close CodeArtifact response", "error", err)
 		}
@@ -219,7 +311,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	if r.Method == http.MethodHead {
 		return
 	}
-	if mode == codeArtifactCacheImmutable && resp.StatusCode == http.StatusOK {
+	if mode == codeArtifactCacheImmutable && resp.StatusCode == http.StatusOK && c.cacheResponseAllowed(responseHeaders) {
 		c.streamAndCache(w, r, resp, responseHeaders)
 		return
 	}
@@ -228,15 +320,30 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	}
 }
 
+func (c *CodeArtifact) shouldRefreshToken(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	if c.cacheRequiredHeader == "" {
+		return true
+	}
+	decision := resp.Header.Get(c.cacheRequiredHeader)
+	return decision == "" || decision == c.cacheRequiredValue
+}
+
 func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error) {
-	target := c.originURL(r)
+	target := c.upstreamURL(r)
 
 	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
 	if err != nil {
 		return nil, errors.New("build CodeArtifact request")
 	}
 	copyHeaders(upstream.Header, codeArtifactRequestHeaders(r.Header))
-	upstream.SetBasicAuth(codeArtifactUsername, token)
+	if c.authorizationScheme == codeArtifactAuthorizationBearer {
+		upstream.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		upstream.SetBasicAuth(codeArtifactUsername, token)
+	}
 
 	resp, err := c.client.Do(upstream)
 	if err != nil {
@@ -247,14 +354,40 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 	return resp, nil
 }
 
-func (c *CodeArtifact) originURL(r *http.Request) url.URL {
-	target := *c.target
-	target.Path = strings.TrimPrefix(r.URL.Path, c.prefix)
+func (c *CodeArtifact) upstreamURL(r *http.Request) url.URL {
+	if c.upstream == nil {
+		return c.originURL(r)
+	}
+	target := *c.upstream
+	target.Path = r.URL.Path
 	if escapedPath := r.URL.EscapedPath(); escapedPath != r.URL.Path {
-		target.RawPath = strings.TrimPrefix(escapedPath, c.prefix)
+		target.RawPath = escapedPath
 	}
 	target.RawQuery = r.URL.RawQuery
 	return target
+}
+
+func (c *CodeArtifact) originURL(r *http.Request) url.URL {
+	target := *c.target
+	target.Path = strings.TrimPrefix(r.URL.Path, c.prefix)
+	if c.routePrefix != "" {
+		target.Path = r.URL.Path
+	}
+	if escapedPath := r.URL.EscapedPath(); escapedPath != r.URL.Path {
+		target.RawPath = strings.TrimPrefix(escapedPath, c.prefix)
+		if c.routePrefix != "" {
+			target.RawPath = escapedPath
+		}
+	}
+	target.RawQuery = r.URL.RawQuery
+	return target
+}
+
+func (c *CodeArtifact) cacheResponseAllowed(headers http.Header) bool {
+	if c.cacheRequiredHeader != "" && headers.Get(c.cacheRequiredHeader) != c.cacheRequiredValue {
+		return false
+	}
+	return c.cacheRejectedHeader == "" || headers.Get(c.cacheRejectedHeader) != c.cacheRejectedValue
 }
 
 func (c *CodeArtifact) rewriteSameOriginLocation(requestURL *url.URL, location string) (string, bool) {
@@ -263,17 +396,21 @@ func (c *CodeArtifact) rewriteSameOriginLocation(requestURL *url.URL, location s
 		return "", false
 	}
 	resolved := requestURL.ResolveReference(parsed)
-	if !strings.EqualFold(resolved.Scheme, c.target.Scheme) || !strings.EqualFold(resolved.Host, c.target.Host) {
+	if !strings.EqualFold(resolved.Scheme, requestURL.Scheme) || !strings.EqualFold(resolved.Host, requestURL.Host) {
 		return "", false
 	}
 
+	pathPrefix := c.prefix
+	if c.routePrefix != "" {
+		pathPrefix = ""
+	}
 	rewritten := &url.URL{
-		Path:     c.prefix + resolved.Path,
+		Path:     pathPrefix + resolved.Path,
 		RawQuery: resolved.RawQuery,
 		Fragment: resolved.Fragment,
 	}
 	if resolved.RawPath != "" {
-		rewritten.RawPath = c.prefix + resolved.RawPath
+		rewritten.RawPath = pathPrefix + resolved.RawPath
 	}
 	return rewritten.String(), true
 }

@@ -106,6 +106,34 @@ versions are canonical stable semantic versions. Metadata, aliases, prereleases,
 build-qualified versions, ranges, and unknown package paths remain authenticated
 pass-through requests.
 
+A validation proxy can be inserted between Cachew and CodeArtifact while the
+public registry remains mounted on a stable path. Cachew sends the minted token
+to the proxy and caches npm or PyPI package bodies only when the configured
+response admission headers approve them:
+
+```hcl
+codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
+  target                = "https://example-111122223333.d.codeartifact.us-east-1.amazonaws.com"
+  domain                = "example"
+  domain-owner          = "111122223333"
+  region                = "us-east-1"
+  role-arn              = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
+  upstream              = "http://127.0.0.1:8081"
+  route-prefix          = "/npm"
+  authorization-scheme  = "bearer"
+  cache-required-header = "X-Package-Decision"
+  cache-required-value  = "allowed"
+  cache-rejected-header = "X-Package-Unscanned"
+  cache-rejected-value  = "true"
+}
+```
+
+Remote validation proxies must use HTTPS. Plain HTTP is accepted only for a
+literal loopback IP so a sidecar can be reached without sending the token over
+the pod network. Basic authentication remains the default; npm registries can
+select bearer authentication. A missing, rejected, or unscanned response is
+served to the client but never stored in Cachew.
+
 ### Host
 
 Generic reverse-proxy caching for arbitrary HTTP hosts, with optional custom headers.
