@@ -42,6 +42,20 @@ type tokenResponse struct {
 	status    int
 }
 
+type codeArtifactAuthorizationClientFunc func(
+	context.Context,
+	*awscodeartifact.GetAuthorizationTokenInput,
+	...func(*awscodeartifact.Options),
+) (*awscodeartifact.GetAuthorizationTokenOutput, error)
+
+func (f codeArtifactAuthorizationClientFunc) GetAuthorizationToken(
+	ctx context.Context,
+	input *awscodeartifact.GetAuthorizationTokenInput,
+	options ...func(*awscodeartifact.Options),
+) (*awscodeartifact.GetAuthorizationTokenOutput, error) {
+	return f(ctx, input, options...)
+}
+
 type localTokenServer struct {
 	server *httptest.Server
 
@@ -773,10 +787,75 @@ func TestCodeArtifactRefreshFailureFallsBackOnlyToUnrejectedToken(t *testing.T) 
 	assert.NoError(t, err)
 	assert.Equal(t, first.value, fallback.value)
 	assert.Equal(t, first.generation, fallback.generation)
-	assert.Equal(t, codeArtifactAuthReuse, fallback.event)
+	assert.Equal(t, codeArtifactAuthFailure, fallback.event)
 
 	_, err = manager.Token(t.Context(), first.generation)
 	assert.Error(t, err)
+}
+
+func TestCodeArtifactFailedProactiveRefreshesBackOff(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	currentTime := now
+	expiresAt := now.Add(4 * time.Minute)
+	var requests atomic.Int32
+	client := codeArtifactAuthorizationClientFunc(func(
+		context.Context,
+		*awscodeartifact.GetAuthorizationTokenInput,
+		...func(*awscodeartifact.Options),
+	) (*awscodeartifact.GetAuthorizationTokenOutput, error) {
+		if requests.Add(1) == 1 {
+			return &awscodeartifact.GetAuthorizationTokenOutput{
+				AuthorizationToken: aws.String("near-expiry"),
+				Expiration:         &expiresAt,
+			}, nil
+		}
+		return nil, errors.New("token service unavailable")
+	})
+	manager := newCodeArtifactTokenManagerWithClient(testCodeArtifactConfig("https://codeartifact.example.com"), client, func() time.Time {
+		return currentTime
+	})
+
+	first, err := manager.Token(t.Context(), 0)
+	assert.NoError(t, err)
+
+	const callers = 16
+	start := make(chan struct{})
+	tokens := make(chan codeArtifactToken, callers)
+	errorsCh := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for range callers {
+		go func() {
+			defer wg.Done()
+			<-start
+			token, tokenErr := manager.Token(t.Context(), 0)
+			tokens <- token
+			errorsCh <- tokenErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(tokens)
+	close(errorsCh)
+
+	for tokenErr := range errorsCh {
+		assert.NoError(t, tokenErr)
+	}
+	events := map[codeArtifactAuthEvent]int{}
+	for token := range tokens {
+		assert.Equal(t, first.value, token.value)
+		assert.Equal(t, first.generation, token.generation)
+		events[token.event]++
+	}
+	assert.Equal(t, 1, events[codeArtifactAuthFailure])
+	assert.Equal(t, callers-1, events[codeArtifactAuthReuse])
+	assert.Equal(t, int32(2), requests.Load(), "failed proactive refreshes should back off")
+
+	currentTime = now.Add(codeArtifactTokenRefreshFailureBackoff)
+	retry, err := manager.Token(t.Context(), 0)
+	assert.NoError(t, err)
+	assert.Equal(t, codeArtifactAuthFailure, retry.event)
+	assert.Equal(t, int32(3), requests.Load(), "refresh should retry after the backoff")
 }
 
 func TestCodeArtifactDeniesWritesBeforeOrigin(t *testing.T) {

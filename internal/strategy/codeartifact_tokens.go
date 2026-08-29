@@ -13,7 +13,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
-const codeArtifactTokenRefreshBuffer = 5 * time.Minute
+const (
+	codeArtifactTokenRefreshBuffer         = 5 * time.Minute
+	codeArtifactTokenRefreshFailureBackoff = time.Minute
+)
 
 type codeArtifactAuthorizationClient interface {
 	GetAuthorizationToken(
@@ -32,6 +35,7 @@ type codeArtifactTokenManager struct {
 	token      string
 	expiresAt  time.Time
 	generation uint64
+	retryAfter time.Time
 }
 
 type codeArtifactToken struct {
@@ -72,8 +76,10 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 		DomainOwner: aws.String(m.config.DomainOwner),
 	})
 	if err != nil {
-		if rejectedGeneration == 0 && m.token != "" && m.now().Before(m.expiresAt) {
-			return codeArtifactToken{value: m.token, generation: m.generation, event: codeArtifactAuthReuse}, nil
+		now := m.now()
+		if rejectedGeneration == 0 && m.token != "" && now.Before(m.expiresAt) {
+			m.retryAfter = now.Add(codeArtifactTokenRefreshFailureBackoff)
+			return codeArtifactToken{value: m.token, generation: m.generation, event: codeArtifactAuthFailure}, nil
 		}
 		return codeArtifactToken{}, errors.Wrap(err, "mint CodeArtifact authorization token")
 	}
@@ -84,6 +90,7 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 	m.token = *output.AuthorizationToken
 	m.expiresAt = *output.Expiration
 	m.generation++
+	m.retryAfter = time.Time{}
 	event := codeArtifactAuthRefresh
 	if rejectedGeneration != 0 {
 		event = codeArtifactAuthForcedRefresh
@@ -92,7 +99,14 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 }
 
 func (m *codeArtifactTokenManager) usableToken(rejectedGeneration uint64) bool {
-	if m.token == "" || !m.now().Add(codeArtifactTokenRefreshBuffer).Before(m.expiresAt) {
+	now := m.now()
+	if m.token == "" || !now.Before(m.expiresAt) {
+		return false
+	}
+	if rejectedGeneration == 0 && now.Before(m.retryAfter) {
+		return true
+	}
+	if !now.Add(codeArtifactTokenRefreshBuffer).Before(m.expiresAt) {
 		return false
 	}
 	return rejectedGeneration == 0 || rejectedGeneration < m.generation
