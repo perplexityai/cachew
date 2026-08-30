@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/alecthomas/errors"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
@@ -27,8 +28,8 @@ type CodeArtifactConfig struct {
 	RoleARN      string `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
 }
 
-// CodeArtifact caches reviewed immutable assets and passes all other
-// authenticated reads through so classifier gaps cannot break package access.
+// CodeArtifact caches origin-declared immutable responses and passes all other
+// authenticated reads through.
 type CodeArtifact struct {
 	target    *url.URL
 	proxyBase *url.URL
@@ -38,6 +39,7 @@ type CodeArtifact struct {
 	client    *http.Client
 	logger    *slog.Logger
 	metric    codeArtifactMetricRecorder
+	fills     singleflight.Group
 }
 
 var _ Strategy = (*CodeArtifact)(nil)
@@ -157,9 +159,27 @@ func parseCodeArtifactOrigin(name, value string, allowHTTP bool) (*url.URL, erro
 func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host }
 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	mode := classifyCodeArtifactRequest(r, c.prefix)
+	mode := classifyCodeArtifactRequest(r)
 	c.metric.recordRequest(r.Context(), mode)
-	if mode == codeArtifactCacheImmutable && c.serveCached(w, r) {
+	if mode != codeArtifactCacheLookup {
+		c.serveOrigin(w, r, mode)
+		return
+	}
+	if c.serveCached(w, r) {
+		return
+	}
+
+	key := c.cacheKey(r)
+	servedByThisRequest := false
+	_, _, _ = c.fills.Do(key.String(), func() (any, error) { //nolint:errcheck // The callback reports failures through its response writer.
+		servedByThisRequest = true
+		c.serveOrigin(w, r, mode)
+		return true, nil
+	})
+	if servedByThisRequest {
+		return
+	}
+	if c.serveCached(w, r) {
 		return
 	}
 	c.serveOrigin(w, r, mode)
@@ -200,6 +220,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	}
 	responseHeaders := endToEndHeaders(resp.Header)
 	responseHeaders.Del(codeArtifactOriginValidatorsHeader)
+	responseHeaders.Del(cache.ExpirationKey)
 	if location := responseHeaders.Get("Location"); location != "" {
 		rewritten, ok := c.rewriteSameOriginLocation(resp.Request.URL, location)
 		if ok {
@@ -238,7 +259,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	if r.Method == http.MethodHead {
 		return
 	}
-	if mode == codeArtifactCacheImmutable && resp.StatusCode == http.StatusOK {
+	if mode == codeArtifactCacheLookup && resp.StatusCode == http.StatusOK {
 		c.streamAndCache(w, r, resp, responseHeaders)
 		return
 	}
