@@ -6,8 +6,9 @@ import (
 	"maps"
 	"net/http"
 	"os"
-	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/errors"
 
@@ -18,86 +19,40 @@ import (
 type codeArtifactCacheMode string
 
 const (
-	codeArtifactCacheImmutable         codeArtifactCacheMode = "immutable"
+	codeArtifactCacheLookup            codeArtifactCacheMode = "lookup"
 	codeArtifactCachePassthrough       codeArtifactCacheMode = "passthrough"
 	codeArtifactOriginValidatorsHeader                       = "X-Cachew-Codeartifact-Origin-Validators"
 )
 
-func classifyCodeArtifactRequest(r *http.Request, prefix string) codeArtifactCacheMode {
-	if r.Method != http.MethodGet || r.Header.Get("Range") != "" {
+func classifyCodeArtifactRequest(r *http.Request) codeArtifactCacheMode {
+	if r.Method != http.MethodGet || r.Header.Get("Range") != "" || r.URL.RawQuery != "" {
 		return codeArtifactCachePassthrough
 	}
-	escapedPath := strings.ToLower(r.URL.EscapedPath())
-	if strings.Contains(escapedPath, "%2f") {
+	if strings.Contains(strings.ToLower(r.URL.EscapedPath()), "%2f") {
 		return codeArtifactCachePassthrough
 	}
-
-	path := strings.TrimPrefix(r.URL.Path, prefix)
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if isImmutableMavenAsset(parts) || isImmutableGenericAsset(parts) {
-		return codeArtifactCacheImmutable
-	}
-	return codeArtifactCachePassthrough
-}
-
-func isImmutableMavenAsset(parts []string) bool {
-	if len(parts) < 6 || parts[0] != "maven" {
-		return false
-	}
-	artifact, version, filename := parts[len(parts)-3], parts[len(parts)-2], parts[len(parts)-1]
-	if artifact == "" || version == "" || filename == "" || strings.EqualFold(filename, "maven-metadata.xml") {
-		return false
-	}
-	if strings.HasSuffix(strings.ToUpper(version), "-SNAPSHOT") {
-		return false
-	}
-	return strings.HasPrefix(filename, artifact+"-"+version)
-}
-
-func isImmutableGenericAsset(parts []string) bool {
-	if len(parts) < 6 || parts[0] != "generic" {
-		return false
-	}
-	if slices.Contains(parts[1:], "") {
-		return false
-	}
-	return isReviewedImmutableGenericVersion(parts[4])
-}
-
-func isReviewedImmutableGenericVersion(version string) bool {
-	// Generic version strings are unconstrained and may be mutable aliases.
-	// The initial cache contract reviews only canonical stable semantic versions.
-	version = strings.TrimPrefix(version, "v")
-	components := strings.Split(version, ".")
-	if len(components) != 3 {
-		return false
-	}
-	for _, component := range components {
-		if component == "" || (len(component) > 1 && component[0] == '0') {
-			return false
-		}
-		for _, char := range component {
-			if char < '0' || char > '9' {
-				return false
-			}
-		}
-	}
-	return true
+	return codeArtifactCacheLookup
 }
 
 func (c *CodeArtifact) cacheKey(r *http.Request) cache.Key {
 	origin := c.originURL(r)
-	key := origin.String()
-	if encoding := r.Header.Get("Accept-Encoding"); encoding != "" {
-		key += "\nAccept-Encoding=" + encoding
+	var key strings.Builder
+	key.WriteString(origin.String())
+	for _, name := range []string{"Accept", "Accept-Encoding"} {
+		if values := r.Header.Values(name); len(values) > 0 {
+			key.WriteByte('\n')
+			key.WriteString(name)
+			key.WriteByte('=')
+			key.WriteString(strings.Join(values, ","))
+		}
 	}
-	return cache.NewKey(key)
+	return cache.NewKey(key.String())
 }
 
 func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool {
 	body, headers, err := c.cache.Open(r.Context(), c.cacheKey(r))
 	if err == nil {
-		headers = codeArtifactOriginHeaders(headers)
+		headers = codeArtifactOriginHeaders(headers, time.Now())
 		if status := cachedPreconditionStatus(r, headers); status != 0 {
 			c.metric.recordCache(r.Context(), codeArtifactCacheHit)
 			if closeErr := body.Close(); closeErr != nil {
@@ -132,14 +87,14 @@ func (c *CodeArtifact) streamAndCache(
 	resp *http.Response,
 	responseHeaders http.Header,
 ) {
-	cacheHeaders, createOptions, cacheable := codeArtifactCacheEntry(responseHeaders)
+	cacheHeaders, ttl, createOptions, cacheable := codeArtifactCacheEntry(responseHeaders, time.Now())
 	if !cacheable {
-		c.metric.recordCache(r.Context(), codeArtifactCacheUnsupportedValidator)
+		c.metric.recordCache(r.Context(), codeArtifactCacheNotCacheable)
 		c.streamOriginBody(r.Context(), w, resp.Body)
 		return
 	}
 
-	writer, err := c.cache.Create(r.Context(), c.cacheKey(r), cacheHeaders, 0, createOptions...)
+	writer, err := c.cache.Create(r.Context(), c.cacheKey(r), cacheHeaders, ttl, createOptions...)
 	if err != nil {
 		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure)
 		c.logger.ErrorContext(r.Context(), "Failed to create CodeArtifact cache entry", "error", err)
@@ -165,15 +120,27 @@ func (c *CodeArtifact) streamAndCache(
 	c.metric.recordCache(r.Context(), codeArtifactCacheStored)
 }
 
-func codeArtifactCacheEntry(headers http.Header) (http.Header, []cache.Option, bool) {
+func codeArtifactCacheEntry(headers http.Header, now time.Time) (http.Header, time.Duration, []cache.Option, bool) {
+	directives, ok := parseCodeArtifactCacheControl(headers.Values("Cache-Control"))
+	if !ok || !codeArtifactSharedCachePolicyAllowsStorage(directives) || !supportedCodeArtifactVary(headers.Values("Vary")) {
+		return nil, 0, nil, false
+	}
+	if headers.Get("Set-Cookie") != "" {
+		return nil, 0, nil, false
+	}
+	ttl, ok := codeArtifactFreshnessLifetime(headers, directives, now)
+	if !ok {
+		return nil, 0, nil, false
+	}
 	cacheHeaders := maps.Clone(headers)
+	cacheHeaders.Set(cache.ExpirationKey, now.Add(ttl).UTC().Format(time.RFC3339Nano))
 	validators := make([]string, 0, 2)
 	var createOptions []cache.Option
 	etag := cacheHeaders.Get(cache.ETagKey)
 	if etag != "" {
 		rawETag, err := cache.RawETagFromHeader(etag)
 		if err != nil {
-			return nil, nil, false
+			return nil, 0, nil, false
 		}
 		validators = append(validators, "etag")
 		createOptions = []cache.Option{cache.WithETag(rawETag)}
@@ -182,11 +149,98 @@ func codeArtifactCacheEntry(headers http.Header) (http.Header, []cache.Option, b
 		validators = append(validators, "last-modified")
 	}
 	cacheHeaders.Set(codeArtifactOriginValidatorsHeader, strings.Join(validators, ","))
-	return cacheHeaders, createOptions, true
+	return cacheHeaders, ttl, createOptions, true
 }
 
-func codeArtifactOriginHeaders(headers http.Header) http.Header {
+func parseCodeArtifactCacheControl(values []string) (map[string]string, bool) {
+	directives := make(map[string]string)
+	for _, value := range values {
+		for directive := range strings.SplitSeq(value, ",") {
+			name, argument, hasArgument := strings.Cut(strings.TrimSpace(directive), "=")
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name == "" {
+				continue
+			}
+			if _, duplicate := directives[name]; duplicate {
+				return nil, false
+			}
+			if hasArgument {
+				argument = strings.TrimSpace(argument)
+				if strings.HasPrefix(argument, `"`) {
+					unquoted, err := strconv.Unquote(argument)
+					if err != nil {
+						return nil, false
+					}
+					argument = unquoted
+				}
+			}
+			directives[name] = argument
+		}
+	}
+	return directives, true
+}
+
+func codeArtifactSharedCachePolicyAllowsStorage(directives map[string]string) bool {
+	for _, required := range []string{"public", "immutable"} {
+		if argument, ok := directives[required]; !ok || argument != "" {
+			return false
+		}
+	}
+	for _, forbidden := range []string{"no-cache", "no-store", "private"} {
+		if _, ok := directives[forbidden]; ok {
+			return false
+		}
+	}
+	return true
+}
+
+func supportedCodeArtifactVary(values []string) bool {
+	for _, value := range values {
+		for field := range strings.SplitSeq(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(field)) {
+			case "", "accept", "accept-encoding":
+			case "*":
+				return false
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func codeArtifactFreshnessLifetime(headers http.Header, directives map[string]string, now time.Time) (time.Duration, bool) {
+	value, ok := directives["s-maxage"]
+	if !ok {
+		value, ok = directives["max-age"]
+	}
+	if !ok {
+		return 0, false
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds <= 0 || seconds > int64(time.Duration(1<<63-1)/time.Second) {
+		return 0, false
+	}
+
+	age := time.Duration(0)
+	if ageValue := headers.Get("Age"); ageValue != "" {
+		ageSeconds, err := strconv.ParseInt(ageValue, 10, 64)
+		if err != nil || ageSeconds < 0 || ageSeconds > int64(time.Duration(1<<63-1)/time.Second) {
+			return 0, false
+		}
+		age = time.Duration(ageSeconds) * time.Second
+	}
+	if date, err := http.ParseTime(headers.Get("Date")); err == nil && now.After(date) {
+		age = max(age, now.Sub(date))
+	}
+	ttl := time.Duration(seconds)*time.Second - age
+	return ttl, ttl > 0
+}
+
+func codeArtifactOriginHeaders(headers http.Header, now time.Time) http.Header {
 	originHeaders := maps.Clone(headers)
+	updateCodeArtifactAge(originHeaders, now)
+	originHeaders.Del(cache.ExpirationKey)
 	validators := originHeaders.Get(codeArtifactOriginValidatorsHeader)
 	originHeaders.Del(codeArtifactOriginValidatorsHeader)
 	if !commaSeparatedValueContains(validators, "etag") {
@@ -196,6 +250,31 @@ func codeArtifactOriginHeaders(headers http.Header) http.Header {
 		originHeaders.Del("Last-Modified")
 	}
 	return originHeaders
+}
+
+func updateCodeArtifactAge(headers http.Header, now time.Time) {
+	expiresAt, err := time.Parse(time.RFC3339Nano, headers.Get(cache.ExpirationKey))
+	if err != nil {
+		return
+	}
+	directives, ok := parseCodeArtifactCacheControl(headers.Values("Cache-Control"))
+	if !ok {
+		return
+	}
+	value, ok := directives["s-maxage"]
+	if !ok {
+		value, ok = directives["max-age"]
+	}
+	if !ok {
+		return
+	}
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || seconds < 0 || seconds > int64(time.Duration(1<<63-1)/time.Second) {
+		return
+	}
+	age := time.Duration(seconds)*time.Second - expiresAt.Sub(now)
+	age = max(age, 0)
+	headers.Set("Age", strconv.FormatInt(int64(age/time.Second), 10))
 }
 
 func cachedPreconditionStatus(r *http.Request, headers http.Header) int {
@@ -265,7 +344,7 @@ func weakETagListMatches(headerValue, etag string) bool {
 
 func commaSeparatedValueContains(headerValue, want string) bool {
 	for value := range strings.SplitSeq(headerValue, ",") {
-		if strings.TrimSpace(value) == want {
+		if strings.EqualFold(strings.TrimSpace(value), want) {
 			return true
 		}
 	}
