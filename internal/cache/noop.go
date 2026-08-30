@@ -22,6 +22,8 @@ func NoOpCache() Cache {
 
 func (n *noOpCache) String() string { return "noop" }
 
+func (n *noOpCache) backendType() BackendType { return backendNoOp }
+
 func (n *noOpCache) Stat(_ context.Context, _ Key, _ ...Option) (http.Header, error) {
 	return nil, os.ErrNotExist
 }

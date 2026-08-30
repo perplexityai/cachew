@@ -59,6 +59,8 @@ func NewMemory(ctx context.Context, config MemoryConfig) (*Memory, error) {
 
 func (m *Memory) String() string { return fmt.Sprintf("memory:%dMB", m.config.LimitMB) }
 
+func (m *Memory) backendType() BackendType { return backendMemory }
+
 func (m *Memory) Stat(_ context.Context, key Key, opts ...Option) (http.Header, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

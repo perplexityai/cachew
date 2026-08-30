@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/errors"
 	"golang.org/x/sync/singleflight"
@@ -225,19 +226,23 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 		rewritten, ok := c.rewriteSameOriginLocation(resp.Request.URL, location)
 		if ok {
 			responseHeaders.Set("Location", rewritten)
+			c.metric.recordRedirect(r.Context(), codeArtifactRedirectSameOrigin)
 		} else {
 			if err := resp.Body.Close(); err != nil {
 				c.logger.ErrorContext(r.Context(), "Failed to close CodeArtifact response", "error", err)
 			}
 			resp, err = c.followCrossOriginRedirect(r, resp, location, rewriteMetadata)
 			if err != nil {
+				c.metric.recordRedirect(r.Context(), codeArtifactRedirectFailure)
 				c.writeError(w, r, err)
 				return
 			}
+			c.metric.recordRedirect(r.Context(), codeArtifactRedirectCrossOrigin)
 			if resp.Header.Get("Location") != "" {
 				if err := resp.Body.Close(); err != nil {
 					c.logger.ErrorContext(r.Context(), "Failed to close CodeArtifact response", "error", err)
 				}
+				c.metric.recordRedirect(r.Context(), codeArtifactRedirectChainedRejected)
 				c.writeError(w, r, errors.New("CodeArtifact redirect target returned another redirect"))
 				return
 			}
@@ -285,6 +290,7 @@ func (c *CodeArtifact) rewriteOriginMetadata(
 
 func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error) {
 	target := c.originURL(r)
+	started := time.Now()
 
 	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
 	if err != nil {
@@ -298,10 +304,16 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 
 	resp, err := c.client.Do(upstream)
 	if err != nil {
+		if c.metric != nil {
+			c.metric.recordOrigin(r.Context(), codeArtifactOriginObservation{
+				status: "transport_error", format: codeArtifactMetricFormat(target.Path), duration: time.Since(started),
+			})
+		}
 		// http.Client errors include the full request URL. Do not retain that
 		// client-controlled value because callers log this error.
 		return nil, errors.New("request CodeArtifact origin")
 	}
+	c.observeOriginResponse(r.Context(), resp, target.Path, started)
 	return resp, nil
 }
 
@@ -350,6 +362,7 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 	location string,
 	rewriteMetadata bool,
 ) (*http.Response, error) {
+	started := time.Now()
 	switch originResponse.StatusCode {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 	default:
@@ -376,11 +389,41 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 
 	resp, err := c.client.Do(redirected)
 	if err != nil {
+		if c.metric != nil {
+			c.metric.recordOrigin(r.Context(), codeArtifactOriginObservation{
+				status: "transport_error", format: codeArtifactMetricFormat(resolved.Path), duration: time.Since(started),
+			})
+		}
 		// A signed redirect URL is credential-bearing. Do not retain the
 		// http.Client error because it includes the full request URL.
 		return nil, errors.New("request CodeArtifact redirect")
 	}
+	c.observeOriginResponse(r.Context(), resp, resolved.Path, started)
 	return resp, nil
+}
+
+func (c *CodeArtifact) observeOriginResponse(ctx context.Context, resp *http.Response, path string, started time.Time) {
+	if c.metric == nil {
+		return
+	}
+	resp.Body = &observedCodeArtifactBody{
+		ReadCloser: resp.Body,
+		ctx:        ctx,
+		metric:     c.metric,
+		status:     resp.StatusCode,
+		format:     codeArtifactMetricFormat(path),
+		started:    started,
+	}
+}
+
+func codeArtifactMetricFormat(path string) string {
+	format := codeArtifactPackageFormat(path)
+	switch format {
+	case codeArtifactCargoFormat, "generic", "maven", "npm", "nuget", "pypi", "ruby", "swift":
+		return format
+	default:
+		return "other"
+	}
 }
 
 func (c *CodeArtifact) writeError(w http.ResponseWriter, r *http.Request, err error) {

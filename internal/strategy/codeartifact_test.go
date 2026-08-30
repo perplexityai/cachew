@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -149,7 +150,7 @@ func newTestCodeArtifact(
 func newTestCachingCodeArtifact(
 	t *testing.T,
 	origin http.Handler,
-) (*http.ServeMux, *httptest.Server, *localTokenServer, context.Context) {
+) (*http.ServeMux, *httptest.Server, *localTokenServer, *CodeArtifact, context.Context) {
 	t.Helper()
 	originServer := httptest.NewServer(origin)
 	t.Cleanup(originServer.Close)
@@ -160,9 +161,9 @@ func newTestCachingCodeArtifact(
 	assert.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
 	mux := http.NewServeMux()
-	_, err = newCodeArtifact(ctx, testCodeArtifactConfig(originServer.URL), mux, tokenServer.tokenManager(time.Now), memory, true)
+	strategy, err := newCodeArtifact(ctx, testCodeArtifactConfig(originServer.URL), mux, tokenServer.tokenManager(time.Now), memory, true)
 	assert.NoError(t, err)
-	return mux, originServer, tokenServer, ctx
+	return mux, originServer, tokenServer, strategy, ctx
 }
 
 func codeArtifactPath(origin *httptest.Server, suffix string) string {
@@ -228,7 +229,7 @@ func TestCodeArtifactCachesOriginDeclaredImmutableResponses(t *testing.T) {
 				w.Header().Set("ETag", testCodeArtifactETag)
 				_, _ = w.Write([]byte(testCodeArtifactBody))
 			})
-			mux, originServer, tokenServer, ctx := newTestCachingCodeArtifact(t, origin)
+			mux, originServer, tokenServer, _, ctx := newTestCachingCodeArtifact(t, origin)
 			requestURL := codeArtifactPath(originServer, path)
 
 			for range 2 {
@@ -254,7 +255,7 @@ func TestCodeArtifactPreservesValidatorsAcrossCacheHits(t *testing.T) {
 		w.Header().Set("Last-Modified", testCodeArtifactModified)
 		_, _ = w.Write([]byte(testCodeArtifactBody))
 	})
-	mux, originServer, tokenServer, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, tokenServer, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	prime := httptest.NewRecorder()
@@ -313,7 +314,7 @@ func TestCodeArtifactDoesNotCacheUnsupportedOriginETags(t *testing.T) {
 		w.Header().Set("ETag", weakETag)
 		_, _ = w.Write([]byte(testCodeArtifactBody))
 	})
-	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	for range 2 {
@@ -334,7 +335,7 @@ func TestCodeArtifactRequiresImmutableOriginPolicy(t *testing.T) {
 		w.Header().Set("ETag", testCodeArtifactETag)
 		_, _ = w.Write([]byte(testCodeArtifactBody))
 	})
-	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz")
 
 	for range 2 {
@@ -355,7 +356,7 @@ func TestCodeArtifactCachesAcceptVariantsSeparately(t *testing.T) {
 		w.Header().Set("Vary", "Accept")
 		_, _ = io.WriteString(w, r.Header.Get("Accept"))
 	})
-	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/future-format/repository/opaque/download")
 
 	for range 2 {
@@ -434,7 +435,7 @@ func TestCodeArtifactDoesNotExposeGeneratedValidators(t *testing.T) {
 		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
 		_, _ = w.Write([]byte(testCodeArtifactBody))
 	})
-	mux, originServer, tokenServer, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, tokenServer, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	tests := []struct {
@@ -485,7 +486,7 @@ func TestCodeArtifactDoesNotCacheRangesOrUnsuccessfulResponses(t *testing.T) {
 		}
 		_, _ = w.Write([]byte("complete"))
 	})
-	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	for range 2 {
@@ -524,7 +525,7 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 		_, _ = output.WriteString("HTTP/1.1 200 OK\r\nCache-Control: public, max-age=3600, immutable\r\nContent-Length: 20\r\n\r\nshort")
 		assert.NoError(t, output.Flush())
 	})
-	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	for range 2 {
@@ -535,6 +536,90 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 	}
 
 	assert.Equal(t, int32(2), requests.Load(), "an interrupted body must abort the cache entry")
+}
+
+type recordingCodeArtifactMetrics struct {
+	requests []codeArtifactCacheMode
+	cache    []recordedCodeArtifactCacheEvent
+	auth     []codeArtifactAuthEvent
+	origin   []recordedCodeArtifactOrigin
+	redirect []codeArtifactRedirectEvent
+}
+
+type recordedCodeArtifactCacheEvent struct {
+	event codeArtifactCacheEvent
+	tier  codeArtifactCacheTier
+}
+
+type recordedCodeArtifactOrigin struct {
+	status string
+	format string
+	size   int64
+}
+
+func (m *recordingCodeArtifactMetrics) recordRequest(_ context.Context, mode codeArtifactCacheMode) {
+	m.requests = append(m.requests, mode)
+}
+
+func (m *recordingCodeArtifactMetrics) recordCache(
+	_ context.Context,
+	event codeArtifactCacheEvent,
+	tier codeArtifactCacheTier,
+) {
+	m.cache = append(m.cache, recordedCodeArtifactCacheEvent{event: event, tier: tier})
+}
+
+func (m *recordingCodeArtifactMetrics) recordAuth(_ context.Context, event codeArtifactAuthEvent) {
+	m.auth = append(m.auth, event)
+}
+
+func (m *recordingCodeArtifactMetrics) recordOrigin(_ context.Context, observation codeArtifactOriginObservation) {
+	m.origin = append(m.origin, recordedCodeArtifactOrigin{
+		status: observation.status,
+		format: observation.format,
+		size:   observation.size,
+	})
+}
+
+func (m *recordingCodeArtifactMetrics) recordRedirect(_ context.Context, event codeArtifactRedirectEvent) {
+	m.redirect = append(m.redirect, event)
+}
+
+func TestCodeArtifactMetricsExposeOnlyBoundedDecisions(t *testing.T) {
+	origin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/immutable-payload") {
+			w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+		}
+		_, _ = w.Write([]byte("payload"))
+	})
+	mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, origin)
+	recorded := &recordingCodeArtifactMetrics{}
+	strategy.metric = recorded
+	immutable := codeArtifactPath(originServer, "/future-format/repository/opaque/immutable-payload")
+	mutable := codeArtifactPath(originServer, "/pypi/repository/simple/private-package/")
+
+	for _, requestURL := range []string{immutable, immutable, mutable} {
+		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx))
+	}
+
+	assert.Equal(t, []codeArtifactCacheMode{
+		codeArtifactCacheLookup,
+		codeArtifactCacheLookup,
+		codeArtifactCacheLookup,
+	}, recorded.requests)
+	assert.Equal(t, []recordedCodeArtifactCacheEvent{
+		{event: codeArtifactCacheMiss, tier: codeArtifactCacheTierNone},
+		{event: codeArtifactCacheStored, tier: codeArtifactCacheTierAll},
+		{event: codeArtifactCacheHit, tier: "memory"},
+		{event: codeArtifactCacheMiss, tier: codeArtifactCacheTierNone},
+		{event: codeArtifactCacheNotCacheable, tier: codeArtifactCacheTierNone},
+	}, recorded.cache)
+	assert.Equal(t, []codeArtifactAuthEvent{codeArtifactAuthRefresh, codeArtifactAuthReuse}, recorded.auth)
+	assert.Equal(t, []recordedCodeArtifactOrigin{
+		{status: "200", format: "other", size: 7},
+		{status: "200", format: "pypi", size: 7},
+	}, recorded.origin)
+	assert.Equal(t, []codeArtifactRedirectEvent(nil), recorded.redirect)
 }
 
 type countingCache struct {
@@ -1101,6 +1186,8 @@ func TestCodeArtifactRewritesSameOriginAndFollowsCrossOriginRedirects(t *testing
 	mux := http.NewServeMux()
 	strategy, err := newCodeArtifact(ctx, testCodeArtifactConfig(originServer.URL), mux, tokenServer.tokenManager(time.Now), cache.NoOpCache(), true)
 	assert.NoError(t, err)
+	recorded := &recordingCodeArtifactMetrics{}
+	strategy.metric = recorded
 	strategy.client.Transport = download.Client().Transport
 	originURL = originServer.URL
 
@@ -1132,4 +1219,8 @@ func TestCodeArtifactRewritesSameOriginAndFollowsCrossOriginRedirects(t *testing
 		acceptEncoding:     "gzip",
 		rawQuery:           "X-Amz-Signature=secret",
 	}, downloadRequest)
+	assert.Equal(t, []codeArtifactRedirectEvent{
+		codeArtifactRedirectSameOrigin,
+		codeArtifactRedirectCrossOrigin,
+	}, recorded.redirect)
 }
