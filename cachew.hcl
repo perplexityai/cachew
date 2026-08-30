@@ -5,11 +5,12 @@
 
 # Authenticated read-only AWS CodeArtifact proxy strategy
 # strategy codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
-#   target       = "https://example-111122223333.d.codeartifact.us-east-1.amazonaws.com"
-#   domain       = "example"
-#   domain-owner = "111122223333"
-#   region       = "us-east-1"
-#   role-arn     = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
+#   target         = "https://example-111122223333.d.codeartifact.us-east-1.amazonaws.com"
+#   proxy-base-url = "https://cachew.example.com"
+#   domain         = "example"
+#   domain-owner   = "111122223333"
+#   region         = "us-east-1"
+#   role-arn       = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
 # }
 
 state = "./state"
