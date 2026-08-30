@@ -119,11 +119,12 @@ func (s *localTokenServer) tokenManager(now func() time.Time) *codeArtifactToken
 
 func testCodeArtifactConfig(target string) CodeArtifactConfig {
 	return CodeArtifactConfig{
-		Target:      target,
-		Domain:      testCodeArtifactDomain,
-		DomainOwner: testCodeArtifactDomainOwner,
-		Region:      testCodeArtifactRegion,
-		RoleARN:     testCodeArtifactRoleARN,
+		Target:       target,
+		ProxyBaseURL: "https://cachew.example.com",
+		Domain:       testCodeArtifactDomain,
+		DomainOwner:  testCodeArtifactDomainOwner,
+		Region:       testCodeArtifactRegion,
+		RoleARN:      testCodeArtifactRoleARN,
 	}
 }
 
@@ -611,10 +612,38 @@ func TestCodeArtifactPassesThroughReadSemantics(t *testing.T) {
 	assert.Equal(t, testCodeArtifactDomainOwner, tokenServer.query.Get("domain-owner"))
 }
 
-func TestCodeArtifactPreservesHEADWithoutBody(t *testing.T) {
+func TestCodeArtifactUsesCargoTokenAuthorization(t *testing.T) {
+	const serviceToken = "cargo-service-token"
+	var authorization string
+	origin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("crate"))
+	})
+	mux, originServer, _, ctx := newTestCodeArtifact(
+		t,
+		origin,
+		tokenResponse{token: serviceToken, expiresAt: time.Now().Add(time.Hour)},
+	)
+	req := httptest.NewRequest(
+		http.MethodGet,
+		codeArtifactPath(originServer, "/cargo/repository/crates/package/1.2.3"),
+		nil,
+	).WithContext(ctx)
+	req.Header.Set("Authorization", "client-token")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "crate", w.Body.String())
+	assert.Equal(t, serviceToken, authorization)
+}
+
+func TestCodeArtifactRewritesMetadataHEADWithoutBody(t *testing.T) {
 	var method string
 	origin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method = r.Method
+		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", "123")
 		w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
 		w.WriteHeader(http.StatusOK)
@@ -629,8 +658,8 @@ func TestCodeArtifactPreservesHEADWithoutBody(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, http.MethodHead, method)
 	assert.Equal(t, "", w.Body.String())
-	assert.Equal(t, "123", w.Header().Get("Content-Length"))
-	assert.Equal(t, "Wed, 21 Oct 2015 07:28:00 GMT", w.Header().Get("Last-Modified"))
+	assert.Equal(t, "", w.Header().Get("Content-Length"))
+	assert.Equal(t, "", w.Header().Get("Last-Modified"))
 }
 
 func TestCodeArtifactRefreshesRejectedTokenOnce(t *testing.T) {
