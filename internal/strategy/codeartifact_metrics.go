@@ -22,12 +22,12 @@ const (
 type codeArtifactCacheEvent string
 
 const (
-	codeArtifactCacheHit                  codeArtifactCacheEvent = "hit"
-	codeArtifactCacheMiss                 codeArtifactCacheEvent = "miss"
-	codeArtifactCacheStored               codeArtifactCacheEvent = "stored"
-	codeArtifactCacheReadFailure          codeArtifactCacheEvent = "read_failure"
-	codeArtifactCacheWriteFailure         codeArtifactCacheEvent = "write_failure"
-	codeArtifactCacheUnsupportedValidator codeArtifactCacheEvent = "unsupported_validator"
+	codeArtifactCacheHit          codeArtifactCacheEvent = "hit"
+	codeArtifactCacheMiss         codeArtifactCacheEvent = "miss"
+	codeArtifactCacheStored       codeArtifactCacheEvent = "stored"
+	codeArtifactCacheReadFailure  codeArtifactCacheEvent = "read_failure"
+	codeArtifactCacheWriteFailure codeArtifactCacheEvent = "write_failure"
+	codeArtifactCacheNotCacheable codeArtifactCacheEvent = "not_cacheable"
 )
 
 type codeArtifactMetricRecorder interface {
