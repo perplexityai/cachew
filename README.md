@@ -106,10 +106,17 @@ The role needs `codeartifact:GetAuthorizationToken` and its underlying principal
 needs `sts:GetServiceBearerToken`. Repository read permissions remain governed by
 the CodeArtifact resource policy.
 
-Cachew stores reviewed immutable Maven assets and generic package assets whose
-versions are canonical stable semantic versions. Metadata, aliases, prereleases,
-build-qualified versions, ranges, and unknown package paths remain authenticated
-pass-through requests.
+Cachew checks its cache for every full CodeArtifact `GET` without a query string,
+range, or encoded path separator. On a miss, it stores only a successful,
+complete response with a positive shared freshness lifetime and an origin policy
+that includes both `public` and `immutable`. Responses with `private`, `no-cache`,
+`no-store`, `Set-Cookie`, or unsupported `Vary` fields remain authenticated
+pass-through reads. Supported `Accept` and `Accept-Encoding` representations use
+separate cache keys, and concurrent cold fills for the same representation are
+coalesced. This keeps cache eligibility independent of package-format path
+conventions without overriding HTTP shared-cache safety. CodeArtifact generic
+packages use AWS CLI or SDK asset APIs rather than a package repository endpoint,
+so they are outside this HTTP proxy strategy.
 
 ### Host
 
