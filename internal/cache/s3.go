@@ -157,6 +157,8 @@ func (s *S3) String() string {
 	return fmt.Sprintf("s3:%s/%s", s.client.EndpointURL().Host, s.config.Bucket)
 }
 
+func (s *S3) backendType() BackendType { return backendS3 }
+
 func (s *S3) Close() error {
 	return nil
 }

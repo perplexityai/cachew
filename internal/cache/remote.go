@@ -34,6 +34,8 @@ func NewRemote(baseURL string, headerFunc HeaderFunc) *Remote {
 
 func (r *Remote) String() string { return r.c.String() }
 
+func (r *Remote) backendType() BackendType { return backendRemote }
+
 func (r *Remote) Namespace(namespace Namespace) Cache {
 	return &Remote{c: r.c.Namespace(namespace)}
 }

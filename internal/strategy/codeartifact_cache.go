@@ -50,11 +50,11 @@ func (c *CodeArtifact) cacheKey(r *http.Request) cache.Key {
 }
 
 func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool {
-	body, headers, err := c.cache.Open(r.Context(), c.cacheKey(r))
+	body, headers, tier, err := cache.OpenWithTier(r.Context(), c.cache, c.cacheKey(r))
 	if err == nil {
 		headers = codeArtifactOriginHeaders(headers, time.Now())
 		if status := cachedPreconditionStatus(r, headers); status != 0 {
-			c.metric.recordCache(r.Context(), codeArtifactCacheHit)
+			c.metric.recordCache(r.Context(), codeArtifactCacheHit, boundedCodeArtifactCacheTier(tier))
 			if closeErr := body.Close(); closeErr != nil {
 				c.logger.ErrorContext(r.Context(), "Failed to close cached CodeArtifact response", "error", closeErr)
 			}
@@ -66,17 +66,17 @@ func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool 
 		}
 	}
 	if handled, _, serveErr := httputil.ServeCacheHit(w, headers, body, err); handled {
-		c.metric.recordCache(r.Context(), codeArtifactCacheHit)
+		c.metric.recordCache(r.Context(), codeArtifactCacheHit, boundedCodeArtifactCacheTier(tier))
 		if serveErr != nil {
 			c.logger.ErrorContext(r.Context(), "Failed to serve cached CodeArtifact response", "error", serveErr)
 		}
 		return true
 	}
 	if errors.Is(err, os.ErrNotExist) {
-		c.metric.recordCache(r.Context(), codeArtifactCacheMiss)
+		c.metric.recordCache(r.Context(), codeArtifactCacheMiss, codeArtifactCacheTierNone)
 		return false
 	}
-	c.metric.recordCache(r.Context(), codeArtifactCacheReadFailure)
+	c.metric.recordCache(r.Context(), codeArtifactCacheReadFailure, codeArtifactCacheTierUnknown)
 	c.logger.ErrorContext(r.Context(), "Failed to read CodeArtifact cache", "error", err)
 	return false
 }
@@ -89,14 +89,14 @@ func (c *CodeArtifact) streamAndCache(
 ) {
 	cacheHeaders, ttl, createOptions, cacheable := codeArtifactCacheEntry(responseHeaders, time.Now())
 	if !cacheable {
-		c.metric.recordCache(r.Context(), codeArtifactCacheNotCacheable)
+		c.metric.recordCache(r.Context(), codeArtifactCacheNotCacheable, codeArtifactCacheTierNone)
 		c.streamOriginBody(r.Context(), w, resp.Body)
 		return
 	}
 
 	writer, err := c.cache.Create(r.Context(), c.cacheKey(r), cacheHeaders, ttl, createOptions...)
 	if err != nil {
-		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure)
+		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
 		c.logger.ErrorContext(r.Context(), "Failed to create CodeArtifact cache entry", "error", err)
 		c.streamOriginBody(r.Context(), w, resp.Body)
 		return
@@ -106,18 +106,18 @@ func (c *CodeArtifact) streamAndCache(
 	_, copyErr := io.Copy(w, io.TeeReader(resp.Body, cacheCopy))
 	if copyErr != nil || cacheCopy.err != nil {
 		abortErr := writer.Abort(errors.Join(copyErr, cacheCopy.err))
-		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure)
+		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
 		if err := errors.Join(copyErr, cacheCopy.err, abortErr); err != nil {
 			c.logger.ErrorContext(r.Context(), "Failed to cache complete CodeArtifact response", "error", err)
 		}
 		return
 	}
 	if err := writer.Close(); err != nil {
-		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure)
+		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
 		c.logger.ErrorContext(r.Context(), "Failed to commit CodeArtifact cache entry", "error", err)
 		return
 	}
-	c.metric.recordCache(r.Context(), codeArtifactCacheStored)
+	c.metric.recordCache(r.Context(), codeArtifactCacheStored, codeArtifactCacheTierAll)
 }
 
 func codeArtifactCacheEntry(headers http.Header, now time.Time) (http.Header, time.Duration, []cache.Option, bool) {

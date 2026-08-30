@@ -142,6 +142,8 @@ func (d *Disk) keyLock(namespace Namespace, key Key) *sync.RWMutex {
 
 func (d *Disk) String() string { return "disk:" + d.config.Root }
 
+func (d *Disk) backendType() BackendType { return backendDisk }
+
 func (d *Disk) Close() error {
 	d.stop()
 	<-d.evictionDone
