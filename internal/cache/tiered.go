@@ -57,6 +57,15 @@ func (c authoritativeCache) Namespace(namespace Namespace) Cache {
 	return authoritativeCache{Cache: c.Cache.Namespace(namespace)}
 }
 
+func (c authoritativeCache) OpenWithTier(
+	ctx context.Context,
+	key Key,
+	opts ...Option,
+) (io.ReadCloser, http.Header, BackendType, error) {
+	body, headers, err := c.Cache.Open(ctx, key, opts...)
+	return body, headers, cacheBackendType(c.Cache), errors.WithStack(err)
+}
+
 var _ Cache = (*Tiered)(nil)
 
 // Close all underlying caches.
@@ -261,6 +270,13 @@ func StatAuthoritative(ctx context.Context, c Cache, key Key, opts ...Option) (h
 //
 // If all caches fail, all errors are returned.
 func (t Tiered) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
+	body, headers, _, err := t.OpenWithTier(ctx, key, opts...)
+	return body, headers, err
+}
+
+// OpenWithTier reports the source before a tier-zero backfill can obscure which
+// backend supplied the representation.
+func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, BackendType, error) {
 	ro := NewRequestOptions(opts...)
 	// A Range request yields a partial body, which must never be backfilled
 	// into a lower tier as if it were the whole object.
@@ -270,6 +286,7 @@ func (t Tiered) Open(ctx context.Context, key Key, opts ...Option) (io.ReadClose
 	// fallback, served only if no deeper tier holds the pinned version.
 	var fallback io.ReadCloser
 	var fallbackHeaders http.Header
+	var fallbackTier BackendType
 	var probeErrs []error
 	rejected := false // a tier failed If-Match; deeper tiers may hold the named version
 
@@ -293,14 +310,14 @@ func (t Tiered) Open(ctx context.Context, key Key, opts ...Option) (io.ReadClose
 			if fallback != nil {
 				discardTieredReader(ctx, key, fallback)
 			}
-			return nil, headers, errors.WithStack(err)
+			return nil, headers, cacheBackendType(c), errors.WithStack(err)
 		case err != nil:
 			// A hard error is definitive when no earlier tier produced a
 			// servable outcome. Otherwise defer it: a deeper tier may still
 			// satisfy the validator, but if none does the error is surfaced in
 			// preference to the degraded fallback/412.
 			if fallback == nil && !rejected {
-				return nil, headers, errors.WithStack(err)
+				return nil, headers, cacheBackendType(c), errors.WithStack(err)
 			}
 			probeErrs = append(probeErrs, errors.WithStack(err))
 			continue
@@ -314,27 +331,34 @@ func (t Tiered) Open(ctx context.Context, key Key, opts ...Option) (io.ReadClose
 				discardTieredReader(ctx, key, r)
 				continue
 			}
-			fallback, fallbackHeaders = r, headers
+			fallback, fallbackHeaders, fallbackTier = r, headers, cacheBackendType(c)
 			continue
 		}
 		if fallback != nil {
 			discardTieredReader(ctx, key, fallback)
 		}
-		return t.convergeTier0(ctx, key, r, headers, c, i, partial), headers, nil
+		return t.convergeTier0(ctx, key, r, headers, c, i, partial), headers, cacheBackendType(c), nil
 	}
 	if len(probeErrs) > 0 {
 		if fallback != nil {
 			probeErrs = append(probeErrs, fallback.Close())
 		}
-		return nil, nil, errors.Join(probeErrs...)
+		return nil, nil, backendUnknown, errors.Join(probeErrs...)
 	}
 	if fallback != nil {
-		return fallback, fallbackHeaders, nil
+		return fallback, fallbackHeaders, fallbackTier, nil
 	}
 	if rejected {
-		return nil, nil, errors.WithStack(ErrPreconditionFailed)
+		return nil, nil, backendUnknown, errors.WithStack(ErrPreconditionFailed)
 	}
-	return nil, nil, errors.Join(errs...)
+	return nil, nil, backendUnknown, errors.Join(errs...)
+}
+
+func cacheBackendType(c Cache) BackendType {
+	if typed, ok := c.(backendTypedCache); ok {
+		return typed.backendType()
+	}
+	return backendUnknown
 }
 
 func discardTieredReader(ctx context.Context, key Key, r io.ReadCloser) {

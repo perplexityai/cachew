@@ -231,6 +231,48 @@ type Cache interface {
 	Close() error
 }
 
+// BackendType is a bounded cache implementation identifier suitable for
+// operational attribution.
+type BackendType string
+
+const (
+	backendUnknown BackendType = "unknown"
+	backendMemory  BackendType = "memory"
+	backendDisk    BackendType = "disk"
+	backendS3      BackendType = "s3"
+	backendRemote  BackendType = "remote"
+	backendNoOp    BackendType = "noop"
+)
+
+type backendTypedCache interface {
+	backendType() BackendType
+}
+
+type tierAwareCache interface {
+	OpenWithTier(context.Context, Key, ...Option) (io.ReadCloser, http.Header, BackendType, error)
+}
+
+// OpenWithTier reports the source before a tiered read can backfill tier zero
+// and obscure which backend actually supplied the representation.
+func OpenWithTier(ctx context.Context, c Cache, key Key, opts ...Option) (io.ReadCloser, http.Header, BackendType, error) {
+	if tiered, ok := c.(tierAwareCache); ok {
+		body, headers, tier, err := tiered.OpenWithTier(ctx, key, opts...)
+		return unexpiredOpenResult(body, headers, tier, err)
+	}
+	body, headers, err := c.Open(ctx, key, opts...)
+	return unexpiredOpenResult(body, headers, cacheBackendType(c), err)
+}
+
+func unexpiredOpenResult(
+	body io.ReadCloser,
+	headers http.Header,
+	backend BackendType,
+	err error,
+) (io.ReadCloser, http.Header, BackendType, error) {
+	body, headers, err = unexpiredCacheResult(body, headers, err, time.Now())
+	return body, headers, backend, errors.WithStack(err)
+}
+
 // WriteFunc is a convenience wrapper around Cache.Create that handles aborting
 // the write on error. The provided function receives a writer; if it returns an
 // error the cache entry is discarded. On success the entry is committed.

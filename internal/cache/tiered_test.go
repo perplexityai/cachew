@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -231,10 +232,11 @@ func TestTieredBackfillPermutations(t *testing.T) {
 			assert.IsError(t, err, os.ErrNotExist)
 
 			// Open through tiered — should hit upper and backfill lower.
-			r, headers, err := tiered.Open(ctx, key)
+			r, headers, source, err := cache.OpenWithTier(ctx, tiered, key)
 			assert.NoError(t, err)
 			assert.Equal(t, content, readAllAndClose(t, r))
 			assert.Equal(t, etag, headers.Get(cache.ETagKey))
+			assert.Equal(t, cache.BackendType(strings.ToLower(perm.upper.name)), source)
 
 			// Now lower tier should have the entry via backfill.
 			r2, lowerHeaders, err := lower.Open(ctx, key)
