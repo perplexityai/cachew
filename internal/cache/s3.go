@@ -275,6 +275,9 @@ func (s *S3) statAndHeaders(ctx context.Context, key Key) (minio.ObjectInfo, htt
 	}
 
 	maps.Copy(headers, meta.Headers)
+	if cacheEntryExpired(headers, time.Now()) {
+		return minio.ObjectInfo{}, nil, s3Meta{}, os.ErrNotExist
+	}
 
 	// Companion expiry takes precedence over the data object's Expires header.
 	if meta.ExpiresAt.IsZero() {
@@ -315,6 +318,13 @@ func (s *S3) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, 
 	objectName := s.keyToPath(s.namespace, key)
 
 	if newExpiresAt, ok := s.refreshedExpiry(hasSlidingExpiry(objInfo), meta.ExpiresAt, time.Now()); ok {
+		// A sliding refresh must not outlive the writer-selected freshness boundary.
+		if semanticExpiration, present, valid := cacheEntryExpiration(headers); present && valid {
+			semanticExpiration = ceilSecond(semanticExpiration)
+			if newExpiresAt.After(semanticExpiration) {
+				newExpiresAt = semanticExpiration
+			}
+		}
 		// Preserve every companion header, not just the ETag, so headers
 		// recorded by UpdateMetadata survive the refresh.
 		refreshMeta := s3Meta{Headers: meta.Headers.Clone(), ExpiresAt: newExpiresAt, Tag: meta.Tag}

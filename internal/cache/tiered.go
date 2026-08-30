@@ -233,6 +233,10 @@ func (t Tiered) Stat(ctx context.Context, key Key, opts ...Option) (http.Header,
 	for i, c := range t.caches {
 		headers, err := c.Stat(ctx, key, opts...)
 		errs[i] = err
+		if cacheEntryExpired(headers, time.Now()) {
+			errs[i] = os.ErrNotExist
+			continue
+		}
 		switch {
 		case errors.Is(err, os.ErrNotExist):
 			continue
@@ -275,6 +279,9 @@ var _ AuthoritativeStater = (*Tiered)(nil)
 // construction.
 func (t Tiered) AuthoritativeStat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
 	headers, err := t.caches[len(t.caches)-1].Stat(ctx, key, opts...)
+	if cacheEntryExpired(headers, time.Now()) {
+		return nil, os.ErrNotExist
+	}
 	return headers, errors.WithStack(err)
 }
 
@@ -286,6 +293,9 @@ func StatAuthoritative(ctx context.Context, c Cache, key Key, opts ...Option) (h
 		return headers, errors.WithStack(err)
 	}
 	headers, err := c.Stat(ctx, key, opts...)
+	if cacheEntryExpired(headers, time.Now()) {
+		return nil, os.ErrNotExist
+	}
 	return headers, errors.WithStack(err)
 }
 
@@ -323,6 +333,7 @@ func (t Tiered) Open(ctx context.Context, key Key, opts ...Option) (io.ReadClose
 	errs := make([]error, len(t.caches))
 	for i, c := range t.caches {
 		r, headers, err := c.Open(ctx, key, opts...)
+		r, headers, err = unexpiredCacheResult(r, headers, err, time.Now())
 		errs[i] = err
 		switch {
 		case errors.Is(err, os.ErrNotExist):
@@ -403,7 +414,8 @@ func (t Tiered) backfillReader(ctx context.Context, key Key, src io.ReadCloser, 
 	// The Cache contract guarantees that cancelled-context writes are discarded.
 	writeCtx, cancel := context.WithCancel(ctx)
 	createOpts := backfillCreateOptions(headers)
-	w, err := dst.Create(writeCtx, key, headers, 0, createOpts...) // 0 → use the cache's max TTL
+	ttl := cacheEntryTTL(headers, time.Now())
+	w, err := dst.Create(writeCtx, key, headers, ttl, createOpts...)
 	w = observeWriter(writeCtx, dst, 0, w, err)
 	if err != nil {
 		cancel()
@@ -561,7 +573,8 @@ func (t Tiered) backfillTier0FromSource(ctx context.Context, key Key, source Cac
 		return
 	}
 
-	w, err := t.caches[0].Create(ctx, key, headers, 0, backfillCreateOptions(headers)...) // 0 → cache's max TTL
+	ttl := cacheEntryTTL(headers, time.Now())
+	w, err := t.caches[0].Create(ctx, key, headers, ttl, backfillCreateOptions(headers)...)
 	w = observeWriter(ctx, t.caches[0], 0, w, err)
 	if err != nil {
 		result = "create_error"
