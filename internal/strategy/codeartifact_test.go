@@ -31,6 +31,7 @@ const (
 	testCodeArtifactRoleARN        = "arn:aws:iam::123456789012:role/cachew-reader"
 	testCodeArtifactETag           = `"asset-v1"`
 	testCodeArtifactBody           = "immutable payload"
+	testCodeArtifactCacheControl   = "public, max-age=3600, immutable"
 	testCodeArtifactModified       = "Wed, 21 Oct 2015 07:28:00 GMT"
 	testCodeArtifactBeforeModified = "Wed, 21 Oct 2015 07:27:59 GMT"
 	testCodeArtifactFutureModified = "Wed, 21 Oct 2030 07:28:00 GMT"
@@ -148,7 +149,7 @@ func newTestCodeArtifact(
 func newTestCachingCodeArtifact(
 	t *testing.T,
 	origin http.Handler,
-) (*http.ServeMux, *httptest.Server, *localTokenServer, *CodeArtifact, context.Context) {
+) (*http.ServeMux, *httptest.Server, *localTokenServer, context.Context) {
 	t.Helper()
 	originServer := httptest.NewServer(origin)
 	t.Cleanup(originServer.Close)
@@ -159,9 +160,9 @@ func newTestCachingCodeArtifact(
 	assert.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
 	mux := http.NewServeMux()
-	strategy, err := newCodeArtifact(ctx, testCodeArtifactConfig(originServer.URL), mux, tokenServer.tokenManager(time.Now), memory, true)
+	_, err = newCodeArtifact(ctx, testCodeArtifactConfig(originServer.URL), mux, tokenServer.tokenManager(time.Now), memory, true)
 	assert.NoError(t, err)
-	return mux, originServer, tokenServer, strategy, ctx
+	return mux, originServer, tokenServer, ctx
 }
 
 func codeArtifactPath(origin *httptest.Server, suffix string) string {
@@ -211,21 +212,24 @@ func TestCodeArtifactSanitizesOriginTransportErrors(t *testing.T) {
 	assert.EqualError(t, err, "request CodeArtifact origin")
 }
 
-func TestCodeArtifactCachesReviewedImmutableAssets(t *testing.T) {
-	for _, suffix := range []string{
-		"/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3-darwin-arm64.tar.gz",
-		"/generic/repository/devx/tool/1.2.3/darwin/arm64/tool.tar.gz",
-		"/generic/repository/devx/tool/v1.2.3/tool.tar.gz",
-	} {
-		t.Run(suffix, func(t *testing.T) {
+func TestCodeArtifactCachesOriginDeclaredImmutableResponses(t *testing.T) {
+	paths := []string{
+		"/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar",
+		"/maven/repository/com/perplexity/tool/maven-metadata.xml",
+		"/future-format/repository/opaque/download",
+	}
+
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
 			var requests atomic.Int32
 			origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				requests.Add(1)
+				w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
 				w.Header().Set("ETag", testCodeArtifactETag)
 				_, _ = w.Write([]byte(testCodeArtifactBody))
 			})
-			mux, originServer, tokenServer, _, ctx := newTestCachingCodeArtifact(t, origin)
-			requestURL := codeArtifactPath(originServer, suffix)
+			mux, originServer, tokenServer, ctx := newTestCachingCodeArtifact(t, origin)
+			requestURL := codeArtifactPath(originServer, path)
 
 			for range 2 {
 				w := httptest.NewRecorder()
@@ -245,11 +249,12 @@ func TestCodeArtifactPreservesValidatorsAcrossCacheHits(t *testing.T) {
 	var requests atomic.Int32
 	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
 		w.Header().Set("ETag", testCodeArtifactETag)
 		w.Header().Set("Last-Modified", testCodeArtifactModified)
 		_, _ = w.Write([]byte(testCodeArtifactBody))
 	})
-	mux, originServer, tokenServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, tokenServer, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	prime := httptest.NewRecorder()
@@ -304,11 +309,12 @@ func TestCodeArtifactDoesNotCacheUnsupportedOriginETags(t *testing.T) {
 	var requests atomic.Int32
 	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
 		w.Header().Set("ETag", weakETag)
 		_, _ = w.Write([]byte(testCodeArtifactBody))
 	})
-	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
-	assetURL := codeArtifactPath(originServer, "/generic/repository/devx/tool/1.2.3/tool.tar.gz")
+	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	for range 2 {
 		w := httptest.NewRecorder()
@@ -321,13 +327,114 @@ func TestCodeArtifactDoesNotCacheUnsupportedOriginETags(t *testing.T) {
 	assert.Equal(t, int32(2), requests.Load(), "an origin validator Cachew cannot preserve must bypass cache")
 }
 
+func TestCodeArtifactRequiresImmutableOriginPolicy(t *testing.T) {
+	var requests atomic.Int32
+	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("ETag", testCodeArtifactETag)
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	})
+	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	assetURL := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz")
+
+	for range 2 {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, assetURL, nil).WithContext(ctx))
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, testCodeArtifactBody, w.Body.String())
+	}
+
+	assert.Equal(t, int32(2), requests.Load(), "Cachew must honor the origin's mutable cache policy")
+}
+
+func TestCodeArtifactCachesAcceptVariantsSeparately(t *testing.T) {
+	var requests atomic.Int32
+	origin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+		w.Header().Set("Vary", "Accept")
+		_, _ = io.WriteString(w, r.Header.Get("Accept"))
+	})
+	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	assetURL := codeArtifactPath(originServer, "/future-format/repository/opaque/download")
+
+	for range 2 {
+		for _, accept := range []string{"application/json", "application/octet-stream"} {
+			req := httptest.NewRequest(http.MethodGet, assetURL, nil).WithContext(ctx)
+			req.Header.Set("Accept", accept)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, accept, w.Body.String())
+		}
+	}
+
+	assert.Equal(t, int32(2), requests.Load(), "each representation should populate once")
+}
+
+func TestCodeArtifactRejectsUnsafeSharedCachePolicies(t *testing.T) {
+	tests := []struct {
+		name         string
+		cacheControl string
+		vary         string
+		setCookie    string
+	}{
+		{name: "missing public", cacheControl: "max-age=3600, immutable"},
+		{name: "missing freshness", cacheControl: "public, immutable"},
+		{name: "zero freshness", cacheControl: "public, max-age=0, immutable"},
+		{name: "no store", cacheControl: "public, max-age=3600, immutable, no-store"},
+		{name: "no cache", cacheControl: "public, max-age=3600, immutable, no-cache"},
+		{name: "private", cacheControl: "public, max-age=3600, immutable, private"},
+		{name: "vary wildcard", cacheControl: testCodeArtifactCacheControl, vary: "*"},
+		{name: "unsupported vary", cacheControl: testCodeArtifactCacheControl, vary: "User-Agent"},
+		{name: "sets cookie", cacheControl: testCodeArtifactCacheControl, setCookie: "session=secret"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			headers := http.Header{
+				"Cache-Control": {test.cacheControl},
+				"Vary":          {test.vary},
+				"Set-Cookie":    {test.setCookie},
+			}
+			_, _, _, cacheable := codeArtifactCacheEntry(headers, time.Now())
+			assert.False(t, cacheable)
+		})
+	}
+}
+
+func TestCodeArtifactUsesRemainingSharedFreshness(t *testing.T) {
+	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	headers := http.Header{
+		"Cache-Control": {"public, max-age=3600, s-maxage=600, immutable"},
+		"Age":           {"120"},
+	}
+	_, ttl, _, cacheable := codeArtifactCacheEntry(headers, now)
+
+	assert.True(t, cacheable)
+	assert.Equal(t, 8*time.Minute, ttl)
+}
+
+func TestCodeArtifactAdvancesAgeOnCacheHits(t *testing.T) {
+	now := time.Date(2026, time.August, 29, 12, 0, 0, 0, time.UTC)
+	headers := http.Header{
+		"Cache-Control":     {"public, max-age=3600, s-maxage=600, immutable"},
+		cache.ExpirationKey: {now.Add(8 * time.Minute).Format(time.RFC3339Nano)},
+	}
+
+	originHeaders := codeArtifactOriginHeaders(headers, now)
+
+	assert.Equal(t, "120", originHeaders.Get("Age"))
+	assert.Equal(t, "", originHeaders.Get(cache.ExpirationKey))
+}
+
 func TestCodeArtifactDoesNotExposeGeneratedValidators(t *testing.T) {
 	var requests atomic.Int32
 	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
 		_, _ = w.Write([]byte(testCodeArtifactBody))
 	})
-	mux, originServer, tokenServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, tokenServer, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	tests := []struct {
@@ -365,6 +472,7 @@ func TestCodeArtifactDoesNotCacheRangesOrUnsuccessfulResponses(t *testing.T) {
 	var requests atomic.Int32
 	origin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
 		if r.URL.Query().Has("missing") {
 			http.NotFound(w, r)
 			return
@@ -377,7 +485,7 @@ func TestCodeArtifactDoesNotCacheRangesOrUnsuccessfulResponses(t *testing.T) {
 		}
 		_, _ = w.Write([]byte("complete"))
 	})
-	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
+	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
 	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	for range 2 {
@@ -407,16 +515,17 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 	var requests atomic.Int32
 	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
 		hijacker, ok := w.(http.Hijacker)
 		assert.True(t, ok)
 		conn, output, err := hijacker.Hijack()
 		assert.NoError(t, err)
 		defer conn.Close()
-		_, _ = output.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort")
+		_, _ = output.WriteString("HTTP/1.1 200 OK\r\nCache-Control: public, max-age=3600, immutable\r\nContent-Length: 20\r\n\r\nshort")
 		assert.NoError(t, output.Flush())
 	})
-	mux, originServer, _, _, ctx := newTestCachingCodeArtifact(t, origin)
-	assetURL := codeArtifactPath(originServer, "/generic/repository/devx/tool/1.2.3/tool.tar.gz")
+	mux, originServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	assetURL := codeArtifactPath(originServer, "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar")
 
 	for range 2 {
 		w := httptest.NewRecorder()
@@ -428,47 +537,44 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 	assert.Equal(t, int32(2), requests.Load(), "an interrupted body must abort the cache entry")
 }
 
-type recordingCodeArtifactMetrics struct {
-	requests []codeArtifactCacheMode
-	cache    []codeArtifactCacheEvent
-	auth     []codeArtifactAuthEvent
-}
-
-func (m *recordingCodeArtifactMetrics) recordRequest(_ context.Context, mode codeArtifactCacheMode) {
-	m.requests = append(m.requests, mode)
-}
-
-func (m *recordingCodeArtifactMetrics) recordCache(_ context.Context, event codeArtifactCacheEvent) {
-	m.cache = append(m.cache, event)
-}
-
-func (m *recordingCodeArtifactMetrics) recordAuth(_ context.Context, event codeArtifactAuthEvent) {
-	m.auth = append(m.auth, event)
-}
-
-func TestCodeArtifactMetricsExposeOnlyBoundedDecisions(t *testing.T) {
-	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("payload"))
-	})
-	mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, origin)
-	recorded := &recordingCodeArtifactMetrics{}
-	strategy.metric = recorded
-	immutable := codeArtifactPath(originServer, "/maven/repository/com/perplexity/private-tool/1.2.3/private-tool-1.2.3.jar")
-	mutable := codeArtifactPath(originServer, "/pypi/repository/simple/private-package/")
-
-	for _, requestURL := range []string{immutable, immutable, mutable} {
-		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx))
-	}
-
-	assert.Equal(t, []codeArtifactCacheMode{codeArtifactCacheImmutable, codeArtifactCacheImmutable, codeArtifactCachePassthrough}, recorded.requests)
-	assert.Equal(t, []codeArtifactCacheEvent{codeArtifactCacheMiss, codeArtifactCacheStored, codeArtifactCacheHit}, recorded.cache)
-	assert.Equal(t, []codeArtifactAuthEvent{codeArtifactAuthRefresh, codeArtifactAuthReuse}, recorded.auth)
-}
-
 type countingCache struct {
 	cache.Cache
 	opens   atomic.Int32
 	creates atomic.Int32
+}
+
+type synchronizedOpenCache struct {
+	cache.Cache
+	waitFor int32
+	opens   atomic.Int32
+	ready   chan struct{}
+}
+
+func (c *synchronizedOpenCache) Namespace(cache.Namespace) cache.Cache {
+	return c
+}
+
+func (c *synchronizedOpenCache) Open(
+	ctx context.Context,
+	key cache.Key,
+	opts ...cache.Option,
+) (io.ReadCloser, http.Header, error) {
+	opened := c.opens.Add(1)
+	if opened <= c.waitFor {
+		if opened == c.waitFor {
+			close(c.ready)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-c.ready:
+		}
+	}
+	return c.Cache.Open(ctx, key, opts...)
+}
+
+func (c *countingCache) Namespace(cache.Namespace) cache.Cache {
+	return c
 }
 
 func (c *countingCache) Open(ctx context.Context, key cache.Key, opts ...cache.Option) (io.ReadCloser, http.Header, error) {
@@ -481,19 +587,60 @@ func (c *countingCache) Create(ctx context.Context, key cache.Key, headers http.
 	return c.Cache.Create(ctx, key, headers, ttl, opts...)
 }
 
-func TestCodeArtifactMutableAndUnknownPathsBypassCache(t *testing.T) {
-	paths := []string{
-		"/maven/repository/com/perplexity/tool/maven-metadata.xml",
-		"/maven/repository/com/perplexity/tool/1.2-SNAPSHOT/tool-1.2-SNAPSHOT.jar",
-		"/generic/repository/devx/tool/tool.tar.gz",
-		"/generic/repository/devx/tool/latest/tool.tar.gz",
-		"/generic/repository/devx/tool/nightly/tool.tar.gz",
-		"/generic/repository/devx/tool/main/tool.tar.gz",
-		"/generic/repository/devx/tool/1.2/tool.tar.gz",
-		"/generic/repository/devx/tool/01.2.3/tool.tar.gz",
-		"/generic/repository/devx/tool/1.2.3-nightly/tool.tar.gz",
-		"/generic/repository/devx/tool/1.2.3+build.1/tool.tar.gz",
-		"/npm/repository/package/-/package-1.2.3.tgz",
+func TestCodeArtifactCoalescesConcurrentImmutableCacheFills(t *testing.T) {
+	const callers = 8
+	var originRequests atomic.Int32
+	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+		_, _ = io.WriteString(w, testCodeArtifactBody)
+	})
+	originServer := httptest.NewServer(origin)
+	t.Cleanup(originServer.Close)
+	tokenServer := newLocalTokenServer(t, tokenResponse{token: "token", expiresAt: time.Now().Add(time.Hour)})
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
+	barrier := &synchronizedOpenCache{Cache: memory, waitFor: callers, ready: make(chan struct{})}
+	mux := http.NewServeMux()
+	_, err = newCodeArtifact(ctx, testCodeArtifactConfig(originServer.URL), mux, tokenServer.tokenManager(time.Now), barrier, true)
+	assert.NoError(t, err)
+	requestURL := codeArtifactPath(originServer, "/future-format/repository/opaque/download")
+
+	start := make(chan struct{})
+	responses := make(chan string, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for range callers {
+		go func() {
+			defer wg.Done()
+			<-start
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx))
+			assert.Equal(t, http.StatusOK, w.Code)
+			responses <- w.Body.String()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(responses)
+
+	for body := range responses {
+		assert.Equal(t, testCodeArtifactBody, body)
+	}
+	assert.Equal(t, int32(1), originRequests.Load())
+	assert.Equal(t, 1, tokenServer.requestCount())
+}
+
+func TestCodeArtifactMutableAndUnknownPathsAreNotStored(t *testing.T) {
+	tests := []struct {
+		path       string
+		wantLookup bool
+	}{
+		{path: "/maven/repository/com/perplexity/tool/maven-metadata.xml", wantLookup: true},
+		{path: "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar?download=1", wantLookup: false},
+		{path: "/future-format/repository/opaque/download", wantLookup: true},
 	}
 	var requests atomic.Int32
 	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -509,18 +656,22 @@ func TestCodeArtifactMutableAndUnknownPathsBypassCache(t *testing.T) {
 	_, err := newCodeArtifact(ctx, testCodeArtifactConfig(originServer.URL), mux, tokenServer.tokenManager(time.Now), tracked, true)
 	assert.NoError(t, err)
 
-	for _, suffix := range paths {
+	var wantOpens int32
+	for _, test := range tests {
+		if test.wantLookup {
+			wantOpens += 2
+		}
 		for range 2 {
 			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(originServer, suffix), nil).WithContext(ctx))
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(originServer, test.path), nil).WithContext(ctx))
 			assert.Equal(t, http.StatusOK, w.Code)
 			assert.Equal(t, "current", w.Body.String())
 		}
 	}
 
-	assert.Equal(t, int32(2*len(paths)), requests.Load())
-	assert.Equal(t, int32(0), tracked.opens.Load(), "pass-through must not read cache")
-	assert.Equal(t, int32(0), tracked.creates.Load(), "pass-through must not write cache")
+	assert.Equal(t, int32(2*len(tests)), requests.Load())
+	assert.Equal(t, wantOpens, tracked.opens.Load(), "only lookup requests should check the cache")
+	assert.Equal(t, int32(0), tracked.creates.Load(), "responses without origin immutability must not be stored")
 }
 
 func TestCodeArtifactPassesThroughReadSemantics(t *testing.T) {
