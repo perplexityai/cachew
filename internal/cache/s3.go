@@ -221,6 +221,9 @@ func (s *S3) statAndHeaders(ctx context.Context, key Key) (minio.ObjectInfo, htt
 	}
 
 	maps.Copy(headers, meta.Headers)
+	if cacheEntryExpired(headers, time.Now()) {
+		return minio.ObjectInfo{}, nil, s3Meta{}, os.ErrNotExist
+	}
 
 	// Companion expiry takes precedence over the data object's Expires header.
 	if meta.ExpiresAt.IsZero() {
@@ -267,6 +270,12 @@ func (s *S3) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, 
 		now := time.Now()
 		if meta.ExpiresAt.Sub(now) < s.config.MaxTTL/2 {
 			newExpiresAt := ceilSecond(now.Add(s.config.MaxTTL))
+			if semanticExpiration, present, valid := cacheEntryExpiration(headers); present && valid {
+				semanticExpiration = ceilSecond(semanticExpiration)
+				if newExpiresAt.After(semanticExpiration) {
+					newExpiresAt = semanticExpiration
+				}
+			}
 			refreshHeaders := make(http.Header)
 			if etag := meta.Headers.Get(ETagKey); etag != "" {
 				refreshHeaders.Set(ETagKey, etag)

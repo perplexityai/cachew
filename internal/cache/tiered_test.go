@@ -883,6 +883,73 @@ type recordingCache struct {
 	aborted   chan struct{}
 }
 
+type ttlRecordingCache struct {
+	cache.Cache
+	ttls chan time.Duration
+}
+
+func (c *ttlRecordingCache) Create(
+	ctx context.Context,
+	key cache.Key,
+	headers http.Header,
+	ttl time.Duration,
+	opts ...cache.Option,
+) (cache.Writer, error) {
+	c.ttls <- ttl
+	return c.Cache.Create(ctx, key, headers, ttl, opts...)
+}
+
+func TestTieredPreservesAbsoluteExpirationAcrossBackfill(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	store := newMetadataStore(ctx)
+	lowerMemory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	lower := &ttlRecordingCache{Cache: lowerMemory, ttls: make(chan time.Duration, 1)}
+	upper, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	tiered := cache.MaybeNewTiered(ctx, []cache.Cache{lower, upper}, store)
+	defer tiered.Close()
+
+	key := cache.NewKey("absolute-expiration-backfill")
+	expiresAt := time.Now().Add(5 * time.Minute)
+	headers := http.Header{cache.ExpirationKey: {expiresAt.UTC().Format(time.RFC3339Nano)}}
+	w, err := upper.Create(ctx, key, headers, time.Hour)
+	assert.NoError(t, err)
+	_, err = w.Write([]byte("payload"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+
+	r, _, err := tiered.Open(ctx, key)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("payload"), readAllAndClose(t, r))
+
+	backfillTTL := <-lower.ttls
+	assert.True(t, backfillTTL > 4*time.Minute+50*time.Second)
+	assert.True(t, backfillTTL <= 5*time.Minute)
+}
+
+func TestTieredSkipsEntriesPastAbsoluteExpiration(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	upper, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	tiered := newTiered(ctx, lower, upper)
+	defer tiered.Close()
+
+	key := cache.NewKey("expired-absolute-expiration")
+	headers := http.Header{cache.ExpirationKey: {time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)}}
+	w, err := upper.Create(ctx, key, headers, time.Hour)
+	assert.NoError(t, err)
+	_, err = w.Write([]byte("stale"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+
+	r, _, err := tiered.Open(ctx, key)
+	assert.IsError(t, err, os.ErrNotExist)
+	assert.Zero(t, r)
+}
+
 func (c *recordingCache) Create(ctx context.Context, key cache.Key, headers http.Header, ttl time.Duration, opts ...cache.Option) (cache.Writer, error) {
 	w, err := c.Cache.Create(ctx, key, headers, ttl, opts...)
 	if err == nil && c.armed.Load() {
