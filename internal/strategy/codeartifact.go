@@ -19,23 +19,25 @@ const codeArtifactUsername = "aws"
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	Target      string `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	Domain      string `hcl:"domain" help:"The CodeArtifact domain name."`
-	DomainOwner string `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
-	Region      string `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
-	RoleARN     string `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	Target       string `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
+	ProxyBaseURL string `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
+	Domain       string `hcl:"domain" help:"The CodeArtifact domain name."`
+	DomainOwner  string `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
+	Region       string `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
+	RoleARN      string `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
 }
 
 // CodeArtifact caches reviewed immutable assets and passes all other
 // authenticated reads through so classifier gaps cannot break package access.
 type CodeArtifact struct {
-	target *url.URL
-	prefix string
-	tokens codeArtifactTokenSource
-	cache  cache.Cache
-	client *http.Client
-	logger *slog.Logger
-	metric codeArtifactMetricRecorder
+	target    *url.URL
+	proxyBase *url.URL
+	prefix    string
+	tokens    codeArtifactTokenSource
+	cache     cache.Cache
+	client    *http.Client
+	logger    *slog.Logger
+	metric    codeArtifactMetricRecorder
 }
 
 var _ Strategy = (*CodeArtifact)(nil)
@@ -52,7 +54,7 @@ func RegisterCodeArtifact(r *Registry) {
 }
 
 func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredCache cache.Cache, mux Mux) (*CodeArtifact, error) {
-	if _, err := validateCodeArtifactConfig(config, false); err != nil {
+	if _, _, err := validateCodeArtifactConfig(config, false); err != nil {
 		return nil, err
 	}
 	tokens, err := newCodeArtifactTokenManager(ctx, config)
@@ -70,7 +72,7 @@ func newCodeArtifact(
 	configuredCache cache.Cache,
 	allowHTTP bool,
 ) (*CodeArtifact, error) {
-	target, err := validateCodeArtifactConfig(config, allowHTTP)
+	target, proxyBase, err := validateCodeArtifactConfig(config, allowHTTP)
 	if err != nil {
 		return nil, err
 	}
@@ -79,10 +81,11 @@ func newCodeArtifact(
 	transport.DisableCompression = true
 
 	c := &CodeArtifact{
-		target: target,
-		prefix: "/" + target.Host,
-		tokens: tokens,
-		cache:  configuredCache.Namespace(cache.Namespace("codeartifact")),
+		target:    target,
+		proxyBase: proxyBase,
+		prefix:    "/" + target.Host,
+		tokens:    tokens,
+		cache:     configuredCache.Namespace(cache.Namespace("codeartifact")),
 		client: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -102,13 +105,14 @@ func newCodeArtifact(
 	return c, nil
 }
 
-func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, error) {
-	missing := make([]string, 0, 5)
+func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, *url.URL, error) {
+	missing := make([]string, 0, 6)
 	configured := []struct {
 		name  string
 		value string
 	}{
 		{name: "target", value: config.Target},
+		{name: "proxy-base-url", value: config.ProxyBaseURL},
 		{name: "domain", value: config.Domain},
 		{name: "domain-owner", value: config.DomainOwner},
 		{name: "region", value: config.Region},
@@ -120,25 +124,34 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 		}
 	}
 	if len(missing) > 0 {
-		return nil, errors.Errorf("codeartifact: missing required configuration: %s", strings.Join(missing, ", "))
+		return nil, nil, errors.Errorf("codeartifact: missing required configuration: %s", strings.Join(missing, ", "))
 	}
 
-	target, err := url.Parse(config.Target)
+	target, err := parseCodeArtifactOrigin("target", config.Target, allowHTTP)
 	if err != nil {
-		return nil, errors.Errorf("codeartifact: invalid target URL: %w", err)
+		return nil, nil, err
 	}
-	validScheme := target.Scheme == "https" || (allowHTTP && target.Scheme == "http")
-	if target.Host == "" || !validScheme {
-		return nil, errors.Errorf("codeartifact: target must be an HTTPS origin")
+	proxyBase, err := parseCodeArtifactOrigin("proxy-base-url", config.ProxyBaseURL, allowHTTP)
+	if err != nil {
+		return nil, nil, err
 	}
-	if target.User != nil || target.RawQuery != "" || target.Fragment != "" {
-		return nil, errors.Errorf("codeartifact: target must not contain credentials, a path, query, or fragment")
+	return target, proxyBase, nil
+}
+
+func parseCodeArtifactOrigin(name, value string, allowHTTP bool) (*url.URL, error) {
+	origin, err := url.Parse(value)
+	if err != nil {
+		return nil, errors.Errorf("codeartifact: invalid %s URL: %w", name, err)
 	}
-	if target.Path != "" && target.Path != "/" {
-		return nil, errors.Errorf("codeartifact: target must not contain credentials, a path, query, or fragment")
+	validScheme := origin.Scheme == "https" || (allowHTTP && origin.Scheme == "http")
+	if origin.Host == "" || !validScheme {
+		return nil, errors.Errorf("codeartifact: %s must be an HTTPS origin", name)
 	}
-	target.Path = ""
-	return target, nil
+	if origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") {
+		return nil, errors.Errorf("codeartifact: %s must not contain credentials, a path, query, or fragment", name)
+	}
+	origin.Path = ""
+	return origin, nil
 }
 
 func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host }
@@ -153,6 +166,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
+	rewriteMetadata := shouldRewriteCodeArtifactMetadata(c.originURL(r).Path)
 	token, err := c.tokens.Token(r.Context(), 0)
 	if err != nil {
 		c.metric.recordAuth(r.Context(), codeArtifactAuthFailure)
@@ -194,7 +208,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 			if err := resp.Body.Close(); err != nil {
 				c.logger.ErrorContext(r.Context(), "Failed to close CodeArtifact response", "error", err)
 			}
-			resp, err = c.followCrossOriginRedirect(r, resp, location)
+			resp, err = c.followCrossOriginRedirect(r, resp, location, rewriteMetadata)
 			if err != nil {
 				c.writeError(w, r, err)
 				return
@@ -214,6 +228,11 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 			c.logger.ErrorContext(r.Context(), "Failed to close CodeArtifact response", "error", err)
 		}
 	}()
+	responseHeaders, err = c.rewriteOriginMetadata(resp, responseHeaders, r, rewriteMetadata)
+	if err != nil {
+		c.writeError(w, r, err)
+		return
+	}
 	copyHeaders(w.Header(), responseHeaders)
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
@@ -228,6 +247,21 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	}
 }
 
+func (c *CodeArtifact) rewriteOriginMetadata(
+	resp *http.Response,
+	headers http.Header,
+	r *http.Request,
+	rewrite bool,
+) (http.Header, error) {
+	if !rewrite || resp.StatusCode != http.StatusOK {
+		return headers, nil
+	}
+	if !isCodeArtifactJSONResponse(headers) {
+		return nil, errors.New("CodeArtifact package metadata is not JSON")
+	}
+	return c.rewriteMetadataResponse(resp, headers, r.Method, c.originURL(r).Path)
+}
+
 func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error) {
 	target := c.originURL(r)
 
@@ -236,7 +270,10 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 		return nil, errors.New("build CodeArtifact request")
 	}
 	copyHeaders(upstream.Header, codeArtifactRequestHeaders(r.Header))
-	upstream.SetBasicAuth(codeArtifactUsername, token)
+	if shouldRewriteCodeArtifactMetadata(target.Path) {
+		stripCodeArtifactMetadataRequestHeaders(upstream.Header)
+	}
+	setCodeArtifactAuthorization(upstream, token)
 
 	resp, err := c.client.Do(upstream)
 	if err != nil {
@@ -245,6 +282,14 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 		return nil, errors.New("request CodeArtifact origin")
 	}
 	return resp, nil
+}
+
+func setCodeArtifactAuthorization(r *http.Request, token string) {
+	if strings.HasPrefix(r.URL.Path, "/cargo/") {
+		r.Header.Set("Authorization", token)
+		return
+	}
+	r.SetBasicAuth(codeArtifactUsername, token)
 }
 
 func (c *CodeArtifact) originURL(r *http.Request) url.URL {
@@ -282,6 +327,7 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 	r *http.Request,
 	originResponse *http.Response,
 	location string,
+	rewriteMetadata bool,
 ) (*http.Response, error) {
 	switch originResponse.StatusCode {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
@@ -303,6 +349,9 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 		return nil, errors.New("build CodeArtifact redirect request")
 	}
 	copyHeaders(redirected.Header, codeArtifactRequestHeaders(r.Header))
+	if rewriteMetadata {
+		stripCodeArtifactMetadataRequestHeaders(redirected.Header)
+	}
 
 	resp, err := c.client.Do(redirected)
 	if err != nil {
