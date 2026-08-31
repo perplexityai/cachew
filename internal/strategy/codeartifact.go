@@ -259,6 +259,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 		c.writeError(w, r, err)
 		return
 	}
+	sanitizeCodeArtifactETag(responseHeaders)
 	copyHeaders(w.Header(), responseHeaders)
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
