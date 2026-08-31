@@ -284,7 +284,7 @@ func (c *CodeArtifact) rewriteOriginMetadata(
 		return headers, nil
 	}
 	originPath := c.originURL(r).Path
-	if !isCodeArtifactJSONResponse(headers) {
+	if !isCodeArtifactJSONResponse(originPath, headers) {
 		if isCodeArtifactSwiftArchiveResponse(originPath, headers) {
 			return headers, nil
 		}
@@ -424,7 +424,7 @@ func (c *CodeArtifact) observeOriginResponse(ctx context.Context, resp *http.Res
 func codeArtifactMetricFormat(path string) string {
 	format := codeArtifactPackageFormat(path)
 	switch format {
-	case codeArtifactCargoFormat, "generic", "maven", "npm", "nuget", "pypi", "ruby", "swift":
+	case codeArtifactCargoFormat, "generic", "maven", "npm", "nuget", "pypi", "ruby", codeArtifactSwiftFormat:
 		return format
 	default:
 		return "other"

@@ -15,10 +15,11 @@ import (
 
 func TestCodeArtifactRewritesPackageMetadata(t *testing.T) {
 	tests := []struct {
-		name string
-		path string
-		body func(string) string
-		want func(string) string
+		name        string
+		path        string
+		contentType string
+		body        func(string) string
+		want        func(string) string
 	}{
 		{
 			name: "npm tarball URL",
@@ -31,8 +32,9 @@ func TestCodeArtifactRewritesPackageMetadata(t *testing.T) {
 			},
 		},
 		{
-			name: "Cargo download template and anonymous access",
-			path: "/cargo/repository/config.json",
+			name:        "Cargo download template and anonymous access",
+			path:        "/cargo/repository/config.json",
+			contentType: "application/octet-stream",
 			body: func(origin string) string {
 				return `{"dl":"` + origin + `/cargo/repository/crates/{crate}/{version}","api":"` + origin + `/cargo/repository/-","auth-required":true}`
 			},
@@ -64,6 +66,10 @@ func TestCodeArtifactRewritesPackageMetadata(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			contentType := test.contentType
+			if contentType == "" {
+				contentType = "application/json"
+			}
 			var originURL string
 			var mu sync.Mutex
 			observedHeaders := make(http.Header)
@@ -71,7 +77,7 @@ func TestCodeArtifactRewritesPackageMetadata(t *testing.T) {
 				mu.Lock()
 				observedHeaders = r.Header.Clone()
 				mu.Unlock()
-				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Type", contentType)
 				w.Header().Set("Content-Encoding", "identity")
 				w.Header().Set("ETag", `"origin-metadata"`)
 				w.Header().Set("Last-Modified", testCodeArtifactModified)
@@ -163,7 +169,7 @@ func TestCodeArtifactRejectsUnsafePackageMetadata(t *testing.T) {
 		body        string
 	}{
 		{name: "malformed JSON", contentType: "application/json", body: `{"url":"` + originSecretURL},
-		{name: "unexpected content type", contentType: "text/plain", body: `{"url":"` + originSecretURL + `"}`},
+		{name: "non-Cargo octet-stream", contentType: "application/octet-stream", body: `{"url":"` + originSecretURL + `"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
