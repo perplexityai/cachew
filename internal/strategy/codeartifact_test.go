@@ -23,6 +23,7 @@ import (
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/packagepolicy"
 )
 
 const (
@@ -194,6 +195,91 @@ type codeArtifactRoundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f codeArtifactRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type recordingPackagePolicy struct {
+	decision packagepolicy.Decision
+	err      error
+	purls    []string
+}
+
+func (r *recordingPackagePolicy) Evaluate(_ context.Context, purl string) (packagepolicy.Decision, error) {
+	r.purls = append(r.purls, purl)
+	return r.decision, r.err
+}
+
+func TestCodeArtifactEnforcesPackagePolicyBeforeOriginAuthentication(t *testing.T) {
+	tests := []struct {
+		name       string
+		decision   packagepolicy.Decision
+		err        error
+		statusCode int
+		policy     string
+	}{
+		{
+			name:       "denied package",
+			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}},
+			statusCode: http.StatusForbidden,
+			policy:     "deny",
+		},
+		{
+			name:       "pending package",
+			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictPending, Reasons: []string{"pendingScan"}},
+			statusCode: http.StatusServiceUnavailable,
+			policy:     "pending",
+		},
+		{
+			name:       "policy unavailable",
+			err:        errors.New("Socket API unavailable"),
+			statusCode: http.StatusServiceUnavailable,
+			policy:     "unavailable",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var originRequests atomic.Int32
+			mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				originRequests.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			policy := &recordingPackagePolicy{decision: test.decision, err: test.err}
+			strategy.packagePolicy = policy
+
+			w := httptest.NewRecorder()
+			path := "/npm/repository/chromatitle-js/-/chromatitle-js-1.0.0.tgz"
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(originServer, path), nil).WithContext(ctx))
+
+			assert.Equal(t, test.statusCode, w.Code)
+			assert.Equal(t, test.policy, w.Header().Get("X-Cachew-Package-Policy"))
+			assert.Equal(t, []string{"pkg:npm/chromatitle-js@1.0.0"}, policy.purls)
+			assert.Equal(t, 0, tokenServer.requestCount())
+			assert.Equal(t, int32(0), originRequests.Load())
+		})
+	}
+}
+
+func TestCodeArtifactCachedPackageBypassesPackagePolicy(t *testing.T) {
+	var originRequests atomic.Int32
+	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	})
+	mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, origin)
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow}}
+	strategy.packagePolicy = policy
+	path := codeArtifactPath(originServer, "/npm/repository/lodash/-/lodash-4.17.21.tgz")
+
+	for range 2 {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, testCodeArtifactBody, w.Body.String())
+	}
+
+	assert.Equal(t, []string{"pkg:npm/lodash@4.17.21"}, policy.purls)
+	assert.Equal(t, int32(1), originRequests.Load())
 }
 
 func TestCodeArtifactSanitizesOriginTransportErrors(t *testing.T) {
