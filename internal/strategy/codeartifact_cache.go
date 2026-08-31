@@ -152,6 +152,22 @@ func codeArtifactCacheEntry(headers http.Header, now time.Time) (http.Header, ti
 	return cacheHeaders, ttl, createOptions, true
 }
 
+func sanitizeCodeArtifactETag(headers http.Header) {
+	etag := headers.Get(cache.ETagKey)
+	if etag == "" {
+		return
+	}
+	if _, err := cache.RawETagFromHeader(etag); err == nil {
+		return
+	}
+	if weakETag, ok := strings.CutPrefix(etag, "W/"); ok {
+		if _, err := cache.RawETagFromHeader(weakETag); err == nil {
+			return
+		}
+	}
+	headers.Del(cache.ETagKey)
+}
+
 func parseCodeArtifactCacheControl(values []string) (map[string]string, bool) {
 	directives := make(map[string]string)
 	for _, value := range values {

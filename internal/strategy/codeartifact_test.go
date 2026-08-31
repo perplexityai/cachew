@@ -31,6 +31,7 @@ const (
 	testCodeArtifactRegion         = "us-east-1"
 	testCodeArtifactRoleARN        = "arn:aws:iam::123456789012:role/cachew-reader"
 	testCodeArtifactETag           = `"asset-v1"`
+	testCodeArtifactMalformedETag  = "83522005c1266cc2de97e65072ff7554ac0f30ad369c3b02ff3a764b962048da"
 	testCodeArtifactBody           = "immutable payload"
 	testCodeArtifactCacheControl   = "public, max-age=3600, immutable"
 	testCodeArtifactModified       = "Wed, 21 Oct 2015 07:28:00 GMT"
@@ -303,6 +304,35 @@ func TestCodeArtifactPreservesValidatorsAcrossCacheHits(t *testing.T) {
 
 	assert.Equal(t, int32(1), requests.Load(), "validator requests should use the cached representation")
 	assert.Equal(t, 1, tokenServer.requestCount(), "validator cache hits should not request origin authorization")
+}
+
+func TestCodeArtifactCachesImmutableResponsesWithMalformedETags(t *testing.T) {
+	var requests atomic.Int32
+	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+		w.Header().Set("ETag", testCodeArtifactMalformedETag)
+		w.Header().Set("Last-Modified", testCodeArtifactModified)
+		w.Header().Set("Vary", "Accept")
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	})
+	mux, originServer, tokenServer, _, ctx := newTestCachingCodeArtifact(t, origin)
+	assetURL := codeArtifactPath(originServer, "/pypi/repository/simple/pip/0.2.1/pip-0.2.1.tar.gz")
+
+	for range 2 {
+		req := httptest.NewRequest(http.MethodGet, assetURL, nil).WithContext(ctx)
+		req.Header.Set("Accept", "application/octet-stream")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, testCodeArtifactBody, w.Body.String())
+		assert.Equal(t, "", w.Header().Get("ETag"))
+		assert.Equal(t, testCodeArtifactModified, w.Header().Get("Last-Modified"))
+	}
+
+	assert.Equal(t, int32(1), requests.Load(), "the malformed optional ETag must not prevent caching")
+	assert.Equal(t, 1, tokenServer.requestCount(), "a cache hit should not request origin authorization")
 }
 
 func TestCodeArtifactDoesNotCacheUnsupportedOriginETags(t *testing.T) {
