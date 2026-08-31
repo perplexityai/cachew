@@ -14,6 +14,7 @@ import (
 const (
 	maxCodeArtifactMetadataBytes = 64 << 20
 	codeArtifactCargoFormat      = "cargo"
+	codeArtifactSwiftFormat      = "swift"
 )
 
 func shouldRewriteCodeArtifactMetadata(path string) bool {
@@ -25,7 +26,7 @@ func shouldRewriteCodeArtifactMetadata(path string) bool {
 		return !strings.Contains(lowerPath, "/-/") || !strings.HasSuffix(lowerPath, ".tgz")
 	case "nuget":
 		return !strings.HasSuffix(lowerPath, ".nupkg") && !strings.HasSuffix(lowerPath, ".snupkg")
-	case "swift":
+	case codeArtifactSwiftFormat:
 		return !strings.HasSuffix(lowerPath, ".zip")
 	default:
 		return false
@@ -54,13 +55,19 @@ func stripCodeArtifactMetadataRequestHeaders(headers http.Header) {
 	}
 }
 
-func isCodeArtifactJSONResponse(headers http.Header) bool {
+func isCodeArtifactJSONResponse(path string, headers http.Header) bool {
 	contentType := codeArtifactContentType(headers)
-	return contentType == "application/json" || strings.HasSuffix(contentType, "+json")
+	if contentType == "application/json" || strings.HasSuffix(contentType, "+json") {
+		return true
+	}
+	lowerPath := strings.ToLower(path)
+	return contentType == "application/octet-stream" &&
+		codeArtifactPackageFormat(lowerPath) == codeArtifactCargoFormat &&
+		strings.HasSuffix(lowerPath, "/config.json")
 }
 
 func isCodeArtifactSwiftArchiveResponse(path string, headers http.Header) bool {
-	if codeArtifactPackageFormat(path) != "swift" {
+	if codeArtifactPackageFormat(path) != codeArtifactSwiftFormat {
 		return false
 	}
 	contentType := codeArtifactContentType(headers)
