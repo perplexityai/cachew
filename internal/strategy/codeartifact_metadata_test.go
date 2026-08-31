@@ -108,6 +108,53 @@ func TestCodeArtifactRewritesPackageMetadata(t *testing.T) {
 	}
 }
 
+func TestCodeArtifactStreamsExtensionlessSwiftArchive(t *testing.T) {
+	const archive = "swift archive"
+	var originURL string
+	origin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/swift/repository/perplexity/design-tokens":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"releases":{"1.2.3":{"url":"` + originURL + `/swift/repository/perplexity/design-tokens/1.2.3"}}}`))
+		case "/swift/repository/perplexity/design-tokens/1.2.3":
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write([]byte(archive))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	mux, originServer, _, ctx := newTestCodeArtifact(
+		t,
+		origin,
+		tokenResponse{token: "token", expiresAt: time.Now().Add(time.Hour)},
+	)
+	originURL = originServer.URL
+	proxyURL := "https://cachew.example.com/" + originServer.Listener.Addr().String()
+
+	metadata := httptest.NewRecorder()
+	mux.ServeHTTP(metadata, httptest.NewRequest(
+		http.MethodGet,
+		codeArtifactPath(originServer, "/swift/repository/perplexity/design-tokens"),
+		nil,
+	).WithContext(ctx))
+	assert.Equal(t, http.StatusOK, metadata.Code)
+	assertJSONEqual(
+		t,
+		`{"releases":{"1.2.3":{"url":"`+proxyURL+`/swift/repository/perplexity/design-tokens/1.2.3"}}}`,
+		metadata.Body.String(),
+	)
+
+	release := httptest.NewRecorder()
+	mux.ServeHTTP(release, httptest.NewRequest(
+		http.MethodGet,
+		codeArtifactPath(originServer, "/swift/repository/perplexity/design-tokens/1.2.3"),
+		nil,
+	).WithContext(ctx))
+	assert.Equal(t, http.StatusOK, release.Code)
+	assert.Equal(t, "application/zip", release.Header().Get("Content-Type"))
+	assert.Equal(t, archive, release.Body.String())
+}
+
 func TestCodeArtifactRejectsUnsafePackageMetadata(t *testing.T) {
 	const originSecretURL = "https://codeartifact.example.com/private"
 	tests := []struct {

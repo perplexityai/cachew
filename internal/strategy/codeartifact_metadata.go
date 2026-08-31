@@ -55,8 +55,20 @@ func stripCodeArtifactMetadataRequestHeaders(headers http.Header) {
 }
 
 func isCodeArtifactJSONResponse(headers http.Header) bool {
-	contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(headers.Get("Content-Type"), ";", 2)[0]))
+	contentType := codeArtifactContentType(headers)
 	return contentType == "application/json" || strings.HasSuffix(contentType, "+json")
+}
+
+func isCodeArtifactSwiftArchiveResponse(path string, headers http.Header) bool {
+	if codeArtifactPackageFormat(path) != "swift" {
+		return false
+	}
+	contentType := codeArtifactContentType(headers)
+	return contentType == "application/zip" || contentType == "application/octet-stream" || strings.HasSuffix(contentType, "+zip")
+}
+
+func codeArtifactContentType(headers http.Header) string {
+	return strings.ToLower(strings.TrimSpace(strings.SplitN(headers.Get("Content-Type"), ";", 2)[0]))
 }
 
 func (c *CodeArtifact) rewriteMetadataResponse(
