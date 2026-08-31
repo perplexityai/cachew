@@ -58,8 +58,21 @@ export GOPROXY=http://cachew.example.com/gomod,direct
 gomod {
   proxy         = "https://proxy.golang.org"
   private-paths = ["github.com/myorg/*"]
+
+  package-policy {
+    socket {
+      api-url      = "https://api.socket.dev"
+      organization = "my-socket-org"
+      token        = "${SOCKET_SECURITY_API_TOKEN}"
+    }
+  }
 }
 ```
+
+When `package-policy` is configured, Cachew evaluates the PURL for each cold,
+versioned public module before it contacts the Go module origin. Cached module
+files bypass the check. The `socket` provider sends the PURL to Socket; modules
+matching `private-paths` are not sent.
 
 ### Hermit
 
@@ -99,6 +112,14 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
   credential-timeout       = "15s"
   origin-header-timeout    = "30s"
   origin-read-idle-timeout = "30s"
+
+  package-policy {
+    socket {
+      api-url      = "https://api.socket.dev"
+      organization = "my-socket-org"
+      token        = "${SOCKET_SECURITY_API_TOKEN}"
+    }
+  }
 }
 ```
 
@@ -126,6 +147,39 @@ through their lifetime.
 
 Omitting a timeout or setting it to zero uses the documented default. Negative
 timeout values are rejected.
+
+The optional `package-policy` block is a provider-independent package-admission
+interface based on standard Package URLs (PURLs). Its `socket` provider checks
+cold npm and PyPI artifact PURLs with the configured organization's [Socket
+package policy](https://docs.socket.dev/reference/batchpackagefetchbyorg) before
+Cachew mints a CodeArtifact token or contacts the repository. Another provider
+can implement the same PURL-to-decision interface without changing the
+CodeArtifact or Go module strategies.
+
+For the Socket provider, a policy action of `error`, or a package Socket cannot
+resolve, returns `403`. Pending analysis or an unavailable Socket API returns
+`503` with `Retry-After`; these outcomes fail closed and never fall through to
+CodeArtifact. Cache hits do not recheck the policy because Cachew only admits
+complete, origin-declared immutable bodies.
+
+Socket receives the public ecosystem, package name, and version from the
+CodeArtifact request path. Cachew does not send package contents, CodeArtifact
+credentials, repository names, or AWS identity to Socket. Operators should
+still treat the package name and version as data crossing from their
+CodeArtifact environment to Socket's SaaS boundary.
+
+The Socket token needs only the `packages:list` scope. Keep it out of the HCL
+file by using an environment placeholder as shown above and inject
+`SOCKET_SECURITY_API_TOKEN` into the Cachew container from the deployment's
+secret manager. For example, Kubernetes can source the environment variable
+from a `Secret` with `env[].valueFrom.secretKeyRef`; the secret does not need to
+be exposed to package-manager clients.
+
+Policy outcomes and API latency are exported as
+`cachew.package_policy.evaluations_total` and
+`cachew.package_policy.evaluation_duration_seconds`. Their attributes are the
+bounded provider and outcome (`allow`, `deny`, `pending`, or `unavailable`);
+package names and versions are not metric labels.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,
