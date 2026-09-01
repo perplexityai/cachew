@@ -171,10 +171,24 @@ CodeArtifact. Cache hits do not recheck the policy because Cachew only admits
 complete, origin-declared immutable bodies.
 
 A later policy change does not automatically invalidate an admitted object.
-Operators can purge it through Cachew's existing `delete` operation in the
-`codeartifact` namespace. Run the deletion against every Cachew deployment that
-may hold a local tier; a tiered deployment deletes the key from all of its
-configured backends.
+Cachew's generic `delete` operation accepts one exact cache key, but CodeArtifact
+can store multiple representations of one URL. The unhashed key material is the
+origin URL followed by these optional lines, in this order:
+
+```text
+https://codeartifact.example.com/npm/repository/package/-/package-1.0.0.tgz
+Accept=<comma-joined request values>
+Accept-Encoding=<comma-joined request values>
+```
+
+`cachew delete codeartifact <key-material>` hashes that material and deletes the
+matching object from every backend configured in that Cachew deployment. Run it
+against every deployment that may hold a local tier. A separate key exists for
+every observed header combination, and Cachew cannot currently list or delete
+keys by package path or PURL. The command is therefore a complete targeted purge
+only when every request variant is known. Otherwise operators must clear every
+backing tier with deployment-specific tooling or wait for the origin TTL; Cachew
+does not currently provide a reliable targeted purge for that incident.
 
 Socket receives the public ecosystem, package name, and version from the
 CodeArtifact request path. Cachew does not send package contents, CodeArtifact
@@ -196,7 +210,14 @@ bounded provider and outcome attributes (`allow`, `deny`, `pending`,
 `unavailable`, or `not_applicable`); package names and versions are not metric
 labels. The latency histogram covers actual provider evaluations. Unsupported
 ecosystems, non-package metadata or query paths, and excluded private Go modules
-record `not_applicable` so gaps in enforcement coverage remain visible.
+record `not_applicable` so gaps in enforcement coverage remain visible. Metadata
+GETs can dominate that outcome, so dashboards should chart it separately and
+exclude it from allow/deny availability ratios. `HEAD` requests are not counted
+because they cannot admit a package body.
+
+Concurrent requests for the same PURL share one in-flight provider call. Cachew
+discards the decision after that call completes: a later cold request performs a
+fresh evaluation, so coalescing does not delay a changed Socket verdict.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,

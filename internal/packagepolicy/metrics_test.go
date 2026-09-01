@@ -2,6 +2,7 @@ package packagepolicy //nolint:testpackage // White-box coverage is required for
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,13 +10,20 @@ import (
 )
 
 type recordingMetrics struct {
-	notApplicable int
+	evaluations   atomic.Int32
+	notApplicable atomic.Int32
+	recorded      chan struct{}
 }
 
-func (r *recordingMetrics) record(context.Context, Decision, error, time.Duration) {}
+func (r *recordingMetrics) record(context.Context, Decision, error, time.Duration) {
+	r.evaluations.Add(1)
+	if r.recorded != nil {
+		r.recorded <- struct{}{}
+	}
+}
 
 func (r *recordingMetrics) recordNotApplicable(context.Context) {
-	r.notApplicable++
+	r.notApplicable.Add(1)
 }
 
 func TestObserveNotApplicableRecordsProviderMetric(t *testing.T) {
@@ -24,5 +32,5 @@ func TestObserveNotApplicableRecordsProviderMetric(t *testing.T) {
 
 	evaluator.ObserveNotApplicable(t.Context())
 
-	assert.Equal(t, 1, metrics.notApplicable)
+	assert.Equal(t, int32(1), metrics.notApplicable.Load())
 }

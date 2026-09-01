@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,10 +21,43 @@ func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 const (
-	testOrganization = "example-org"
-	testToken        = "socket-test-token"
-	testPURL         = "pkg:npm/chromatitle-js@1.0.0"
+	testOrganization  = "example-org"
+	testToken         = "socket-test-token"
+	testPURL          = "pkg:npm/chromatitle-js@1.0.0"
+	testAllowResponse = `{"type":"npm","name":"chromatitle-js","version":"1.0.0","alerts":[]}`
 )
+
+type blockedSocketTestHarness struct {
+	client   *socketEvaluator
+	requests atomic.Int32
+	started  chan struct{}
+	release  chan struct{}
+}
+
+func newBlockedSocketTestHarness(t *testing.T, metrics metricRecorder) *blockedSocketTestHarness {
+	t.Helper()
+	harness := &blockedSocketTestHarness{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if harness.requests.Add(1) == 1 {
+			close(harness.started)
+		}
+		<-harness.release
+		_, _ = w.Write([]byte(testAllowResponse))
+	}))
+	t.Cleanup(server.Close)
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       server.URL,
+		Organization: testOrganization,
+		Token:        testToken,
+	}, true)
+	assert.NoError(t, err)
+	client.metrics = metrics
+	harness.client = client
+	return harness
+}
 
 func TestNewSelectsSocketProvider(t *testing.T) {
 	evaluator, err := New(Config{Socket: &SocketConfig{Organization: testOrganization, Token: testToken}})
@@ -110,6 +145,68 @@ func TestClientEvaluatesOrganizationPolicy(t *testing.T) {
 			assert.Equal(t, test.reasons, decision.Reasons)
 		})
 	}
+}
+
+func TestClientCoalescesConcurrentEvaluations(t *testing.T) {
+	metrics := &recordingMetrics{}
+	harness := newBlockedSocketTestHarness(t, metrics)
+
+	type result struct {
+		decision Decision
+		err      error
+	}
+	const callers = 16
+	begin := make(chan struct{})
+	results := make(chan result, callers)
+	var ready sync.WaitGroup
+	ready.Add(callers)
+	for range callers {
+		go func() {
+			ready.Done()
+			<-begin
+			decision, err := harness.client.Evaluate(t.Context(), testPURL)
+			results <- result{decision: decision, err: err}
+		}()
+	}
+	ready.Wait()
+	close(begin)
+	<-harness.started
+	time.Sleep(25 * time.Millisecond)
+	requestCount := harness.requests.Load()
+	close(harness.release)
+	assert.Equal(t, int32(1), requestCount)
+
+	for range callers {
+		evaluation := <-results
+		assert.NoError(t, evaluation.err)
+		assert.Equal(t, VerdictAllow, evaluation.decision.Verdict)
+	}
+	assert.Equal(t, int32(1), metrics.evaluations.Load())
+
+	decision, err := harness.client.Evaluate(t.Context(), testPURL)
+	assert.NoError(t, err)
+	assert.Equal(t, VerdictAllow, decision.Verdict)
+	assert.Equal(t, int32(2), harness.requests.Load())
+	assert.Equal(t, int32(2), metrics.evaluations.Load())
+}
+
+func TestClientRecordsSharedEvaluationAfterCallerCancellation(t *testing.T) {
+	metrics := &recordingMetrics{recorded: make(chan struct{}, 1)}
+	harness := newBlockedSocketTestHarness(t, metrics)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		_, err := harness.client.Evaluate(ctx, testPURL)
+		result <- err
+	}()
+	<-harness.started
+	cancel()
+	assert.True(t, errors.Is(<-result, context.Canceled))
+	assert.Equal(t, int32(0), metrics.evaluations.Load())
+	close(harness.release)
+	<-metrics.recorded
+	assert.Equal(t, int32(1), metrics.evaluations.Load())
 }
 
 func TestClientFailsClosedOnInvalidResponses(t *testing.T) {

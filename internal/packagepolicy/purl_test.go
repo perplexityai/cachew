@@ -40,7 +40,7 @@ func TestPackageURLForCodeArtifact(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name: "literal encoded separator in decoded path",
+			name: "double-encoded separator is not decoded twice",
 			path: "/npm/repository/package%2Fname/-/package%2Fname-1.0.0.tgz",
 			purl: "pkg:npm/package%252Fname@1.0.0",
 			ok:   true,

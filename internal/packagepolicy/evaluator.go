@@ -36,7 +36,7 @@ type Evaluator interface {
 // New creates the configured package policy evaluator.
 func New(config Config) (Evaluator, error) {
 	if config.Socket == nil {
-		return nil, errors.New("package policy: exactly one provider is required")
+		return nil, errors.New("package policy: provider is required")
 	}
 	return newSocketEvaluator(*config.Socket, false)
 }
