@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -40,6 +41,7 @@ type socketEvaluator struct {
 	timeoutSec int
 	httpClient *http.Client
 	metrics    metricRecorder
+	inflight   singleflight.Group
 }
 
 var _ Evaluator = (*socketEvaluator)(nil)
@@ -91,7 +93,28 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 }
 
 // Evaluate returns the strictest policy result across every artifact Socket returns.
-func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision Decision, err error) {
+func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
+	resultCh := c.inflight.DoChan(purl, func() (any, error) {
+		requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.httpClient.Timeout)
+		defer cancel()
+		return c.evaluateProvider(requestCtx, purl)
+	})
+	select {
+	case <-ctx.Done():
+		return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
+	case result := <-resultCh:
+		if result.Err != nil {
+			return Decision{}, result.Err
+		}
+		sharedDecision, ok := result.Val.(Decision)
+		if !ok {
+			return Decision{}, errors.New("socket policy: invalid shared evaluation")
+		}
+		return sharedDecision, nil
+	}
+}
+
+func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (decision Decision, err error) {
 	started := time.Now()
 	defer func() { c.metrics.record(context.WithoutCancel(ctx), decision, err, time.Since(started)) }()
 
