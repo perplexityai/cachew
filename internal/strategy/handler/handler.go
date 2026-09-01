@@ -16,7 +16,9 @@ import (
 
 	"github.com/alecthomas/errors"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/block/cachew/client"
 	"github.com/block/cachew/internal/cache"
@@ -25,6 +27,9 @@ import (
 	"github.com/block/cachew/internal/metrics"
 	"github.com/block/cachew/internal/spool"
 )
+
+// CacheResultHeader reports whether CacheW served a request from cache.
+const CacheResultHeader = "X-Cachew-Result"
 
 // CacheKeyParts holds the components used to build a cache key. Path is the
 // primary identifier (typically the upstream URL) and Vary captures
@@ -86,6 +91,7 @@ type Handler struct {
 	revalidation  *revalidation
 	parallel      *parallelFetch
 	spools        *spool.Group
+	cacheLookups  metric.Int64Counter
 }
 
 type revalidation struct {
@@ -120,6 +126,12 @@ func New(client *http.Client, c cache.Cache, spools *spool.Registry) *Handler {
 		ttlFunc: func(_ *http.Request) time.Duration {
 			return 0
 		},
+		cacheLookups: metrics.NewMetric[metric.Int64Counter](
+			otel.Meter("cachew.handler"),
+			"cachew.handler.cache_lookups_total",
+			"{lookups}",
+			"Cache lookup outcomes",
+		),
 	}
 }
 
@@ -341,33 +353,49 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, key cache.
 	if r.Method == http.MethodHead {
 		headers, err := h.cache.Stat(ctx, key, opts...)
 		if cacheEntryExists(err) && !h.fresh(r, key, headers) {
+			h.markCacheMiss(ctx, w)
 			return false, nil
 		}
+		w.Header().Set(CacheResultHeader, "hit")
 		if httputil.ServeCacheStat(w, clientHeaders(headers), err) {
 			h.labelCacheHit(ctx)
+			h.recordCacheLookup(ctx, "hit")
 			return true, nil
 		}
+		w.Header().Del(CacheResultHeader)
 		return h.cacheMiss(w, r, err), nil
 	}
 	cr, headers, err := h.cache.Open(ctx, key, opts...)
 	if cacheEntryExists(err) && !h.fresh(r, key, headers) {
+		h.markCacheMiss(ctx, w)
 		if cr != nil {
 			return false, errors.Wrap(cr.Close(), "close stale entry")
 		}
 		return false, nil
 	}
+	w.Header().Set(CacheResultHeader, "hit")
 	if handled, _, serveErr := httputil.ServeCacheHit(w, clientHeaders(headers), cr, err); handled {
 		h.labelCacheHit(ctx)
 		logging.FromContext(ctx).DebugContext(ctx, "Cache hit")
+		h.recordCacheLookup(ctx, "hit")
 		return true, errors.WithStack(serveErr)
 	}
+	w.Header().Del(CacheResultHeader)
 	return h.cacheMiss(w, r, err), nil
+}
+
+// markCacheMiss sets the trusted result before any upstream response is
+// forwarded; upstream values of CacheResultHeader are stripped on the way in.
+func (h *Handler) markCacheMiss(ctx context.Context, w http.ResponseWriter) {
+	w.Header().Set(CacheResultHeader, "miss")
+	h.recordCacheLookup(ctx, "miss")
 }
 
 // cacheMiss reports whether a failed cache lookup was answered with an error,
 // rather than being a miss to fill from upstream.
 func (h *Handler) cacheMiss(w http.ResponseWriter, r *http.Request, err error) bool {
 	if errors.Is(err, os.ErrNotExist) {
+		h.markCacheMiss(r.Context(), w)
 		return false
 	}
 	labelCacheResult(r.Context(), CacheError)
@@ -380,12 +408,23 @@ func cacheEntryExists(err error) bool {
 		errors.Is(err, cache.ErrRangeNotSatisfiable)
 }
 
+// clientHeaders removes internal bookkeeping and any stored CacheResultHeader,
+// so a cached copy cannot spoof the trusted result.
 func clientHeaders(headers http.Header) http.Header {
-	if headers.Get(checkedAtHeader) == "" {
+	if headers.Get(checkedAtHeader) == "" && headers.Get(CacheResultHeader) == "" {
 		return headers
 	}
 	headers = headers.Clone()
 	headers.Del(checkedAtHeader)
+	headers.Del(CacheResultHeader)
+	return headers
+}
+
+// upstreamHeaders copies upstream response headers without CacheResultHeader,
+// which only this handler may set.
+func upstreamHeaders(headers http.Header) http.Header {
+	headers = maps.Clone(headers)
+	headers.Del(CacheResultHeader)
 	return headers
 }
 
@@ -488,7 +527,7 @@ func (h *Handler) forwardHead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = resp.Body.Close() //nolint:errcheck // HEAD has no body to lose
-	maps.Copy(w.Header(), resp.Header)
+	maps.Copy(w.Header(), upstreamHeaders(resp.Header))
 	w.WriteHeader(resp.StatusCode)
 }
 
@@ -519,7 +558,7 @@ func (h *Handler) fill(ctx context.Context, w *spool.Writer, r *http.Request, ke
 		return h.streamNonOKResponse(w, resp)
 	}
 
-	maps.Copy(w.Header(), resp.Header)
+	maps.Copy(w.Header(), upstreamHeaders(resp.Header))
 	w.WriteHeader(http.StatusOK)
 	result := fillSuccess
 	if h.external {
@@ -551,7 +590,7 @@ func (h *Handler) fill(ctx context.Context, w *spool.Writer, r *http.Request, ke
 }
 
 func (h *Handler) cacheHeaders(resp *http.Response) http.Header {
-	headers := maps.Clone(resp.Header)
+	headers := upstreamHeaders(resp.Header)
 	if h.revalidation != nil {
 		headers.Set(checkedAtHeader, strconv.FormatInt(time.Now().Unix(), 10))
 	}
@@ -669,7 +708,7 @@ func (h *Handler) fetch(w http.ResponseWriter, r *http.Request) (*http.Response,
 // streamNonOKResponse forwards an upstream error with its headers, which carry
 // the Cache-Control directives that decide whether the spool may share it.
 func (h *Handler) streamNonOKResponse(w http.ResponseWriter, resp *http.Response) error {
-	maps.Copy(w.Header(), httputil.FilterHeaders(resp.Header, httputil.HopByHopHeaders...))
+	maps.Copy(w.Header(), httputil.FilterHeaders(resp.Header, slices.Concat(httputil.HopByHopHeaders, []string{CacheResultHeader})...))
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		return errors.Wrap(err, "stream non-OK response")
@@ -681,7 +720,8 @@ func (h *Handler) streamNonOKResponse(w http.ResponseWriter, resp *http.Response
 // Cache failures never interrupt the client stream: the cache entry is
 // discarded and the response is streamed in full.
 func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cache.Key, resp *http.Response) error {
-	maps.Copy(w.Header(), resp.Header)
+	maps.Copy(w.Header(), upstreamHeaders(resp.Header))
+	w.Header().Set(CacheResultHeader, "miss")
 	result := fillSuccess
 	if h.external {
 		defer func() { metrics.RecordCacheFill(r.Context(), result) }()
@@ -796,6 +836,10 @@ func (t *cacheTee) Write(p []byte) (int, error) {
 		_, t.err = t.w.Write(p)
 	}
 	return len(p), nil
+}
+
+func (h *Handler) recordCacheLookup(ctx context.Context, result string) {
+	h.cacheLookups.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
 func defaultErrorHandler(err error, w http.ResponseWriter, r *http.Request) {

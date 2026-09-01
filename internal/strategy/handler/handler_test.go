@@ -402,6 +402,34 @@ func TestHeaderForwarding(t *testing.T) {
 	})
 }
 
+func TestCacheResultHeaderCannotBeSpoofed(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Cachew-Result", "spoofed")
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	h := handler.New(http.DefaultClient, mustNewMemoryCache(), newTestSpools(t)).
+		Transform(func(r *http.Request) (*http.Request, error) {
+			return http.NewRequestWithContext(r.Context(), r.Method, upstream.URL, nil)
+		})
+
+	for _, step := range []struct{ method, expected string }{
+		{http.MethodHead, "miss"},
+		{http.MethodGet, "miss"},
+		{http.MethodGet, "hit"},
+		{http.MethodHead, "hit"},
+	} {
+		r := httptest.NewRequest(step.method, "http://example.com/test", nil)
+		r = r.WithContext(logging.ContextWithLogger(r.Context(), slog.Default()))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, step.expected, w.Header().Get(handler.CacheResultHeader), step.method)
+	}
+}
+
 func TestHandlerMethodChaining(t *testing.T) {
 	c := mustNewMemoryCache()
 	client := &http.Client{}
