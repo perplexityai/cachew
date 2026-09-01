@@ -80,6 +80,28 @@ func (c failingCache) Open(_ context.Context, _ cache.Key, _ ...cache.Option) (i
 	return nil, nil, c.err
 }
 
+type createFuncCache struct {
+	cache.Cache
+	create func(context.Context, cache.Key, http.Header, time.Duration, ...cache.Option) (cache.Writer, error)
+}
+
+func (c createFuncCache) Create(
+	ctx context.Context,
+	key cache.Key,
+	headers http.Header,
+	ttl time.Duration,
+	opts ...cache.Option,
+) (cache.Writer, error) {
+	return c.create(ctx, key, headers, ttl, opts...)
+}
+
+func newRecordingNoOpWriter(t *testing.T, committed, aborted chan struct{}) cache.Writer {
+	t.Helper()
+	writer, err := cache.NoOpCache().Create(t.Context(), cache.NewKey("recording-noop"), nil, time.Hour)
+	assert.NoError(t, err)
+	return &recordingWriter{Writer: writer, committed: committed, aborted: aborted}
+}
+
 type statFailingCache struct {
 	cache.Cache
 	err error
@@ -357,14 +379,14 @@ func TestTieredCreateUsesSameETagInEveryTier(t *testing.T) {
 
 func TestTieredCreateContinuesWhenMemoryTierDeclinesAdmission(t *testing.T) {
 	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
-	constrained, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, InflightLimitMB: 1, MaxTTL: time.Hour})
+	constrained, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 8, InflightLimitMB: 2, MaxTTL: time.Hour})
 	assert.NoError(t, err)
-	authoritative, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 2, MaxTTL: time.Hour})
+	authoritative, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 4, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	tiered := newTiered(ctx, constrained, authoritative)
 	t.Cleanup(func() { assert.NoError(t, tiered.Close()) })
 	key := cache.NewKey("declined-memory-admission")
-	content := make([]byte, 1024*1024)
+	content := make([]byte, 2*1024*1024)
 	content[0] = 1
 	headers := http.Header{"Content-Length": {strconv.Itoa(len(content))}}
 
@@ -380,6 +402,85 @@ func TestTieredCreateContinuesWhenMemoryTierDeclinesAdmission(t *testing.T) {
 	reader, _, err := authoritative.Open(ctx, key)
 	assert.NoError(t, err)
 	assert.Equal(t, content, readAllAndClose(t, reader))
+}
+
+func TestTieredCreateCancellationAbortsCreatedAndLateWriters(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	ctx, cancel := context.WithCancel(ctx)
+	created := make(chan struct{})
+	lateCreateStarted := make(chan struct{})
+	releaseLateCreate := make(chan struct{})
+	firstAborted := make(chan struct{})
+	lateAborted := make(chan struct{})
+	firstWriter := newRecordingNoOpWriter(t, make(chan struct{}), firstAborted)
+	lateWriter := newRecordingNoOpWriter(t, make(chan struct{}), lateAborted)
+	first := createFuncCache{
+		Cache: cache.NoOpCache(),
+		create: func(context.Context, cache.Key, http.Header, time.Duration, ...cache.Option) (cache.Writer, error) {
+			close(created)
+			return firstWriter, nil
+		},
+	}
+	late := createFuncCache{
+		Cache: cache.NoOpCache(),
+		create: func(context.Context, cache.Key, http.Header, time.Duration, ...cache.Option) (cache.Writer, error) {
+			close(lateCreateStarted)
+			<-releaseLateCreate
+			return lateWriter, nil
+		},
+	}
+	tiered := newTiered(ctx, first, late)
+	result := make(chan error, 1)
+	go func() {
+		_, err := tiered.Create(ctx, cache.NewKey("cancelled-tiered-create"), nil, time.Hour)
+		result <- err
+	}()
+	<-created
+	<-lateCreateStarted
+	cancel()
+	assert.IsError(t, <-result, context.Canceled)
+	select {
+	case <-firstAborted:
+	case <-time.After(time.Second):
+		t.Fatal("created writer was not aborted")
+	}
+	close(releaseLateCreate)
+	select {
+	case <-lateAborted:
+	case <-time.After(time.Second):
+		t.Fatal("late writer was not aborted")
+	}
+}
+
+func TestTieredCreateErrorAbortsOtherWriters(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	createFailed := errors.New("create failed")
+	created := make(chan struct{})
+	aborted := make(chan struct{})
+	successfulWriter := newRecordingNoOpWriter(t, make(chan struct{}), aborted)
+	successful := createFuncCache{
+		Cache: cache.NoOpCache(),
+		create: func(context.Context, cache.Key, http.Header, time.Duration, ...cache.Option) (cache.Writer, error) {
+			close(created)
+			return successfulWriter, nil
+		},
+	}
+	failing := createFuncCache{
+		Cache: cache.NoOpCache(),
+		create: func(context.Context, cache.Key, http.Header, time.Duration, ...cache.Option) (cache.Writer, error) {
+			<-created
+			return nil, createFailed
+		},
+	}
+	tiered := newTiered(ctx, successful, failing)
+	writer, err := tiered.Create(ctx, cache.NewKey("failed-tiered-create"), nil, time.Hour)
+	assert.Zero(t, writer)
+	assert.IsError(t, err, createFailed)
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("successful writer was not aborted")
+	}
 }
 
 func TestTieredRequiresMetadataStore(t *testing.T) {

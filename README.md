@@ -151,28 +151,43 @@ copies before falling through to the authoritative tier.
 ### Memory
 
 In-memory sharded CLOCK cache with bounded admission and eviction work. Cache
-hits lock only the shard containing the requested key. Each admission and trim
-examines at most 64 victims, regardless of cache cardinality.
+hits lock only the shard containing the requested key. Each trim pass scans at
+most 64 entries per shard and commits at most 64 victims, regardless of cache
+cardinality. Recently referenced entries receive a CLOCK second chance. If one
+bounded pass cannot find enough cold entries, Cachew declines the optional
+memory copy instead of extending the scan or blocking unrelated hits; later
+admissions continue from the advanced CLOCK hands.
 
-`limit-mb` is a hard retained-memory accounting ceiling, not a process RSS
+`limit-mb` is a hard accounted-memory ceiling, not a process RSS
 limit. Accounting includes object buffers, estimated metadata, and buffers held
-by active readers. `Stats.Capacity` reports this ceiling; `Stats.Size` reports
-payload bytes and can differ because it excludes charged metadata and spare
-buffer capacity. Go runtime and allocator overhead can make RSS differ from
-both values.
+by active readers. Every retained entry and incomplete writer has a minimum
+4 KiB charge so collections of tiny objects cannot leave Go object and map
+overhead unbounded. This means a 1 GiB cache retains at most roughly 262,000
+objects even when their payloads are smaller. `Stats.Capacity` reports the hard
+accounting ceiling; `Stats.Size` reports payload bytes and can differ because it
+excludes charged metadata and spare buffer capacity. Go runtime and allocator
+overhead can make RSS differ from both values. `limit-mb = 0` disables the hard
+ceiling and permits unlimited retained accounting.
 
 Incomplete writes remain unbounded when `inflight-limit-mb` is zero, preserving
-the behavior of configurations written before this option existed. A positive
-value limits aggregate incomplete writes and reserves that amount inside
-`limit-mb`: retained entries are trimmed toward `limit-mb -
-inflight-limit-mb`, and retained plus incomplete accounting cannot exceed
-`limit-mb`. Writes that cannot obtain capacity within the bounded admission
-work bypass the memory tier without interrupting other cache tiers. Declared
-content lengths are validated against these limits, but buffers grow only as
-body bytes arrive. Buffer growth transfers the existing accounting reservation
-to the larger capacity; the allocator may briefly retain both allocations, so
-process RSS can transiently exceed the accounting ceiling by the old buffer's
-capacity.
+the behavior of configurations written before this option existed. For a
+finite `limit-mb`, a positive `inflight-limit-mb` must be smaller and reserves
+that amount inside the hard ceiling: retained entries are trimmed toward
+`limit-mb - inflight-limit-mb`, and retained plus incomplete accounting cannot
+exceed `limit-mb`. With unlimited retention, a positive inflight limit still
+bounds incomplete writes independently. Writes that cannot obtain capacity
+within the bounded admission work bypass the memory tier without interrupting
+other cache tiers. The `cachew.memory.admission_declines_total` counter reports
+these events by low-cardinality `reason`.
+
+Declared content lengths are validated against the limits, but buffers grow
+only as body bytes arrive and never beyond the declared length. Unknown-length
+bodies use a 4 KiB minimum growth allocation for smaller writes and then grow
+geometrically; this can retain spare capacity but avoids another full-body copy
+at publication, and all spare capacity remains charged. Buffer growth transfers
+the existing accounting reservation to the larger capacity; the allocator may
+briefly retain both allocations, so process RSS can transiently exceed the
+accounting ceiling by the old buffer's capacity.
 
 ```hcl
 memory {

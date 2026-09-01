@@ -29,7 +29,7 @@ const (
 	memoryHeaderEntryCharge        = 64
 	memoryHeaderValueCharge        = 16
 	memoryWriterMinimumCharge      = 4 * 1024
-	memoryWriterInitialCapacity    = 64 * 1024
+	memoryWriterInitialCapacity    = memoryWriterMinimumCharge
 	memoryBytesPerMegabyte         = 1024 * 1024
 	fnv64Offset                    = 14695981039346656037
 	fnv64Prime                     = 1099511628211
@@ -47,8 +47,8 @@ func RegisterMemory(r *Registry) {
 
 // MemoryConfig keeps incomplete-write protection opt-in so existing zero-valued configurations remain compatible.
 type MemoryConfig struct {
-	LimitMB         int           `hcl:"limit-mb,optional" help:"Maximum retained size of the memory cache in megabytes (defaults to 1GB); positive inflight-limit-mb shares this budget." default:"1024"`
-	InflightLimitMB int           `hcl:"inflight-limit-mb,optional" help:"Maximum aggregate incomplete writes in megabytes (0 disables the sub-limit for compatibility)." default:"0"`
+	LimitMB         int           `hcl:"limit-mb,optional" help:"Maximum accounted memory in megabytes (defaults to 1GB, 0 is unlimited); positive inflight-limit-mb shares this budget." default:"1024"`
+	InflightLimitMB int           `hcl:"inflight-limit-mb,optional" help:"Maximum aggregate incomplete writes in megabytes (0 disables the sub-limit); must be smaller than a finite limit-mb." default:"0"`
 	MaxTTL          time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the memory cache (defaults to 1 hour)." default:"1h"`
 }
 
@@ -131,6 +131,9 @@ func (s *memoryShard) insert(entry *memoryEntry) {
 	s.append(entry)
 }
 
+// With finite limits, the hard-budget counter overlaps retained and inflight
+// charges only when an inflight sub-limit is configured, preventing independent
+// reservations from crossing the process-wide accounting ceiling.
 type memoryState struct {
 	shards          []memoryShard
 	limitBytes      int64
@@ -143,6 +146,7 @@ type memoryState struct {
 	objectCount     atomic.Int64
 	evictionCursor  atomic.Uint32
 	closed          atomic.Bool
+	metrics         memoryMetricRecorder
 }
 
 // Memory shares capacity across namespace views so each view cannot consume limit-mb independently.
@@ -171,15 +175,21 @@ func newMemoryState(config MemoryConfig) (*memoryState, error) {
 	if err != nil {
 		return nil, err
 	}
-	inflightLimit := memoryInflightLimit(configuredInflightBytes, limitBytes)
-	retainedTarget := memoryRetainedTarget(limitBytes, inflightLimit)
+	if limitBytes > 0 && configuredInflightBytes >= limitBytes {
+		return nil, errors.New("inflight-limit-mb must be less than limit-mb when limit-mb is finite")
+	}
+	retainedTarget := int64(0)
+	if limitBytes > 0 {
+		retainedTarget = limitBytes - configuredInflightBytes
+	}
 	shards := make([]memoryShard, memoryShardCount)
 	for index := range shards {
 		shards[index].entries = make(map[Namespace]map[Key]*memoryEntry)
 	}
 	return &memoryState{
 		shards: shards, limitBytes: limitBytes,
-		retainedTarget: retainedTarget, inflightLimit: inflightLimit,
+		retainedTarget: retainedTarget, inflightLimit: configuredInflightBytes,
+		metrics: newMemoryMetrics(),
 	}, nil
 }
 
@@ -237,23 +247,6 @@ func memoryEntryCharge(namespace Namespace, data []byte, headers http.Header) in
 	return max(charge, int64(memoryEntryMinimumCharge))
 }
 
-func memoryInflightLimit(configuredBytes, limitBytes int64) int64 {
-	if configuredBytes <= 0 {
-		return 0
-	}
-	if limitBytes > 0 {
-		return min(configuredBytes, limitBytes)
-	}
-	return configuredBytes
-}
-
-func memoryRetainedTarget(limitBytes, inflightLimit int64) int64 {
-	if limitBytes <= 0 {
-		return 0
-	}
-	return limitBytes - min(limitBytes, max(inflightLimit, 0))
-}
-
 func reserveBounded(counter *atomic.Int64, limit, amount int64) bool {
 	if amount <= 0 {
 		return true
@@ -268,17 +261,6 @@ func reserveBounded(counter *atomic.Int64, limit, amount int64) bool {
 		}
 	}
 	return false
-}
-
-func reserveCounter(counter *atomic.Int64, limit, amount int64) bool {
-	if amount <= 0 {
-		return true
-	}
-	if limit <= 0 {
-		counter.Add(amount)
-		return true
-	}
-	return reserveBounded(counter, limit, amount)
 }
 
 type memoryPlannedEviction struct {
@@ -330,10 +312,15 @@ func (m *Memory) insertActiveLocked(shard *memoryShard, entry *memoryEntry) {
 }
 
 func (m *Memory) reserveRetained(retainedLimit, amount int64) bool {
-	if !reserveCounter(&m.state.retainedCharge, retainedLimit, amount) {
+	if m.state.limitBytes == 0 {
+		m.state.retainedCharge.Add(amount)
+		m.state.hardLimitCharge.Add(amount)
+		return true
+	}
+	if !reserveBounded(&m.state.retainedCharge, retainedLimit, amount) {
 		return false
 	}
-	if reserveCounter(&m.state.hardLimitCharge, m.state.limitBytes, amount) {
+	if reserveBounded(&m.state.hardLimitCharge, m.state.limitBytes, amount) {
 		return true
 	}
 	m.state.retainedCharge.Add(-amount)
@@ -349,7 +336,11 @@ const (
 
 func (m *Memory) reserveAdmission(mode memoryAdmissionMode, retainedLimit, amount int64) bool {
 	if mode == memoryAdmissionHasAllocation {
-		return reserveCounter(&m.state.retainedCharge, retainedLimit, amount)
+		if m.state.limitBytes == 0 {
+			m.state.retainedCharge.Add(amount)
+			return true
+		}
+		return reserveBounded(&m.state.retainedCharge, retainedLimit, amount)
 	}
 	return m.reserveRetained(retainedLimit, amount)
 }
@@ -424,6 +415,9 @@ func (m *Memory) planEvictions(
 	protectedKey Key,
 	planned []memoryPlannedEviction,
 ) int {
+	// Planning leaves candidates visible to readers. The later commit phase
+	// revalidates each reference epoch so a hit between these phases wins its
+	// CLOCK second chance without holding multiple shard locks at once.
 	if needed <= 0 {
 		return 0
 	}
@@ -473,6 +467,9 @@ func (m *Memory) planEvictions(
 }
 
 func (m *Memory) commitMemoryEvictionPlan(ctx context.Context, planned []memoryPlannedEviction, target int64) {
+	// Pointer identity rejects replacements and the epoch check rejects
+	// post-plan hits, so only the exact cold generation originally planned can
+	// be removed.
 	now := time.Now()
 	for start := 0; start < len(planned); {
 		shard := planned[start].shard
@@ -551,9 +548,6 @@ func (m *Memory) admit(ctx context.Context, entry *memoryEntry) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, errors.WithStack(err)
 	}
-	if admitted, err = m.tryAdmission(ctx, entry, m.state.limitBytes, memoryAdmissionNeedsAllocation); admitted || err != nil {
-		return admitted, err
-	}
 	m.trimForAdmission(ctx, entry)
 	admitted, err = m.tryAdmission(ctx, entry, m.state.limitBytes, memoryAdmissionNeedsAllocation)
 	if !admitted || err != nil {
@@ -627,6 +621,8 @@ type memoryReader struct {
 	closed atomic.Bool
 }
 
+var _ io.WriterTo = (*memoryReader)(nil)
+
 func (r *memoryReader) Read(p []byte) (int, error) {
 	if r.closed.Load() {
 		return 0, os.ErrClosed
@@ -637,6 +633,25 @@ func (r *memoryReader) Read(p []byte) (int, error) {
 	n := copy(p, r.data[r.offset:])
 	r.offset += n
 	return n, nil
+}
+
+func (r *memoryReader) WriteTo(destination io.Writer) (int64, error) {
+	if r.closed.Load() {
+		return 0, os.ErrClosed
+	}
+	if r.offset >= len(r.data) {
+		return 0, nil
+	}
+	remaining := len(r.data) - r.offset
+	written, err := destination.Write(r.data[r.offset:])
+	if written < 0 || written > remaining {
+		return 0, errors.Errorf("invalid Write count %d", written)
+	}
+	r.offset += written
+	if written != remaining && err == nil {
+		err = io.ErrShortWrite
+	}
+	return int64(written), errors.WithStack(err)
 }
 
 func (r *memoryReader) Close() error {
@@ -675,9 +690,11 @@ func (m *Memory) Create(ctx context.Context, key Key, headers http.Header, ttl t
 	metadataCharge := memoryMetadataCharge(m.namespace, clonedHeaders)
 	baseCharge := max(metadataCharge, int64(memoryWriterMinimumCharge))
 	if contentLength >= 0 && m.state.limitBytes > 0 && contentLength > m.state.limitBytes-metadataCharge {
+		m.state.metrics.recordDecline(ctx, memoryDeclineDeclaredHardLimit)
 		return &noOpWriter{}, nil
 	}
 	if contentLength >= 0 && m.state.inflightLimit > 0 && contentLength > m.state.inflightLimit-baseCharge {
+		m.state.metrics.recordDecline(ctx, memoryDeclineDeclaredInflightLimit)
 		return &noOpWriter{}, nil
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -696,6 +713,7 @@ func (m *Memory) Create(ctx context.Context, key Key, headers http.Header, ttl t
 		cancel:         cancel,
 	}
 	if !writer.reserve(baseCharge) {
+		m.state.metrics.recordDecline(ctx, memoryDeclineWriterReservation)
 		cancel(nil)
 		return &noOpWriter{}, nil
 	}
@@ -784,8 +802,16 @@ func (w *memoryWriter) Write(p []byte) (int, error) {
 	tooLarge := w.limitBytes > 0 && int64(len(p)) > w.limitBytes-w.baseCharge-buffered
 	longerThanDeclared := w.expectedLength >= 0 && int64(len(p)) > w.expectedLength-buffered
 	needed := buffered + int64(len(p))
-	if tooLarge || longerThanDeclared || !w.ensureCapacity(needed) {
-		w.discard()
+	if tooLarge {
+		w.decline(memoryDeclineBodyHardLimit)
+		return len(p), nil
+	}
+	if longerThanDeclared {
+		w.decline(memoryDeclineContentLengthMismatch)
+		return len(p), nil
+	}
+	if !w.ensureCapacity(needed) {
+		w.decline(memoryDeclineWriterReservation)
 		return len(p), nil
 	}
 	w.data = append(w.data, p...)
@@ -804,6 +830,9 @@ func (w *memoryWriter) maximumBodyCapacity() int64 {
 	}
 	if w.inflightLimit > 0 {
 		maximum = min(maximum, w.inflightLimit-w.baseCharge)
+	}
+	if w.expectedLength >= 0 {
+		maximum = min(maximum, w.expectedLength)
 	}
 	return maximum
 }
@@ -868,12 +897,18 @@ func (w *memoryWriter) reserve(amount int64) bool {
 }
 
 func (w *memoryWriter) tryReserve(amount int64) bool {
-	if !reserveCounter(&w.cache.state.inflightCharge, w.inflightLimit, amount) {
+	if w.inflightLimit == 0 {
+		w.cache.state.inflightCharge.Add(amount)
+	} else if !reserveBounded(&w.cache.state.inflightCharge, w.inflightLimit, amount) {
 		return false
 	}
-	if w.budgeted && !reserveCounter(&w.cache.state.hardLimitCharge, w.limitBytes, amount) {
-		w.cache.state.inflightCharge.Add(-amount)
-		return false
+	if w.budgeted {
+		if w.limitBytes == 0 {
+			w.cache.state.hardLimitCharge.Add(amount)
+		} else if !reserveBounded(&w.cache.state.hardLimitCharge, w.limitBytes, amount) {
+			w.cache.state.inflightCharge.Add(-amount)
+			return false
+		}
 	}
 	w.reservedBytes += amount
 	return true
@@ -914,6 +949,14 @@ func (w *memoryWriter) discard() {
 	w.discarded = true
 }
 
+func (w *memoryWriter) decline(reason memoryDeclineReason) {
+	if w.discarded {
+		return
+	}
+	w.cache.state.metrics.recordDecline(w.ctx, reason)
+	w.discard()
+}
+
 func (w *memoryWriter) Abort(err error) error {
 	w.cancel(err)
 	return w.Close()
@@ -933,7 +976,7 @@ func (w *memoryWriter) Close() error {
 		return nil
 	}
 	if w.expectedLength >= 0 && int64(len(w.data)) != w.expectedLength {
-		w.discard()
+		w.decline(memoryDeclineContentLengthMismatch)
 		return nil
 	}
 
@@ -948,15 +991,21 @@ func (w *memoryWriter) Close() error {
 	}
 	entry.charge = memoryEntryCharge(entry.namespace, entry.data, entry.headers)
 	if !w.budgeted {
-		_, err := w.cache.admit(w.ctx, entry)
+		admitted, err := w.cache.admit(w.ctx, entry)
+		if !admitted && err == nil {
+			w.cache.state.metrics.recordDecline(w.ctx, memoryDeclineAdmissionLimit)
+		}
 		return errors.WithStack(err)
 	}
 	if entry.charge > w.reservedBytes && !w.reserve(entry.charge-w.reservedBytes) {
+		w.cache.state.metrics.recordDecline(w.ctx, memoryDeclineWriterReservation)
 		return nil
 	}
 	admitted, err := w.cache.admitReserved(w.ctx, entry)
 	if admitted {
 		w.transferReservation(entry.charge)
+	} else if err == nil {
+		w.cache.state.metrics.recordDecline(w.ctx, memoryDeclineAdmissionLimit)
 	}
 	return errors.WithStack(err)
 }

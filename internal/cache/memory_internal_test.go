@@ -84,6 +84,48 @@ func memoryTestReader(t testing.TB, reader io.ReadCloser) *memoryReader {
 	return memoryReader
 }
 
+type writeCountingBuffer struct {
+	bytes.Buffer
+	writes int
+}
+
+func (w *writeCountingBuffer) Write(p []byte) (int, error) {
+	w.writes++
+	return w.Buffer.Write(p)
+}
+
+type writeOnlyDiscard struct{}
+
+func (writeOnlyDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+type recordingMemoryMetrics struct {
+	mu       sync.Mutex
+	declines map[memoryDeclineReason]int
+}
+
+func (r *recordingMemoryMetrics) recordDecline(_ context.Context, reason memoryDeclineReason) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.declines == nil {
+		r.declines = make(map[memoryDeclineReason]int)
+	}
+	r.declines[reason]++
+}
+
+func (r *recordingMemoryMetrics) declineCount(reason memoryDeclineReason) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.declines[reason]
+}
+
+func memoryWithRecordingMetrics(t *testing.T, config MemoryConfig) (*Memory, *recordingMemoryMetrics) {
+	t.Helper()
+	memory := newMemoryTestCacheWithConfig(t, config)
+	metrics := &recordingMemoryMetrics{}
+	memory.state.metrics = metrics
+	return memory, metrics
+}
+
 func admitMemoryTestEntry(ctx context.Context, t testing.TB, memory *Memory, entry *memoryEntry) {
 	t.Helper()
 	admitted, err := memory.admit(ctx, entry)
@@ -650,6 +692,47 @@ func TestMemoryDeclaredLengthDoesNotAllocateBeforeWrite(t *testing.T) {
 	assert.Equal(t, int64(0), memory.state.inflightCharge.Load())
 }
 
+func TestMemoryDeclaredLengthCapsFinalBufferCapacity(t *testing.T) {
+	memory := newMemoryTestCacheWithConfig(t, MemoryConfig{LimitMB: 4, InflightLimitMB: 2, MaxTTL: time.Hour})
+	declaredLength := 1024*1024 + 1
+	payload := bytes.Repeat([]byte{0x5a}, declaredLength)
+	writer, err := memory.Create(t.Context(), NewKey("exact-declared-capacity"), http.Header{
+		"Content-Length": {strconv.Itoa(declaredLength)},
+	}, time.Hour)
+	assert.NoError(t, err)
+	written, err := writer.Write(payload[:1024*1024])
+	assert.NoError(t, err)
+	assert.Equal(t, 1024*1024, written)
+	written, err = writer.Write(payload[1024*1024:])
+	assert.NoError(t, err)
+	assert.Equal(t, 1, written)
+	memoryWriter := memoryTestWriter(t, writer)
+	assert.Equal(t, declaredLength, cap(memoryWriter.data))
+	assert.NoError(t, writer.Close())
+}
+
+func TestMemoryReaderPreservesWriterToFastPath(t *testing.T) {
+	memory := newMemoryTestCache(t)
+	key := NewKey("writer-to-fast-path")
+	payload := bytes.Repeat([]byte{0x6b}, 96*1024)
+	writeMemoryTestEntry(t, memory, key, payload, time.Hour)
+	reader, _, err := memory.Open(t.Context(), key)
+	assert.NoError(t, err)
+	prefix := make([]byte, 1024)
+	read, err := reader.Read(prefix)
+	assert.NoError(t, err)
+	assert.Equal(t, len(prefix), read)
+	writerTo, ok := reader.(io.WriterTo)
+	assert.True(t, ok)
+	destination := &writeCountingBuffer{}
+	written, err := writerTo.WriteTo(destination)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(len(payload)-len(prefix)), written)
+	assert.Equal(t, 1, destination.writes)
+	assert.Equal(t, payload[len(prefix):], destination.Bytes())
+	assert.NoError(t, reader.Close())
+}
+
 func TestMemoryUnknownLengthAdmissionDoesNotDependOnWriteChunks(t *testing.T) {
 	memory := newMemoryTestCacheWithConfig(t, MemoryConfig{LimitMB: 2, InflightLimitMB: 1, MaxTTL: time.Hour})
 	key := NewKey("chunked-unknown-length")
@@ -671,6 +754,88 @@ func TestMemoryUnknownLengthAdmissionDoesNotDependOnWriteChunks(t *testing.T) {
 	assert.Equal(t, payload, stored)
 }
 
+func TestMemorySmallUnknownLengthUsesMinimumCapacity(t *testing.T) {
+	memory := newMemoryTestCache(t)
+	writer, err := memory.Create(t.Context(), NewKey("small-unknown-length"), nil, time.Hour)
+	assert.NoError(t, err)
+	written, err := writer.Write([]byte{1})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, written)
+	assert.Equal(t, memoryWriterInitialCapacity, cap(memoryTestWriter(t, writer).data))
+	assert.NoError(t, writer.Close())
+}
+
+func TestMemoryRecordsAdmissionDeclineReasons(t *testing.T) {
+	t.Run("declared hard limit", func(t *testing.T) {
+		memory, metrics := memoryWithRecordingMetrics(t, MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+		writer, err := memory.Create(t.Context(), NewKey("declared-hard-limit"), http.Header{
+			"Content-Length": {strconv.Itoa(2 * 1024 * 1024)},
+		}, time.Hour)
+		assert.NoError(t, err)
+		assert.NoError(t, writer.Close())
+		assert.Equal(t, 1, metrics.declineCount(memoryDeclineDeclaredHardLimit))
+	})
+
+	t.Run("declared inflight limit", func(t *testing.T) {
+		memory, metrics := memoryWithRecordingMetrics(t, MemoryConfig{LimitMB: 4, InflightLimitMB: 1, MaxTTL: time.Hour})
+		writer, err := memory.Create(t.Context(), NewKey("declared-inflight-limit"), http.Header{
+			"Content-Length": {strconv.Itoa(1024 * 1024)},
+		}, time.Hour)
+		assert.NoError(t, err)
+		assert.NoError(t, writer.Close())
+		assert.Equal(t, 1, metrics.declineCount(memoryDeclineDeclaredInflightLimit))
+	})
+
+	t.Run("writer reservation", func(t *testing.T) {
+		memory, metrics := memoryWithRecordingMetrics(t, MemoryConfig{LimitMB: 4, InflightLimitMB: 1, MaxTTL: time.Hour})
+		memory.state.inflightCharge.Store(memory.state.inflightLimit)
+		writer, err := memory.Create(t.Context(), NewKey("writer-reservation"), nil, time.Hour)
+		assert.NoError(t, err)
+		assert.NoError(t, writer.Close())
+		memory.state.inflightCharge.Store(0)
+		assert.Equal(t, 1, metrics.declineCount(memoryDeclineWriterReservation))
+	})
+
+	t.Run("body hard limit", func(t *testing.T) {
+		memory, metrics := memoryWithRecordingMetrics(t, MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+		writer, err := memory.Create(t.Context(), NewKey("body-hard-limit"), nil, time.Hour)
+		assert.NoError(t, err)
+		written, err := writer.Write(make([]byte, 2*1024*1024))
+		assert.NoError(t, err)
+		assert.Equal(t, 2*1024*1024, written)
+		assert.NoError(t, writer.Close())
+		assert.Equal(t, 1, metrics.declineCount(memoryDeclineBodyHardLimit))
+	})
+
+	t.Run("content length mismatch", func(t *testing.T) {
+		memory, metrics := memoryWithRecordingMetrics(t, MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+		writer, err := memory.Create(t.Context(), NewKey("content-length-mismatch"), http.Header{
+			"Content-Length": {"1"},
+		}, time.Hour)
+		assert.NoError(t, err)
+		assert.NoError(t, writer.Close())
+		assert.Equal(t, 1, metrics.declineCount(memoryDeclineContentLengthMismatch))
+	})
+
+	t.Run("admission limit", func(t *testing.T) {
+		memory, metrics := memoryWithRecordingMetrics(t, MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+		keys := make([]Key, 0, memory.state.limitBytes/memoryEntryMinimumCharge)
+		for index := range cap(keys) {
+			key := NewKey(fmt.Sprintf("admission-limit-%d", index))
+			keys = append(keys, key)
+			writeMemoryTestEntry(t, memory, key, nil, time.Hour)
+		}
+		for _, key := range keys {
+			_, err := memory.Stat(t.Context(), key)
+			assert.NoError(t, err)
+		}
+		writer, err := memory.Create(t.Context(), NewKey("declined-admission"), nil, time.Hour)
+		assert.NoError(t, err)
+		assert.NoError(t, writer.Close())
+		assert.Equal(t, 1, metrics.declineCount(memoryDeclineAdmissionLimit))
+	})
+}
+
 func TestMemoryRejectsInvalidLimits(t *testing.T) {
 	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
 	type invalidLimitTest struct {
@@ -680,6 +845,8 @@ func TestMemoryRejectsInvalidLimits(t *testing.T) {
 	tests := []invalidLimitTest{
 		{name: "negative retained limit", config: MemoryConfig{LimitMB: -1}},
 		{name: "negative inflight limit", config: MemoryConfig{InflightLimitMB: -1}},
+		{name: "inflight limit equals retained limit", config: MemoryConfig{LimitMB: 8, InflightLimitMB: 8}},
+		{name: "inflight limit exceeds retained limit", config: MemoryConfig{LimitMB: 8, InflightLimitMB: 9}},
 	}
 	if strconv.IntSize == 64 {
 		overflowMB := int(math.MaxInt64/(1024*1024) + 1)
@@ -697,6 +864,32 @@ func TestMemoryRejectsInvalidLimits(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
+}
+
+func TestMemoryUnlimitedRetentionSupportsInflightLimit(t *testing.T) {
+	memory := newMemoryTestCacheWithConfig(t, MemoryConfig{InflightLimitMB: 1, MaxTTL: time.Hour})
+	first, err := memory.Create(t.Context(), NewKey("unlimited-retention-first"), nil, time.Hour)
+	assert.NoError(t, err)
+	second, err := memory.Create(t.Context(), NewKey("unlimited-retention-second"), nil, time.Hour)
+	assert.NoError(t, err)
+	for _, writer := range []Writer{first, second} {
+		written, err := writer.Write(make([]byte, 768*1024))
+		assert.NoError(t, err)
+		assert.Equal(t, 768*1024, written)
+	}
+	assert.True(t, memory.state.inflightCharge.Load() <= memory.state.inflightLimit)
+	assert.NoError(t, first.Close())
+	assert.NoError(t, second.Close())
+	third, err := memory.Create(t.Context(), NewKey("unlimited-retention-third"), nil, time.Hour)
+	assert.NoError(t, err)
+	written, err := third.Write(make([]byte, 768*1024))
+	assert.NoError(t, err)
+	assert.Equal(t, 768*1024, written)
+	assert.NoError(t, third.Close())
+	stats, err := memory.Stats(t.Context())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(2), stats.Objects)
+	assert.True(t, memory.state.retainedCharge.Load() > memory.state.inflightLimit)
 }
 
 func TestMemoryCancelledAdmissionDoesNotEvictEntries(t *testing.T) {
@@ -792,7 +985,7 @@ func TestMemoryCancellationWhileWaitingForAdmissionIsNotAdmitted(t *testing.T) {
 
 func TestMemoryConcurrentAdmissionKeepsAccountingBounded(t *testing.T) {
 	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
-	memory, err := NewMemory(ctx, MemoryConfig{LimitMB: 1, InflightLimitMB: 1, MaxTTL: time.Hour})
+	memory, err := NewMemory(ctx, MemoryConfig{LimitMB: 8, InflightLimitMB: 2, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
 	const writes = 64
@@ -838,6 +1031,7 @@ func TestMemoryConcurrentAdmissionKeepsAccountingBounded(t *testing.T) {
 	}
 	assert.Equal(t, actualObjects, stats.Objects)
 	assert.Equal(t, actualSize, stats.Size)
+	assert.True(t, actualObjects > 1)
 }
 
 func TestMemoryConcurrentReplacementDoesNotExposeCapacity(t *testing.T) {
@@ -1063,7 +1257,7 @@ func newMemoryBenchmarkCache(b *testing.B, entryCount int, expiresAt time.Time) 
 
 func newConfiguredMemoryBenchmarkCache(b *testing.B, entryCount int, expiresAt time.Time) *Memory {
 	b.Helper()
-	config := MemoryConfig{LimitMB: 1, InflightLimitMB: 1, MaxTTL: time.Hour}
+	config := MemoryConfig{LimitMB: 8, InflightLimitMB: 2, MaxTTL: time.Hour}
 	state, err := newMemoryState(config)
 	assert.NoError(b, err)
 	state.retainedTarget = int64(entryCount * memoryEntryMinimumCharge)
@@ -1101,6 +1295,41 @@ func BenchmarkMemoryParallelHotHits(b *testing.B) {
 		for pb.Next() {
 			reader, _, err := memory.Open(ctx, key)
 			if err != nil {
+				b.Error(err)
+				return
+			}
+			if err := reader.Close(); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
+func BenchmarkMemoryParallelHotHitCopy(b *testing.B) {
+	_, ctx := logging.Configure(b.Context(), logging.Config{Level: slog.LevelError})
+	memory, err := NewMemory(ctx, MemoryConfig{LimitMB: 8, MaxTTL: time.Hour})
+	assert.NoError(b, err)
+	key := NewKey("parallel-hot-hit-copy")
+	payload := bytes.Repeat([]byte{0x4d}, 1024*1024)
+	writer, err := memory.Create(ctx, key, http.Header{"Content-Length": {strconv.Itoa(len(payload))}}, time.Hour)
+	assert.NoError(b, err)
+	_, err = writer.Write(payload)
+	assert.NoError(b, err)
+	assert.NoError(b, writer.Close())
+	b.Cleanup(func() { assert.NoError(b, memory.Close()) })
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	destination := writeOnlyDiscard{}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			reader, _, err := memory.Open(ctx, key)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			if _, err := io.Copy(destination, reader); err != nil {
 				b.Error(err)
 				return
 			}
