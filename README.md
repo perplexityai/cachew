@@ -165,10 +165,10 @@ can implement the same PURL-to-decision interface without changing the
 CodeArtifact or Go module strategies.
 
 For the Socket provider, a policy action of `error`, or a package Socket cannot
-resolve, returns `403`. Pending analysis or an unavailable Socket API returns
-`503` with `Retry-After`; these outcomes fail closed and never fall through to
-CodeArtifact. Cache hits do not recheck the policy because Cachew only admits
-complete, origin-declared immutable bodies.
+resolve, returns `403`. Pending analysis, provider failures, and malformed
+responses fail open: Cachew records the outcome and continues to the package
+origin. Cache hits do not recheck the policy because Cachew only admits complete,
+origin-declared immutable bodies.
 
 A later policy change does not automatically invalidate an admitted object.
 Cachew's generic `delete` operation accepts one exact cache key, but CodeArtifact

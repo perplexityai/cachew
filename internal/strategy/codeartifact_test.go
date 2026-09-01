@@ -234,13 +234,15 @@ func TestCodeArtifactRecordsUnsupportedPolicyRequest(t *testing.T) {
 	assert.Equal(t, []string(nil), policy.purls)
 }
 
-func TestCodeArtifactEnforcesPackagePolicyBeforeOriginAuthentication(t *testing.T) {
+func TestCodeArtifactHandlesPackagePolicyBeforeOriginAuthentication(t *testing.T) {
 	tests := []struct {
-		name       string
-		decision   packagepolicy.Decision
-		err        error
-		statusCode int
-		policy     string
+		name           string
+		decision       packagepolicy.Decision
+		err            error
+		statusCode     int
+		policy         string
+		tokenRequests  int
+		originRequests int32
 	}{
 		{
 			name:       "denied package",
@@ -249,16 +251,18 @@ func TestCodeArtifactEnforcesPackagePolicyBeforeOriginAuthentication(t *testing.
 			policy:     "deny",
 		},
 		{
-			name:       "pending package",
-			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictPending, Reasons: []string{"pendingScan"}},
-			statusCode: http.StatusServiceUnavailable,
-			policy:     "pending",
+			name:           "pending package",
+			decision:       packagepolicy.Decision{Verdict: packagepolicy.VerdictPending, Reasons: []string{"pendingScan"}},
+			statusCode:     http.StatusOK,
+			tokenRequests:  1,
+			originRequests: 1,
 		},
 		{
-			name:       "policy unavailable",
-			err:        errors.New("Socket API unavailable"),
-			statusCode: http.StatusServiceUnavailable,
-			policy:     "unavailable",
+			name:           "policy unavailable",
+			err:            errors.New("Socket API unavailable"),
+			statusCode:     http.StatusOK,
+			tokenRequests:  1,
+			originRequests: 1,
 		},
 	}
 
@@ -281,8 +285,8 @@ func TestCodeArtifactEnforcesPackagePolicyBeforeOriginAuthentication(t *testing.
 			assert.Equal(t, test.statusCode, w.Code)
 			assert.Equal(t, test.policy, w.Header().Get("X-Cachew-Package-Policy"))
 			assert.Equal(t, []string{"pkg:npm/chromatitle-js@1.0.0"}, policy.purls)
-			assert.Equal(t, 0, tokenServer.requestCount())
-			assert.Equal(t, int32(0), originRequests.Load())
+			assert.Equal(t, test.tokenRequests, tokenServer.requestCount())
+			assert.Equal(t, test.originRequests, originRequests.Load())
 			if test.err != nil {
 				assert.Contains(t, logs.String(), test.err.Error())
 			}

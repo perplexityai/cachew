@@ -50,13 +50,14 @@ func (r *recordingPackagePolicy) ObserveNotApplicable(context.Context) {
 	r.notApplicable++
 }
 
-func TestGoModuleEnforcesPackagePolicyBeforeOrigin(t *testing.T) {
+func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 	tests := []struct {
-		name       string
-		decision   packagepolicy.Decision
-		err        error
-		statusCode int
-		policy     string
+		name           string
+		decision       packagepolicy.Decision
+		err            error
+		statusCode     int
+		policy         string
+		originRequests int
 	}{
 		{
 			name:       "denied package",
@@ -65,16 +66,16 @@ func TestGoModuleEnforcesPackagePolicyBeforeOrigin(t *testing.T) {
 			policy:     "deny",
 		},
 		{
-			name:       "pending package",
-			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictPending},
-			statusCode: http.StatusServiceUnavailable,
-			policy:     "pending",
+			name:           "pending package",
+			decision:       packagepolicy.Decision{Verdict: packagepolicy.VerdictPending},
+			statusCode:     http.StatusOK,
+			originRequests: 1,
 		},
 		{
-			name:       "policy unavailable",
-			err:        io.ErrUnexpectedEOF,
-			statusCode: http.StatusServiceUnavailable,
-			policy:     "unavailable",
+			name:           "policy unavailable",
+			err:            io.ErrUnexpectedEOF,
+			statusCode:     http.StatusOK,
+			originRequests: 1,
 		},
 	}
 
@@ -99,7 +100,7 @@ func TestGoModuleEnforcesPackagePolicyBeforeOrigin(t *testing.T) {
 			assert.Equal(t, test.statusCode, w.Code)
 			assert.Equal(t, test.policy, w.Header().Get("X-Cachew-Package-Policy"))
 			assert.Equal(t, []string{"pkg:golang/github.com/pkg/errors@v0.9.1"}, policy.purls)
-			assert.Equal(t, 0, originRequests)
+			assert.Equal(t, test.originRequests, originRequests)
 			if test.err != nil {
 				assert.Contains(t, logs.String(), test.err.Error())
 			}
