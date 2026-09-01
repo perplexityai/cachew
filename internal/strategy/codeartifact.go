@@ -303,7 +303,7 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 	}
 	copyHeaders(upstream.Header, codeArtifactRequestHeaders(r.Header))
 	if shouldRewriteCodeArtifactMetadata(target.Path) {
-		stripCodeArtifactMetadataRequestHeaders(upstream.Header)
+		normalizeCodeArtifactMetadataRequestHeaders(upstream.Header, target.Path)
 	}
 	setCodeArtifactAuthorization(upstream, token)
 
@@ -389,7 +389,7 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 	}
 	copyHeaders(redirected.Header, codeArtifactRequestHeaders(r.Header))
 	if rewriteMetadata {
-		stripCodeArtifactMetadataRequestHeaders(redirected.Header)
+		normalizeCodeArtifactMetadataRequestHeaders(redirected.Header, c.originURL(r).Path)
 	}
 
 	resp, err := c.client.Do(redirected)
