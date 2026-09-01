@@ -1,11 +1,11 @@
 package cache
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -19,65 +19,566 @@ import (
 	"github.com/block/cachew/internal/logging"
 )
 
+const (
+	memoryShardCount               = 16
+	maxMemoryEvictionsPerWrite     = 64
+	maxMemoryEvictionScansPerShard = 64
+	maxMemoryReservationRetries    = 8
+	memoryEntryMinimumCharge       = 4 * 1024
+	memoryEntryBaseCharge          = 512
+	memoryHeaderEntryCharge        = 64
+	memoryHeaderValueCharge        = 16
+	memoryWriterMinimumCharge      = 4 * 1024
+	memoryWriterInitialCapacity    = 64 * 1024
+	memoryBytesPerMegabyte         = 1024 * 1024
+	fnv64Offset                    = 14695981039346656037
+	fnv64Prime                     = 1099511628211
+)
+
+// RegisterMemory preserves the existing "memory" HCL backend while replacing its admission policy.
 func RegisterMemory(r *Registry) {
 	Register(
 		r,
 		"memory",
-		"Caches objects in memory, with a maximum size limit and LRU eviction",
+		"Caches objects in memory, with retained-size accounting and bounded CLOCK eviction",
 		NewMemory,
 	)
 }
 
+// MemoryConfig keeps incomplete-write protection opt-in so existing zero-valued configurations remain compatible.
 type MemoryConfig struct {
-	LimitMB int           `hcl:"limit-mb,optional" help:"Maximum size of the disk cache in megabytes (defaults to 1GB)." default:"1024"`
-	MaxTTL  time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
+	LimitMB         int           `hcl:"limit-mb,optional" help:"Maximum retained size of the memory cache in megabytes (defaults to 1GB); positive inflight-limit-mb shares this budget." default:"1024"`
+	InflightLimitMB int           `hcl:"inflight-limit-mb,optional" help:"Maximum aggregate incomplete writes in megabytes (0 disables the sub-limit for compatibility)." default:"0"`
+	MaxTTL          time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the memory cache (defaults to 1 hour)." default:"1h"`
 }
 
 type memoryEntry struct {
-	data      []byte
-	expiresAt time.Time
-	headers   http.Header
+	namespace      Namespace
+	key            Key
+	data           []byte
+	expiresAt      time.Time
+	headers        http.Header
+	charge         int64
+	referenceEpoch atomic.Uint64
+	clockEpoch     uint64
+	readers        atomic.Int64
+	previous       *memoryEntry
+	next           *memoryEntry
+	retired        atomic.Bool
+	released       bool
 }
 
+type memoryShard struct {
+	mu           sync.RWMutex
+	entries      map[Namespace]map[Key]*memoryEntry
+	evictionHead *memoryEntry
+	evictionTail *memoryEntry
+	evictionHand *memoryEntry
+}
+
+func (s *memoryShard) entry(namespace Namespace, key Key) (*memoryEntry, bool) {
+	namespaceEntries, ok := s.entries[namespace]
+	if !ok {
+		return nil, false
+	}
+	entry, ok := namespaceEntries[key]
+	return entry, ok
+}
+
+func (s *memoryShard) append(entry *memoryEntry) {
+	entry.previous = s.evictionTail
+	entry.next = nil
+	if s.evictionTail == nil {
+		s.evictionHead = entry
+	} else {
+		s.evictionTail.next = entry
+	}
+	s.evictionTail = entry
+	if s.evictionHand == nil {
+		s.evictionHand = entry
+	}
+}
+
+func (s *memoryShard) remove(entry *memoryEntry) {
+	nextHand := entry.next
+	if entry.previous == nil {
+		s.evictionHead = entry.next
+	} else {
+		entry.previous.next = entry.next
+	}
+	if entry.next == nil {
+		s.evictionTail = entry.previous
+	} else {
+		entry.next.previous = entry.previous
+	}
+	entry.previous = nil
+	entry.next = nil
+	if s.evictionHand == entry {
+		s.evictionHand = nextHand
+		if s.evictionHand == nil {
+			s.evictionHand = s.evictionHead
+		}
+	}
+}
+
+func (s *memoryShard) insert(entry *memoryEntry) {
+	namespaceEntries := s.entries[entry.namespace]
+	if namespaceEntries == nil {
+		namespaceEntries = make(map[Key]*memoryEntry)
+		s.entries[entry.namespace] = namespaceEntries
+	}
+	namespaceEntries[entry.key] = entry
+	s.append(entry)
+}
+
+type memoryState struct {
+	shards          []memoryShard
+	limitBytes      int64
+	retainedTarget  int64
+	inflightLimit   int64
+	retainedCharge  atomic.Int64
+	inflightCharge  atomic.Int64
+	hardLimitCharge atomic.Int64
+	payloadSize     atomic.Int64
+	objectCount     atomic.Int64
+	evictionCursor  atomic.Uint32
+	closed          atomic.Bool
+}
+
+// Memory shares capacity across namespace views so each view cannot consume limit-mb independently.
 type Memory struct {
-	config      MemoryConfig
-	namespace   Namespace
-	mu          *sync.RWMutex
-	entries     map[Namespace]map[Key]*memoryEntry // namespace -> key -> entry
-	currentSize *atomic.Int64
+	config    MemoryConfig
+	namespace Namespace
+	state     *memoryState
 }
 
-func NewMemory(ctx context.Context, config MemoryConfig) (*Memory, error) {
-	logging.FromContext(ctx).InfoContext(ctx, "Constructing in-memory Cache", "limit-mb", config.LimitMB, "max-ttl", config.MaxTTL)
-	return &Memory{
-		config:      config,
-		mu:          &sync.RWMutex{},
-		entries:     make(map[Namespace]map[Key]*memoryEntry),
-		currentSize: &atomic.Int64{},
+func memoryMegabytes(field string, value int) (int64, error) {
+	if value < 0 {
+		return 0, errors.Errorf("%s must be non-negative", field)
+	}
+	if int64(value) > math.MaxInt64/memoryBytesPerMegabyte {
+		return 0, errors.Errorf("%s is too large", field)
+	}
+	return int64(value) * memoryBytesPerMegabyte, nil
+}
+
+func newMemoryState(config MemoryConfig) (*memoryState, error) {
+	limitBytes, err := memoryMegabytes("limit-mb", config.LimitMB)
+	if err != nil {
+		return nil, err
+	}
+	configuredInflightBytes, err := memoryMegabytes("inflight-limit-mb", config.InflightLimitMB)
+	if err != nil {
+		return nil, err
+	}
+	inflightLimit := memoryInflightLimit(configuredInflightBytes, limitBytes)
+	retainedTarget := memoryRetainedTarget(limitBytes, inflightLimit)
+	shards := make([]memoryShard, memoryShardCount)
+	for index := range shards {
+		shards[index].entries = make(map[Namespace]map[Key]*memoryEntry)
+	}
+	return &memoryState{
+		shards: shards, limitBytes: limitBytes,
+		retainedTarget: retainedTarget, inflightLimit: inflightLimit,
 	}, nil
 }
 
+// NewMemory rejects invalid byte conversions before a bad limit can silently become unlimited.
+func NewMemory(ctx context.Context, config MemoryConfig) (*Memory, error) {
+	state, err := newMemoryState(config)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	logging.FromContext(ctx).InfoContext(ctx, "Constructing in-memory Cache", "limit-mb", config.LimitMB,
+		"inflight-limit-mb", config.InflightLimitMB, "max-ttl", config.MaxTTL)
+	return &Memory{config: config, state: state}, nil
+}
+
+func memoryShardIndex(namespace Namespace, key Key) int {
+	hash := uint64(fnv64Offset)
+	for index := range len(namespace) {
+		hash ^= uint64(namespace[index])
+		hash *= fnv64Prime
+	}
+	hash ^= 0xff
+	hash *= fnv64Prime
+	for _, value := range key {
+		hash ^= uint64(value)
+		hash *= fnv64Prime
+	}
+	return int(hash % memoryShardCount)
+}
+
+func (m *Memory) shard(namespace Namespace, key Key) *memoryShard {
+	return &m.state.shards[memoryShardIndex(namespace, key)]
+}
+
+func expectedContentLength(headers http.Header) int64 {
+	contentLength, err := strconv.ParseInt(headers.Get("Content-Length"), 10, 64)
+	if err != nil || contentLength < 0 {
+		return -1
+	}
+	return contentLength
+}
+
+func memoryMetadataCharge(namespace Namespace, headers http.Header) int64 {
+	charge := int64(memoryEntryBaseCharge + len(namespace))
+	for name, values := range headers {
+		charge += int64(memoryHeaderEntryCharge + len(name))
+		for _, value := range values {
+			charge += int64(memoryHeaderValueCharge + len(value))
+		}
+	}
+	return charge
+}
+
+func memoryEntryCharge(namespace Namespace, data []byte, headers http.Header) int64 {
+	charge := int64(cap(data)) + memoryMetadataCharge(namespace, headers)
+	return max(charge, int64(memoryEntryMinimumCharge))
+}
+
+func memoryInflightLimit(configuredBytes, limitBytes int64) int64 {
+	if configuredBytes <= 0 {
+		return 0
+	}
+	if limitBytes > 0 {
+		return min(configuredBytes, limitBytes)
+	}
+	return configuredBytes
+}
+
+func memoryRetainedTarget(limitBytes, inflightLimit int64) int64 {
+	if limitBytes <= 0 {
+		return 0
+	}
+	return limitBytes - min(limitBytes, max(inflightLimit, 0))
+}
+
+func reserveBounded(counter *atomic.Int64, limit, amount int64) bool {
+	if amount <= 0 {
+		return true
+	}
+	for range maxMemoryReservationRetries {
+		current := counter.Load()
+		if amount > limit-current {
+			return false
+		}
+		if counter.CompareAndSwap(current, current+amount) {
+			return true
+		}
+	}
+	return false
+}
+
+func reserveCounter(counter *atomic.Int64, limit, amount int64) bool {
+	if amount <= 0 {
+		return true
+	}
+	if limit <= 0 {
+		counter.Add(amount)
+		return true
+	}
+	return reserveBounded(counter, limit, amount)
+}
+
+type memoryPlannedEviction struct {
+	shard          *memoryShard
+	entry          *memoryEntry
+	referenceEpoch uint64
+}
+
+func (m *Memory) releaseRetiredLocked(entry *memoryEntry) {
+	if entry.released || !entry.retired.Load() || entry.readers.Load() != 0 {
+		return
+	}
+	entry.released = true
+	m.state.retainedCharge.Add(-entry.charge)
+	m.state.hardLimitCharge.Add(-entry.charge)
+	entry.data = nil
+	entry.headers = nil
+}
+
+func (m *Memory) removeActiveLocked(shard *memoryShard, entry *memoryEntry) {
+	shard.remove(entry)
+	namespaceEntries := shard.entries[entry.namespace]
+	delete(namespaceEntries, entry.key)
+	if len(namespaceEntries) == 0 {
+		delete(shard.entries, entry.namespace)
+	}
+	entry.retired.Store(true)
+	m.state.objectCount.Add(-1)
+	m.state.payloadSize.Add(-int64(len(entry.data)))
+	m.releaseRetiredLocked(entry)
+}
+
+func (m *Memory) replaceActiveLocked(shard *memoryShard, oldEntry, newEntry *memoryEntry) {
+	oldPayloadSize := len(oldEntry.data)
+	shard.remove(oldEntry)
+	oldEntry.retired.Store(true)
+	oldEntry.released = true
+	oldEntry.data = nil
+	oldEntry.headers = nil
+	shard.entries[newEntry.namespace][newEntry.key] = newEntry
+	shard.append(newEntry)
+	m.state.payloadSize.Add(int64(len(newEntry.data) - oldPayloadSize))
+}
+
+func (m *Memory) insertActiveLocked(shard *memoryShard, entry *memoryEntry) {
+	shard.insert(entry)
+	m.state.objectCount.Add(1)
+	m.state.payloadSize.Add(int64(len(entry.data)))
+}
+
+func (m *Memory) reserveRetained(retainedLimit, amount int64) bool {
+	if !reserveCounter(&m.state.retainedCharge, retainedLimit, amount) {
+		return false
+	}
+	if reserveCounter(&m.state.hardLimitCharge, m.state.limitBytes, amount) {
+		return true
+	}
+	m.state.retainedCharge.Add(-amount)
+	return false
+}
+
+type memoryAdmissionMode uint8
+
+const (
+	memoryAdmissionNeedsAllocation memoryAdmissionMode = iota
+	memoryAdmissionHasAllocation
+)
+
+func (m *Memory) reserveAdmission(mode memoryAdmissionMode, retainedLimit, amount int64) bool {
+	if mode == memoryAdmissionHasAllocation {
+		return reserveCounter(&m.state.retainedCharge, retainedLimit, amount)
+	}
+	return m.reserveRetained(retainedLimit, amount)
+}
+
+func (m *Memory) tryAdmission(
+	ctx context.Context,
+	entry *memoryEntry,
+	retainedLimit int64,
+	mode memoryAdmissionMode,
+) (bool, error) {
+	shard := m.shard(entry.namespace, entry.key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if m.state.closed.Load() {
+		return false, errors.WithStack(os.ErrClosed)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, errors.WithStack(err)
+	}
+	oldEntry, replacing := shard.entry(entry.namespace, entry.key)
+	if replacing && oldEntry.readers.Load() == 0 {
+		delta := entry.charge - oldEntry.charge
+		if delta > 0 && !m.reserveAdmission(mode, retainedLimit, delta) {
+			return false, nil
+		}
+		m.replaceActiveLocked(shard, oldEntry, entry)
+		if delta < 0 {
+			m.state.retainedCharge.Add(delta)
+		}
+		if mode == memoryAdmissionHasAllocation {
+			m.state.hardLimitCharge.Add(-oldEntry.charge)
+		} else if delta < 0 {
+			m.state.hardLimitCharge.Add(delta)
+		}
+		return true, nil
+	}
+	if !m.reserveAdmission(mode, retainedLimit, entry.charge) {
+		return false, nil
+	}
+	if oldEntry != nil {
+		m.removeActiveLocked(shard, oldEntry)
+	}
+	m.insertActiveLocked(shard, entry)
+	return true, nil
+}
+
+func (m *Memory) admitReserved(ctx context.Context, entry *memoryEntry) (bool, error) {
+	if m.state.closed.Load() {
+		return false, errors.WithStack(os.ErrClosed)
+	}
+	if m.state.limitBytes > 0 && entry.charge > m.state.limitBytes {
+		return false, nil
+	}
+	admitted, err := m.tryAdmission(ctx, entry, m.state.limitBytes, memoryAdmissionHasAllocation)
+	if admitted || err != nil || m.state.limitBytes <= 0 {
+		if admitted && m.state.limitBytes > 0 {
+			m.trimToTarget(ctx, entry.namespace, entry.key)
+		}
+		return admitted, err
+	}
+	m.trimToTarget(ctx, entry.namespace, entry.key)
+	admitted, err = m.tryAdmission(ctx, entry, m.state.limitBytes, memoryAdmissionHasAllocation)
+	if admitted {
+		m.trimToTarget(ctx, entry.namespace, entry.key)
+	}
+	return admitted, err
+}
+
+func (m *Memory) planEvictions(
+	needed int64,
+	protectedNamespace Namespace,
+	protectedKey Key,
+	planned []memoryPlannedEviction,
+) int {
+	if needed <= 0 {
+		return 0
+	}
+	now := time.Now()
+	start := int((m.state.evictionCursor.Add(1) - 1) % memoryShardCount)
+	plannedEntries := 0
+	plannedSize := int64(0)
+	for offset := range memoryShardCount {
+		shard := &m.state.shards[(start+offset)%memoryShardCount]
+		shard.mu.Lock()
+		scanned := 0
+		candidate := shard.evictionHand
+		startCandidate := candidate
+		for candidate != nil && scanned < maxMemoryEvictionScansPerShard {
+			scanned++
+			nextCandidate := candidate.next
+			if nextCandidate == nil {
+				nextCandidate = shard.evictionHead
+			}
+			if candidate.namespace != protectedNamespace || candidate.key != protectedKey {
+				referenceEpoch := candidate.referenceEpoch.Load()
+				expired := !now.Before(candidate.expiresAt)
+				if candidate.readers.Load() == 0 {
+					if expired || candidate.clockEpoch == referenceEpoch {
+						planned[plannedEntries] = memoryPlannedEviction{
+							shard: shard, entry: candidate, referenceEpoch: referenceEpoch,
+						}
+						plannedEntries++
+						plannedSize += candidate.charge
+					} else {
+						candidate.clockEpoch = referenceEpoch
+					}
+				}
+			}
+			candidate = nextCandidate
+			if plannedSize >= needed || plannedEntries == maxMemoryEvictionsPerWrite || candidate == startCandidate {
+				break
+			}
+		}
+		shard.evictionHand = candidate
+		shard.mu.Unlock()
+		if plannedSize >= needed || plannedEntries == maxMemoryEvictionsPerWrite {
+			break
+		}
+	}
+	return plannedEntries
+}
+
+func (m *Memory) commitMemoryEvictionPlan(ctx context.Context, planned []memoryPlannedEviction, target int64) {
+	now := time.Now()
+	for start := 0; start < len(planned); {
+		shard := planned[start].shard
+		shard.mu.Lock()
+		if ctx.Err() != nil {
+			shard.mu.Unlock()
+			return
+		}
+		end := start
+		for end < len(planned) && planned[end].shard == shard {
+			if m.state.retainedCharge.Load() <= target {
+				shard.mu.Unlock()
+				return
+			}
+			plannedEntry := planned[end]
+			entry := plannedEntry.entry
+			activeEntry, active := shard.entry(entry.namespace, entry.key)
+			if active && activeEntry == entry && entry.readers.Load() == 0 {
+				referenceEpoch := entry.referenceEpoch.Load()
+				if !now.Before(entry.expiresAt) || referenceEpoch == plannedEntry.referenceEpoch {
+					m.removeActiveLocked(shard, entry)
+				} else {
+					entry.clockEpoch = referenceEpoch
+				}
+			}
+			end++
+		}
+		shard.mu.Unlock()
+		start = end
+	}
+}
+
+func (m *Memory) trimToTarget(ctx context.Context, protectedNamespace Namespace, protectedKey Key) {
+	needed := m.state.retainedCharge.Load() - m.state.retainedTarget
+	if needed <= 0 {
+		return
+	}
+	var planBuffer [maxMemoryEvictionsPerWrite]memoryPlannedEviction
+	plannedEntries := m.planEvictions(needed, protectedNamespace, protectedKey, planBuffer[:])
+	m.commitMemoryEvictionPlan(ctx, planBuffer[:plannedEntries], m.state.retainedTarget)
+}
+
+func (m *Memory) trimForAdmission(ctx context.Context, entry *memoryEntry) {
+	amount := entry.charge
+	shard := m.shard(entry.namespace, entry.key)
+	shard.mu.RLock()
+	if oldEntry, replacing := shard.entry(entry.namespace, entry.key); replacing && oldEntry.readers.Load() == 0 {
+		amount = max(entry.charge-oldEntry.charge, 0)
+	}
+	shard.mu.RUnlock()
+	target := max(m.state.limitBytes-amount, 0)
+	needed := m.state.retainedCharge.Load() - target
+	if needed <= 0 {
+		return
+	}
+	var planBuffer [maxMemoryEvictionsPerWrite]memoryPlannedEviction
+	plannedEntries := m.planEvictions(needed, entry.namespace, entry.key, planBuffer[:])
+	m.commitMemoryEvictionPlan(ctx, planBuffer[:plannedEntries], target)
+}
+
+func (m *Memory) admit(ctx context.Context, entry *memoryEntry) (bool, error) {
+	if m.state.closed.Load() {
+		return false, errors.WithStack(os.ErrClosed)
+	}
+	if m.state.limitBytes > 0 && entry.charge > m.state.limitBytes {
+		return false, nil
+	}
+	admitted, err := m.tryAdmission(ctx, entry, m.state.retainedTarget, memoryAdmissionNeedsAllocation)
+	if err != nil || m.state.limitBytes <= 0 {
+		return admitted, err
+	}
+	if admitted {
+		m.trimToTarget(ctx, entry.namespace, entry.key)
+		return true, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, errors.WithStack(err)
+	}
+	if admitted, err = m.tryAdmission(ctx, entry, m.state.limitBytes, memoryAdmissionNeedsAllocation); admitted || err != nil {
+		return admitted, err
+	}
+	m.trimForAdmission(ctx, entry)
+	admitted, err = m.tryAdmission(ctx, entry, m.state.limitBytes, memoryAdmissionNeedsAllocation)
+	if !admitted || err != nil {
+		return admitted, err
+	}
+	m.trimToTarget(ctx, entry.namespace, entry.key)
+	return true, nil
+}
+
+// String includes the hard limit so differently sized tiers remain distinguishable in diagnostics.
 func (m *Memory) String() string { return fmt.Sprintf("memory:%dMB", m.config.LimitMB) }
 
 func (m *Memory) backendType() BackendType { return backendMemory }
 
+// Stat counts metadata-only hits as CLOCK references so they receive the same recency protection as Open.
 func (m *Memory) Stat(_ context.Context, key Key, opts ...Option) (http.Header, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	shard := m.shard(m.namespace, key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
-	nsEntries, nsExists := m.entries[m.namespace]
-	if !nsExists {
+	entry, exists := shard.entry(m.namespace, key)
+	if !exists || time.Now().After(entry.expiresAt) {
 		return nil, os.ErrNotExist
 	}
-
-	entry, exists := nsEntries[key]
-	if !exists {
-		return nil, os.ErrNotExist
-	}
-
-	if time.Now().After(entry.expiresAt) {
-		return nil, os.ErrNotExist
-	}
+	entry.referenceEpoch.Add(1)
 
 	headers := maps.Clone(entry.headers)
 	headers.Set("Content-Length", strconv.Itoa(len(entry.data)))
@@ -87,23 +588,17 @@ func (m *Memory) Stat(_ context.Context, key Key, opts ...Option) (http.Header, 
 	return headers, nil
 }
 
+// Open pins its entry generation so replacement and eviction cannot invalidate an active response body.
 func (m *Memory) Open(_ context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	shard := m.shard(m.namespace, key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
-	nsEntries, nsExists := m.entries[m.namespace]
-	if !nsExists {
+	entry, exists := shard.entry(m.namespace, key)
+	if !exists || time.Now().After(entry.expiresAt) {
 		return nil, nil, os.ErrNotExist
 	}
-
-	entry, exists := nsEntries[key]
-	if !exists {
-		return nil, nil, os.ErrNotExist
-	}
-
-	if time.Now().After(entry.expiresAt) {
-		return nil, nil, os.ErrNotExist
-	}
+	entry.referenceEpoch.Add(1)
 
 	headers := maps.Clone(entry.headers)
 	headers.Set("Content-Length", strconv.Itoa(len(entry.data)))
@@ -119,16 +614,56 @@ func (m *Memory) Open(_ context.Context, key Key, opts ...Option) (io.ReadCloser
 	if partial {
 		data = data[start : start+length]
 	}
-	return io.NopCloser(bytes.NewReader(data)), headers, nil
+	entry.readers.Add(1)
+	return &memoryReader{data: data, cache: m, shard: shard, entry: entry}, headers, nil
 }
 
+type memoryReader struct {
+	data   []byte
+	offset int
+	cache  *Memory
+	shard  *memoryShard
+	entry  *memoryEntry
+	closed atomic.Bool
+}
+
+func (r *memoryReader) Read(p []byte) (int, error) {
+	if r.closed.Load() {
+		return 0, os.ErrClosed
+	}
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.offset:])
+	r.offset += n
+	return n, nil
+}
+
+func (r *memoryReader) Close() error {
+	if r.closed.Swap(true) {
+		return nil
+	}
+	r.data = nil
+	if r.entry.readers.Add(-1) != 0 || !r.entry.retired.Load() {
+		return nil
+	}
+	r.shard.mu.Lock()
+	r.cache.releaseRetiredLocked(r.entry)
+	r.shard.mu.Unlock()
+	return nil
+}
+
+// Create buffers privately so incomplete bodies stay invisible and declined memory admission remains non-fatal.
 func (m *Memory) Create(ctx context.Context, key Key, headers http.Header, ttl time.Duration, opts ...Option) (Writer, error) {
+	if m.state.closed.Load() {
+		return nil, errors.WithStack(os.ErrClosed)
+	}
 	if ttl == 0 {
 		ttl = m.config.MaxTTL
 	}
 
 	now := time.Now()
-	// Clone (to avoid concurrent map writes) and drop transport headers.
+	contentLength := expectedContentLength(headers)
 	clonedHeaders := httputil.FilterHeaders(headers, httputil.TransportHeaders...)
 	if clonedHeaders.Get("Last-Modified") == "" {
 		clonedHeaders.Set("Last-Modified", now.UTC().Format(http.TimeFormat))
@@ -137,40 +672,54 @@ func (m *Memory) Create(ctx context.Context, key Key, headers http.Header, ttl t
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancelCause(ctx)
-
-	writer := &memoryWriter{
-		cache:     m,
-		namespace: m.namespace,
-		key:       key,
-		buf:       &bytes.Buffer{},
-		expiresAt: now.Add(ttl),
-		headers:   clonedHeaders,
-		ctx:       ctx,
-		cancel:    cancel,
+	metadataCharge := memoryMetadataCharge(m.namespace, clonedHeaders)
+	baseCharge := max(metadataCharge, int64(memoryWriterMinimumCharge))
+	if contentLength >= 0 && m.state.limitBytes > 0 && contentLength > m.state.limitBytes-metadataCharge {
+		return &noOpWriter{}, nil
 	}
-
+	if contentLength >= 0 && m.state.inflightLimit > 0 && contentLength > m.state.inflightLimit-baseCharge {
+		return &noOpWriter{}, nil
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	writer := &memoryWriter{
+		cache:          m,
+		namespace:      m.namespace,
+		key:            key,
+		expiresAt:      now.Add(ttl),
+		headers:        clonedHeaders,
+		limitBytes:     m.state.limitBytes,
+		inflightLimit:  m.state.inflightLimit,
+		budgeted:       m.state.inflightLimit > 0,
+		baseCharge:     baseCharge,
+		expectedLength: contentLength,
+		ctx:            ctx,
+		cancel:         cancel,
+	}
+	if !writer.reserve(baseCharge) {
+		cancel(nil)
+		return &noOpWriter{}, nil
+	}
 	return writer, nil
 }
 
+// Delete defers reclaiming reader-pinned storage until the final reader closes.
 func (m *Memory) Delete(_ context.Context, key Key) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	nsEntries, nsExists := m.entries[m.namespace]
-	if !nsExists {
-		return os.ErrNotExist
+	shard := m.shard(m.namespace, key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if m.state.closed.Load() {
+		return errors.WithStack(os.ErrClosed)
 	}
 
-	entry, exists := nsEntries[key]
+	entry, exists := shard.entry(m.namespace, key)
 	if !exists {
 		return os.ErrNotExist
 	}
-	m.currentSize.Add(-int64(len(entry.data)))
-	delete(nsEntries, key)
+	m.removeActiveLocked(shard, entry)
 	return nil
 }
 
+// Invalidate treats a missing entry as success because callers use it to discard optional stale copies.
 func (m *Memory) Invalidate(ctx context.Context, key Key) error {
 	err := m.Delete(ctx, key)
 	if errors.Is(err, os.ErrNotExist) {
@@ -179,88 +728,190 @@ func (m *Memory) Invalidate(ctx context.Context, key Key) error {
 	return errors.WithStack(err)
 }
 
+// Close stops admission immediately while reader-pinned generations remain valid until their readers close.
 func (m *Memory) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.entries = nil
+	if !m.state.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	for index := range m.state.shards {
+		shard := &m.state.shards[index]
+		shard.mu.Lock()
+		for shard.evictionHead != nil {
+			m.removeActiveLocked(shard, shard.evictionHead)
+		}
+		shard.entries = make(map[Namespace]map[Key]*memoryEntry)
+		shard.mu.Unlock()
+	}
 	return nil
 }
 
+// Stats uses atomics so metrics collection never waits behind cache traffic on a shard lock.
 func (m *Memory) Stats(_ context.Context) (Stats, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	totalObjects := int64(0)
-	for _, nsEntries := range m.entries {
-		totalObjects += int64(len(nsEntries))
-	}
-
 	return Stats{
-		Objects:  totalObjects,
-		Size:     m.currentSize.Load(),
-		Capacity: int64(m.config.LimitMB) * 1024 * 1024,
+		Objects:  m.state.objectCount.Load(),
+		Size:     m.state.payloadSize.Load(),
+		Capacity: m.state.limitBytes,
 	}, nil
 }
 
-func (m *Memory) evictOldest(neededSpace int64) {
-	type entryInfo struct {
-		namespace Namespace
-		key       Key
-		size      int64
-		expiresAt time.Time
-	}
-
-	var entries []entryInfo
-	for ns, nsEntries := range m.entries {
-		for k, e := range nsEntries {
-			entries = append(entries, entryInfo{
-				namespace: ns,
-				key:       k,
-				size:      int64(len(e.data)),
-				expiresAt: e.expiresAt,
-			})
-		}
-	}
-
-	// Sort by expiry time (earliest first)
-	for i := 0; i < len(entries); i++ {
-		for j := i + 1; j < len(entries); j++ {
-			if entries[i].expiresAt.After(entries[j].expiresAt) {
-				entries[i], entries[j] = entries[j], entries[i]
-			}
-		}
-	}
-
-	freedSpace := int64(0)
-	for _, e := range entries {
-		if freedSpace >= neededSpace {
-			break
-		}
-		m.currentSize.Add(-e.size)
-		delete(m.entries[e.namespace], e.key)
-		freedSpace += e.size
-	}
-}
-
 type memoryWriter struct {
-	cache     *Memory
-	namespace Namespace
-	key       Key
-	buf       *bytes.Buffer
-	expiresAt time.Time
-	headers   http.Header
-	closed    bool
-	ctx       context.Context
-	cancel    context.CancelCauseFunc
+	cache          *Memory
+	namespace      Namespace
+	key            Key
+	data           []byte
+	expiresAt      time.Time
+	headers        http.Header
+	limitBytes     int64
+	inflightLimit  int64
+	budgeted       bool
+	baseCharge     int64
+	reservedBytes  int64
+	expectedLength int64
+	discarded      bool
+	closed         bool
+	ctx            context.Context
+	cancel         context.CancelCauseFunc
 }
 
 func (w *memoryWriter) Write(p []byte) (int, error) {
 	if w.closed {
 		return 0, errors.New("writer closed")
 	}
-	n, err := w.buf.Write(p)
-	return n, errors.WithStack(err)
+	if w.discarded {
+		return len(p), nil
+	}
+	buffered := int64(len(w.data))
+	tooLarge := w.limitBytes > 0 && int64(len(p)) > w.limitBytes-w.baseCharge-buffered
+	longerThanDeclared := w.expectedLength >= 0 && int64(len(p)) > w.expectedLength-buffered
+	needed := buffered + int64(len(p))
+	if tooLarge || longerThanDeclared || !w.ensureCapacity(needed) {
+		w.discard()
+		return len(p), nil
+	}
+	w.data = append(w.data, p...)
+	return len(p), nil
+}
+
+func memoryBufferCapacity(size int64) (int, bool) {
+	capacity := int(size)
+	return capacity, capacity >= 0 && int64(capacity) == size
+}
+
+func (w *memoryWriter) maximumBodyCapacity() int64 {
+	maximum := int64(math.MaxInt64)
+	if w.limitBytes > 0 {
+		maximum = min(maximum, w.limitBytes-w.baseCharge)
+	}
+	if w.inflightLimit > 0 {
+		maximum = min(maximum, w.inflightLimit-w.baseCharge)
+	}
+	return maximum
+}
+
+func (w *memoryWriter) nextCapacity(needed int64) (int64, bool) {
+	maximum := w.maximumBodyCapacity()
+	if needed < 0 || needed > maximum {
+		return 0, false
+	}
+	current := int64(cap(w.data))
+	initial := min(int64(memoryWriterInitialCapacity), maximum)
+	if w.expectedLength >= 0 {
+		initial = min(initial, w.expectedLength)
+	}
+	next := max(needed, initial)
+	if current > 0 {
+		doubled := maximum
+		if current <= maximum-current {
+			doubled = current * 2
+		}
+		next = max(next, min(doubled, maximum))
+	}
+	return next, true
+}
+
+func (w *memoryWriter) ensureCapacity(needed int64) bool {
+	if needed <= int64(cap(w.data)) {
+		return true
+	}
+	next, ok := w.nextCapacity(needed)
+	if !ok {
+		return false
+	}
+	oldCapacity := int64(cap(w.data))
+	additionalCapacity := next - oldCapacity
+	if !w.reserve(additionalCapacity) {
+		return false
+	}
+	capacity, ok := memoryBufferCapacity(next)
+	if !ok {
+		w.release(additionalCapacity)
+		return false
+	}
+	grown := make([]byte, len(w.data), capacity)
+	copy(grown, w.data)
+	w.data = grown
+	return true
+}
+
+func (w *memoryWriter) reserve(amount int64) bool {
+	if amount <= 0 {
+		return true
+	}
+	if w.tryReserve(amount) {
+		return true
+	}
+	if !w.budgeted {
+		return false
+	}
+	w.cache.trimToTarget(w.ctx, w.namespace, w.key)
+	return w.tryReserve(amount)
+}
+
+func (w *memoryWriter) tryReserve(amount int64) bool {
+	if !reserveCounter(&w.cache.state.inflightCharge, w.inflightLimit, amount) {
+		return false
+	}
+	if w.budgeted && !reserveCounter(&w.cache.state.hardLimitCharge, w.limitBytes, amount) {
+		w.cache.state.inflightCharge.Add(-amount)
+		return false
+	}
+	w.reservedBytes += amount
+	return true
+}
+
+func (w *memoryWriter) release(amount int64) {
+	if amount <= 0 {
+		return
+	}
+	w.cache.state.inflightCharge.Add(-amount)
+	if w.budgeted {
+		w.cache.state.hardLimitCharge.Add(-amount)
+	}
+	w.reservedBytes -= amount
+}
+
+func (w *memoryWriter) releaseReservation() {
+	if w.reservedBytes > 0 {
+		w.cache.state.inflightCharge.Add(-w.reservedBytes)
+		if w.budgeted {
+			w.cache.state.hardLimitCharge.Add(-w.reservedBytes)
+		}
+		w.reservedBytes = 0
+	}
+}
+
+func (w *memoryWriter) transferReservation(charge int64) {
+	w.cache.state.inflightCharge.Add(-w.reservedBytes)
+	if excess := w.reservedBytes - charge; excess > 0 {
+		w.cache.state.hardLimitCharge.Add(-excess)
+	}
+	w.reservedBytes = 0
+}
+
+func (w *memoryWriter) discard() {
+	w.releaseReservation()
+	w.data = nil
+	w.discarded = true
 }
 
 func (w *memoryWriter) Abort(err error) error {
@@ -273,70 +924,67 @@ func (w *memoryWriter) Close() error {
 		return nil
 	}
 	w.closed = true
-
-	// Check if context was cancelled
+	defer w.releaseReservation()
 	if err := w.ctx.Err(); err != nil {
+		w.discard()
 		return errors.Wrap(err, "create operation cancelled")
 	}
-
-	w.cache.mu.Lock()
-	defer w.cache.mu.Unlock()
-
-	newSize := int64(w.buf.Len())
-	limitBytes := int64(w.cache.config.LimitMB) * 1024 * 1024
-
-	// Ensure namespace map exists
-	if w.cache.entries[w.namespace] == nil {
-		w.cache.entries[w.namespace] = make(map[Key]*memoryEntry)
+	if w.discarded {
+		return nil
 	}
-	nsEntries := w.cache.entries[w.namespace]
-
-	// Remove old entry size if it exists
-	oldSize := int64(0)
-	if oldEntry, exists := nsEntries[w.key]; exists {
-		oldSize = int64(len(oldEntry.data))
+	if w.expectedLength >= 0 && int64(len(w.data)) != w.expectedLength {
+		w.discard()
+		return nil
 	}
 
-	// Evict entries if needed to make room
-	if limitBytes > 0 {
-		neededSpace := w.cache.currentSize.Load() - oldSize + newSize - limitBytes
-		if neededSpace > 0 {
-			w.cache.evictOldest(neededSpace)
-		}
-	}
-
-	w.cache.currentSize.Add(-oldSize)
-	// Copy the buffer data to avoid holding a reference to the buffer's internal slice
-	data := make([]byte, w.buf.Len())
-	copy(data, w.buf.Bytes())
-	w.buf.Reset()
-	nsEntries[w.key] = &memoryEntry{
+	data := w.data
+	w.data = nil
+	entry := &memoryEntry{
+		namespace: w.namespace,
+		key:       w.key,
 		data:      data,
 		expiresAt: w.expiresAt,
 		headers:   w.headers,
 	}
-	w.cache.currentSize.Add(newSize)
-
-	return nil
-}
-
-// Namespace creates a namespaced view of the memory cache.
-func (m *Memory) Namespace(namespace Namespace) Cache {
-	c := *m
-	c.namespace = namespace
-	return &c
-}
-
-// ListNamespaces returns all unique namespaces in the memory cache.
-func (m *Memory) ListNamespaces(_ context.Context) ([]string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	namespaces := make([]string, 0, len(m.entries))
-	for ns := range m.entries {
-		if ns != "" {
-			namespaces = append(namespaces, string(ns))
-		}
+	entry.charge = memoryEntryCharge(entry.namespace, entry.data, entry.headers)
+	if !w.budgeted {
+		_, err := w.cache.admit(w.ctx, entry)
+		return errors.WithStack(err)
 	}
-	return namespaces, nil
+	if entry.charge > w.reservedBytes && !w.reserve(entry.charge-w.reservedBytes) {
+		return nil
+	}
+	admitted, err := w.cache.admitReserved(w.ctx, entry)
+	if admitted {
+		w.transferReservation(entry.charge)
+	}
+	return errors.WithStack(err)
+}
+
+// Namespace reuses one state object so every protocol namespace shares the configured capacity.
+func (m *Memory) Namespace(namespace Namespace) Cache {
+	view := *m
+	view.namespace = namespace
+	return &view
+}
+
+// ListNamespaces excludes the default namespace because only explicit cache partitions are discoverable.
+func (m *Memory) ListNamespaces(_ context.Context) ([]string, error) {
+	namespaces := make(map[Namespace]struct{})
+	for index := range m.state.shards {
+		shard := &m.state.shards[index]
+		shard.mu.RLock()
+		for namespace, namespaceEntries := range shard.entries {
+			if namespace != "" && len(namespaceEntries) > 0 {
+				namespaces[namespace] = struct{}{}
+			}
+		}
+		shard.mu.RUnlock()
+	}
+
+	result := make([]string, 0, len(namespaces))
+	for namespace := range namespaces {
+		result = append(result, string(namespace))
+	}
+	return result, nil
 }

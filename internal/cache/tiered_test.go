@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -352,6 +353,33 @@ func TestTieredCreateUsesSameETagInEveryTier(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, upperReader.Close())
 	assert.Equal(t, lowerHeaders.Get(cache.ETagKey), upperHeaders.Get(cache.ETagKey))
+}
+
+func TestTieredCreateContinuesWhenMemoryTierDeclinesAdmission(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	constrained, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, InflightLimitMB: 1, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	authoritative, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 2, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	tiered := newTiered(ctx, constrained, authoritative)
+	t.Cleanup(func() { assert.NoError(t, tiered.Close()) })
+	key := cache.NewKey("declined-memory-admission")
+	content := make([]byte, 1024*1024)
+	content[0] = 1
+	headers := http.Header{"Content-Length": {strconv.Itoa(len(content))}}
+
+	writer, err := tiered.Create(ctx, key, headers, time.Hour)
+	assert.NoError(t, err)
+	written, err := writer.Write(content)
+	assert.NoError(t, err)
+	assert.Equal(t, len(content), written)
+	assert.NoError(t, writer.Close())
+
+	_, _, err = constrained.Open(ctx, key)
+	assert.IsError(t, err, os.ErrNotExist)
+	reader, _, err := authoritative.Open(ctx, key)
+	assert.NoError(t, err)
+	assert.Equal(t, content, readAllAndClose(t, reader))
 }
 
 func TestTieredRequiresMetadataStore(t *testing.T) {

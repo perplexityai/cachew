@@ -150,12 +150,35 @@ copies before falling through to the authoritative tier.
 
 ### Memory
 
-In-memory LRU cache.
+In-memory sharded CLOCK cache with bounded admission and eviction work. Cache
+hits lock only the shard containing the requested key. Each admission and trim
+examines at most 64 victims, regardless of cache cardinality.
+
+`limit-mb` is a hard retained-memory accounting ceiling, not a process RSS
+limit. Accounting includes object buffers, estimated metadata, and buffers held
+by active readers. `Stats.Capacity` reports this ceiling; `Stats.Size` reports
+payload bytes and can differ because it excludes charged metadata and spare
+buffer capacity. Go runtime and allocator overhead can make RSS differ from
+both values.
+
+Incomplete writes remain unbounded when `inflight-limit-mb` is zero, preserving
+the behavior of configurations written before this option existed. A positive
+value limits aggregate incomplete writes and reserves that amount inside
+`limit-mb`: retained entries are trimmed toward `limit-mb -
+inflight-limit-mb`, and retained plus incomplete accounting cannot exceed
+`limit-mb`. Writes that cannot obtain capacity within the bounded admission
+work bypass the memory tier without interrupting other cache tiers. Declared
+content lengths are validated against these limits, but buffers grow only as
+body bytes arrive. Buffer growth transfers the existing accounting reservation
+to the larger capacity; the allocator may briefly retain both allocations, so
+process RSS can transiently exceed the accounting ceiling by the old buffer's
+capacity.
 
 ```hcl
 memory {
-  limit-mb = 1024   # default
-  max-ttl  = "1h"   # default
+  limit-mb          = 1024 # default
+  inflight-limit-mb = 0    # disabled for compatibility
+  max-ttl           = "1h" # default
 }
 ```
 
