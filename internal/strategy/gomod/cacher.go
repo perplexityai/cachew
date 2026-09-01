@@ -15,6 +15,11 @@ type goproxyCacher struct {
 	cache cache.Cache
 }
 
+func (g *goproxyCacher) Exists(ctx context.Context, name string) bool {
+	_, err := g.cache.Stat(ctx, cache.NewKey(name))
+	return err == nil
+}
+
 func (g *goproxyCacher) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	key := cache.NewKey(name)
 

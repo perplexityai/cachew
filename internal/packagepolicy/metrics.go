@@ -13,6 +13,14 @@ import (
 
 type metricRecorder interface {
 	record(context.Context, Decision, error, time.Duration)
+	recordNotApplicable(context.Context)
+}
+
+func (m *clientMetrics) recordNotApplicable(ctx context.Context) {
+	m.evaluations.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("provider", m.provider),
+		attribute.String("outcome", "not_applicable"),
+	))
 }
 
 type clientMetrics struct {

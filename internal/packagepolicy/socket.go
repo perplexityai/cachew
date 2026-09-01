@@ -44,6 +44,11 @@ type socketEvaluator struct {
 
 var _ Evaluator = (*socketEvaluator)(nil)
 
+// ObserveNotApplicable records a request that Cachew could not map to a PURL.
+func (c *socketEvaluator) ObserveNotApplicable(ctx context.Context) {
+	c.metrics.recordNotApplicable(ctx)
+}
+
 func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, error) {
 	if config.APIURL == "" {
 		config.APIURL = defaultAPIURL
@@ -115,7 +120,7 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision D
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Decision{}, errors.New("socket policy: request failed")
+		return Decision{}, errors.Wrap(err, "socket policy: request failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {

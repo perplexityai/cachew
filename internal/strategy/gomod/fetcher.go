@@ -31,7 +31,11 @@ func NewCompositeFetcher(
 }
 
 func (c *CompositeFetcher) IsPrivate(modulePath string) bool {
-	for _, pattern := range c.patterns {
+	return isPrivateModule(c.patterns, modulePath)
+}
+
+func isPrivateModule(patterns []string, modulePath string) bool {
+	for _, pattern := range patterns {
 		matched, err := path.Match(pattern, modulePath)
 		if err == nil && matched {
 			return true

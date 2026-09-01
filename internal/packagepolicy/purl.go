@@ -3,6 +3,7 @@ package packagepolicy
 import (
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 
 	"golang.org/x/mod/module"
@@ -12,7 +13,7 @@ var pypiNormalizationPattern = regexp.MustCompile(`[-_.]+`)
 
 // PackageURLForCodeArtifact derives a PURL from an immutable npm or PyPI CodeArtifact asset path.
 func PackageURLForCodeArtifact(path string) (string, bool) {
-	parts, ok := unescapedPathParts(path)
+	parts, ok := decodedPathParts(path)
 	if !ok || len(parts) < 5 {
 		return "", false
 	}
@@ -82,18 +83,16 @@ func PackageURLForGoModule(path string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	if module.Check(name, version) != nil || version != module.CanonicalVersion(version) {
+		return "", false
+	}
 	return "pkg:golang/" + escapePURLPath(name) + "@" + escapePURLSegment(version), true
 }
 
-func unescapedPathParts(path string) ([]string, bool) {
-	escaped := strings.Split(strings.Trim(path, "/"), "/")
-	parts := make([]string, len(escaped))
-	for i, part := range escaped {
-		decoded, err := url.PathUnescape(part)
-		if err != nil || decoded == "" || strings.Contains(decoded, "/") {
-			return nil, false
-		}
-		parts[i] = decoded
+func decodedPathParts(path string) ([]string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if slices.Contains(parts, "") {
+		return nil, false
 	}
 	return parts, true
 }

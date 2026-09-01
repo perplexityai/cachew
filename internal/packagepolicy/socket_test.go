@@ -9,7 +9,14 @@ import (
 	"time"
 
 	"github.com/alecthomas/assert/v2"
+	"github.com/alecthomas/errors"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 const (
 	testOrganization = "example-org"
@@ -132,6 +139,22 @@ func TestClientFailsClosedOnInvalidResponses(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
+}
+
+func TestClientPreservesTransportFailureForCallerLogging(t *testing.T) {
+	transportErr := errors.New("dial Socket API")
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       "https://socket.example.com",
+		Organization: testOrganization,
+		Token:        testToken,
+	}, false)
+	assert.NoError(t, err)
+	client.httpClient.Transport = roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		return nil, transportErr
+	})
+
+	_, err = client.Evaluate(context.Background(), testPURL)
+	assert.True(t, errors.Is(err, transportErr))
 }
 
 func TestClientDoesNotForwardTokenAcrossRedirects(t *testing.T) {

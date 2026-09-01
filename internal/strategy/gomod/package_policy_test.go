@@ -1,6 +1,7 @@
 package gomod //nolint:testpackage // White-box coverage is required for policy and cache injection.
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -18,14 +19,35 @@ import (
 )
 
 type recordingPackagePolicy struct {
-	decision packagepolicy.Decision
-	err      error
-	purls    []string
+	decision      packagepolicy.Decision
+	err           error
+	purls         []string
+	notApplicable int
+}
+
+type cacheProbe struct {
+	cache.Cache
+	statCalls int
+	openCalls int
+}
+
+func (c *cacheProbe) Stat(ctx context.Context, key cache.Key, opts ...cache.Option) (http.Header, error) {
+	c.statCalls++
+	return c.Cache.Stat(ctx, key, opts...)
+}
+
+func (c *cacheProbe) Open(ctx context.Context, key cache.Key, opts ...cache.Option) (io.ReadCloser, http.Header, error) {
+	c.openCalls++
+	return c.Cache.Open(ctx, key, opts...)
 }
 
 func (r *recordingPackagePolicy) Evaluate(_ context.Context, purl string) (packagepolicy.Decision, error) {
 	r.purls = append(r.purls, purl)
 	return r.decision, r.err
+}
+
+func (r *recordingPackagePolicy) ObserveNotApplicable(context.Context) {
+	r.notApplicable++
 }
 
 func TestGoModuleEnforcesPackagePolicyBeforeOrigin(t *testing.T) {
@@ -48,14 +70,22 @@ func TestGoModuleEnforcesPackagePolicyBeforeOrigin(t *testing.T) {
 			statusCode: http.StatusServiceUnavailable,
 			policy:     "pending",
 		},
+		{
+			name:       "policy unavailable",
+			err:        io.ErrUnexpectedEOF,
+			statusCode: http.StatusServiceUnavailable,
+			policy:     "unavailable",
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
 			var originRequests int
 			policy := &recordingPackagePolicy{decision: test.decision, err: test.err}
 			strategy := &Strategy{
 				packagePolicy: policy,
+				logger:        slog.New(slog.NewJSONHandler(&logs, nil)),
 				proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					originRequests++
 					w.WriteHeader(http.StatusOK)
@@ -70,6 +100,9 @@ func TestGoModuleEnforcesPackagePolicyBeforeOrigin(t *testing.T) {
 			assert.Equal(t, test.policy, w.Header().Get("X-Cachew-Package-Policy"))
 			assert.Equal(t, []string{"pkg:golang/github.com/pkg/errors@v0.9.1"}, policy.purls)
 			assert.Equal(t, 0, originRequests)
+			if test.err != nil {
+				assert.Contains(t, logs.String(), test.err.Error())
+			}
 		})
 	}
 }
@@ -79,7 +112,8 @@ func TestGoModuleCachedPackageBypassesPackagePolicy(t *testing.T) {
 	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
-	cacher := &goproxyCacher{cache: memory}
+	probe := &cacheProbe{Cache: memory}
+	cacher := &goproxyCacher{cache: probe}
 	cacheName := "github.com/pkg/errors/@v/v0.9.1.zip"
 	assert.NoError(t, cacher.Put(ctx, cacheName, strings.NewReader("cached module")))
 
@@ -99,6 +133,8 @@ func TestGoModuleCachedPackageBypassesPackagePolicy(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "cached module", w.Body.String())
 	assert.Equal(t, []string(nil), policy.purls)
+	assert.Equal(t, 1, probe.statCalls)
+	assert.Equal(t, 0, probe.openCalls)
 }
 
 func TestGoModulePrivatePackageBypassesPackagePolicy(t *testing.T) {
@@ -117,4 +153,24 @@ func TestGoModulePrivatePackageBypassesPackagePolicy(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "private module", w.Body.String())
 	assert.Equal(t, []string(nil), policy.purls)
+	assert.Equal(t, 1, policy.notApplicable)
+}
+
+func TestGoModuleBranchQueryBypassesPackagePolicy(t *testing.T) {
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+	strategy := &Strategy{
+		packagePolicy: policy,
+		proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, "resolved branch")
+		}),
+	}
+	w := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/gomod/github.com/pkg/errors/@v/master.info", nil)
+
+	strategy.serveHTTP(w, request)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "resolved branch", w.Body.String())
+	assert.Equal(t, []string(nil), policy.purls)
+	assert.Equal(t, 1, policy.notApplicable)
 }

@@ -1,6 +1,7 @@
 package strategy //nolint:testpackage // White-box coverage is required for token and transport injection.
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -198,14 +199,39 @@ func (f codeArtifactRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response
 }
 
 type recordingPackagePolicy struct {
-	decision packagepolicy.Decision
-	err      error
-	purls    []string
+	decision      packagepolicy.Decision
+	err           error
+	purls         []string
+	notApplicable int
 }
 
 func (r *recordingPackagePolicy) Evaluate(_ context.Context, purl string) (packagepolicy.Decision, error) {
 	r.purls = append(r.purls, purl)
 	return r.decision, r.err
+}
+
+func (r *recordingPackagePolicy) ObserveNotApplicable(context.Context) {
+	r.notApplicable++
+}
+
+func TestCodeArtifactRecordsUnsupportedPolicyRequest(t *testing.T) {
+	target, err := url.Parse("https://codeartifact.example.com")
+	assert.NoError(t, err)
+	policy := &recordingPackagePolicy{}
+	strategy := &CodeArtifact{
+		target:        target,
+		prefix:        "/codeartifact.example.com",
+		packagePolicy: policy,
+	}
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/codeartifact.example.com/maven/repository/example.jar",
+		nil,
+	)
+
+	assert.True(t, strategy.allowPackage(httptest.NewRecorder(), request))
+	assert.Equal(t, 1, policy.notApplicable)
+	assert.Equal(t, []string(nil), policy.purls)
 }
 
 func TestCodeArtifactEnforcesPackagePolicyBeforeOriginAuthentication(t *testing.T) {
@@ -238,11 +264,13 @@ func TestCodeArtifactEnforcesPackagePolicyBeforeOriginAuthentication(t *testing.
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
 			var originRequests atomic.Int32
 			mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				originRequests.Add(1)
 				w.WriteHeader(http.StatusOK)
 			}))
+			strategy.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 			policy := &recordingPackagePolicy{decision: test.decision, err: test.err}
 			strategy.packagePolicy = policy
 
@@ -255,6 +283,9 @@ func TestCodeArtifactEnforcesPackagePolicyBeforeOriginAuthentication(t *testing.
 			assert.Equal(t, []string{"pkg:npm/chromatitle-js@1.0.0"}, policy.purls)
 			assert.Equal(t, 0, tokenServer.requestCount())
 			assert.Equal(t, int32(0), originRequests.Load())
+			if test.err != nil {
+				assert.Contains(t, logs.String(), test.err.Error())
+			}
 		})
 	}
 }

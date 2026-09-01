@@ -30,6 +30,7 @@ type Decision struct {
 // Evaluator checks package URLs against a package policy.
 type Evaluator interface {
 	Evaluate(context.Context, string) (Decision, error)
+	ObserveNotApplicable(context.Context)
 }
 
 // New creates the configured package policy evaluator.
