@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/block/cachew/internal/admission"
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/config"
 	"github.com/block/cachew/internal/gitclone"
@@ -49,6 +50,7 @@ type GlobalConfig struct {
 	// ShutdownTimeout must be less than the pod's terminationGracePeriodSeconds
 	// (minus ShutdownReadinessDelay) or the kubelet will SIGKILL before Shutdown returns.
 	ShutdownTimeout  time.Duration       `hcl:"shutdown-timeout,optional" default:"150s" help:"Maximum time to wait for in-flight requests to drain on graceful shutdown."`
+	RequestAdmission admission.Config    `hcl:"request-admission,block,optional"`
 	SchedulerConfig  jobscheduler.Config `hcl:"scheduler,block"`
 	LoggingConfig    logging.Config      `hcl:"log,block"`
 	MetricsConfig    metrics.Config      `hcl:"metrics,block"`
@@ -164,6 +166,7 @@ func main() {
 		globalConfig.MetricsConfig,
 		globalConfig.OPAConfig,
 		globalConfig.LoggingConfig,
+		globalConfig.RequestAdmission,
 	)
 	fatalIfError(ctx, logger, err, "Failed to create server")
 
@@ -381,17 +384,27 @@ func newServer(
 	metricsConfig metrics.Config,
 	opaConfig opa.Config,
 	logConfig logging.Config,
+	admissionConfig admission.Config,
 ) (*http.Server, error) {
-	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		labeler, _ := otelhttp.LabelerFromContext(r.Context())
-		labeler.Add(attribute.String("cachew.http.path.prefix", extractPathPrefix(r.URL.Path)))
-		muxHandler.ServeHTTP(w, r)
-	})
+	limiter, err := admission.New(admissionConfig)
+	if err != nil {
+		return nil, errors.Errorf("initialise request admission: %w", err)
+	}
+	handler := limiter.Middleware(muxHandler)
 
-	handler, err := opa.Middleware(ctx, opaConfig, handler)
+	// Authorization runs before admission so denied admin requests cannot
+	// consume capacity reserved for authorized operator endpoints.
+	handler, err = opa.Middleware(ctx, opaConfig, handler)
 	if err != nil {
 		return nil, errors.Errorf("initialise OPA middleware: %w", err)
 	}
+
+	authorizedHandler := handler
+	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		labeler, _ := otelhttp.LabelerFromContext(r.Context())
+		labeler.Add(attribute.String("cachew.http.path.prefix", extractPathPrefix(r.URL.Path)))
+		authorizedHandler.ServeHTTP(w, r)
+	})
 
 	// Add standard otelhttp middleware
 	handler = otelhttp.NewMiddleware(metricsConfig.ServiceName,
