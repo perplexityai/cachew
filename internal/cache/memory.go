@@ -882,36 +882,45 @@ func (w *memoryWriter) ensureCapacity(needed int64) bool {
 	return true
 }
 
+type memoryReservationResult uint8
+
+const (
+	memoryReservationSucceeded memoryReservationResult = iota
+	memoryReservationInflightLimited
+	memoryReservationHardLimited
+)
+
 func (w *memoryWriter) reserve(amount int64) bool {
 	if amount <= 0 {
 		return true
 	}
-	if w.tryReserve(amount) {
+	result := w.tryReserve(amount)
+	if result == memoryReservationSucceeded {
 		return true
 	}
-	if !w.budgeted {
+	if result != memoryReservationHardLimited {
 		return false
 	}
 	w.cache.trimToTarget(w.ctx, w.namespace, w.key)
-	return w.tryReserve(amount)
+	return w.tryReserve(amount) == memoryReservationSucceeded
 }
 
-func (w *memoryWriter) tryReserve(amount int64) bool {
+func (w *memoryWriter) tryReserve(amount int64) memoryReservationResult {
 	if w.inflightLimit == 0 {
 		w.cache.state.inflightCharge.Add(amount)
 	} else if !reserveBounded(&w.cache.state.inflightCharge, w.inflightLimit, amount) {
-		return false
+		return memoryReservationInflightLimited
 	}
 	if w.budgeted {
 		if w.limitBytes == 0 {
 			w.cache.state.hardLimitCharge.Add(amount)
 		} else if !reserveBounded(&w.cache.state.hardLimitCharge, w.limitBytes, amount) {
 			w.cache.state.inflightCharge.Add(-amount)
-			return false
+			return memoryReservationHardLimited
 		}
 	}
 	w.reservedBytes += amount
-	return true
+	return memoryReservationSucceeded
 }
 
 func (w *memoryWriter) release(amount int64) {

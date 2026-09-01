@@ -483,6 +483,32 @@ func TestTieredCreateErrorAbortsOtherWriters(t *testing.T) {
 	}
 }
 
+func TestTieredWriterCloseReleasesCreateContext(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	createdContext := make(chan context.Context, 1)
+	recording := createFuncCache{
+		Cache: cache.NoOpCache(),
+		create: func(
+			ctx context.Context,
+			key cache.Key,
+			headers http.Header,
+			ttl time.Duration,
+			opts ...cache.Option,
+		) (cache.Writer, error) {
+			createdContext <- ctx
+			return cache.NoOpCache().Create(ctx, key, headers, ttl, opts...)
+		},
+	}
+	tiered := newTiered(ctx, recording, cache.NoOpCache())
+	t.Cleanup(func() { assert.NoError(t, tiered.Close()) })
+	writer, err := tiered.Create(ctx, cache.NewKey("released-create-context"), nil, time.Hour)
+	assert.NoError(t, err)
+	writerContext := <-createdContext
+	assert.Zero(t, context.Cause(writerContext))
+	assert.NoError(t, writer.Close())
+	assert.IsError(t, context.Cause(writerContext), context.Canceled)
+}
+
 func TestTieredRequiresMetadataStore(t *testing.T) {
 	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})

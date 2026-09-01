@@ -749,6 +749,7 @@ func (t *tieredWriter) Close() error {
 		return nil
 	}
 	t.closed = true
+	defer t.cancel(nil)
 
 	wg := sync.WaitGroup{}
 	errs := make([]error, len(t.writers))

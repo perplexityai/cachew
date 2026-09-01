@@ -866,30 +866,35 @@ func TestMemoryRejectsInvalidLimits(t *testing.T) {
 	}
 }
 
-func TestMemoryUnlimitedRetentionSupportsInflightLimit(t *testing.T) {
+func TestMemoryUnlimitedRetentionSurvivesInflightPressure(t *testing.T) {
 	memory := newMemoryTestCacheWithConfig(t, MemoryConfig{InflightLimitMB: 1, MaxTTL: time.Hour})
-	first, err := memory.Create(t.Context(), NewKey("unlimited-retention-first"), nil, time.Hour)
-	assert.NoError(t, err)
-	second, err := memory.Create(t.Context(), NewKey("unlimited-retention-second"), nil, time.Hour)
-	assert.NoError(t, err)
-	for _, writer := range []Writer{first, second} {
+	for _, key := range []Key{NewKey("unlimited-retention-first"), NewKey("unlimited-retention-second")} {
+		writer, err := memory.Create(t.Context(), key, nil, time.Hour)
+		assert.NoError(t, err)
 		written, err := writer.Write(make([]byte, 768*1024))
 		assert.NoError(t, err)
 		assert.Equal(t, 768*1024, written)
+		assert.NoError(t, writer.Close())
 	}
-	assert.True(t, memory.state.inflightCharge.Load() <= memory.state.inflightLimit)
-	assert.NoError(t, first.Close())
-	assert.NoError(t, second.Close())
-	third, err := memory.Create(t.Context(), NewKey("unlimited-retention-third"), nil, time.Hour)
+	before, err := memory.Stats(t.Context())
 	assert.NoError(t, err)
-	written, err := third.Write(make([]byte, 768*1024))
-	assert.NoError(t, err)
-	assert.Equal(t, 768*1024, written)
-	assert.NoError(t, third.Close())
-	stats, err := memory.Stats(t.Context())
-	assert.NoError(t, err)
-	assert.Equal(t, int64(2), stats.Objects)
+	assert.Equal(t, int64(2), before.Objects)
 	assert.True(t, memory.state.retainedCharge.Load() > memory.state.inflightLimit)
+
+	pressure, err := memory.Create(t.Context(), NewKey("unlimited-inflight-pressure"), nil, time.Hour)
+	assert.NoError(t, err)
+	written, err := pressure.Write(make([]byte, 1024*1024-memoryWriterMinimumCharge))
+	assert.NoError(t, err)
+	assert.Equal(t, 1024*1024-memoryWriterMinimumCharge, written)
+	assert.Equal(t, memory.state.inflightLimit, memory.state.inflightCharge.Load())
+
+	declined, err := memory.Create(t.Context(), NewKey("unlimited-inflight-declined"), nil, time.Hour)
+	assert.NoError(t, err)
+	assert.NoError(t, declined.Close())
+	after, err := memory.Stats(t.Context())
+	assert.NoError(t, err)
+	assert.Equal(t, before, after)
+	assert.IsError(t, pressure.Abort(errors.New("release inflight pressure")), context.Canceled)
 }
 
 func TestMemoryCancelledAdmissionDoesNotEvictEntries(t *testing.T) {
@@ -1306,7 +1311,7 @@ func BenchmarkMemoryParallelHotHits(b *testing.B) {
 	})
 }
 
-func BenchmarkMemoryParallelHotHitCopy(b *testing.B) {
+func BenchmarkMemoryParallelHotHitWriteToDiscard(b *testing.B) {
 	_, ctx := logging.Configure(b.Context(), logging.Config{Level: slog.LevelError})
 	memory, err := NewMemory(ctx, MemoryConfig{LimitMB: 8, MaxTTL: time.Hour})
 	assert.NoError(b, err)
@@ -1318,7 +1323,6 @@ func BenchmarkMemoryParallelHotHitCopy(b *testing.B) {
 	assert.NoError(b, err)
 	assert.NoError(b, writer.Close())
 	b.Cleanup(func() { assert.NoError(b, memory.Close()) })
-	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	destination := writeOnlyDiscard{}
