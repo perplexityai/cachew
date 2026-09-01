@@ -41,7 +41,7 @@ func codeArtifactPackageFormat(path string) string {
 	return parts[0]
 }
 
-func stripCodeArtifactMetadataRequestHeaders(headers http.Header) {
+func normalizeCodeArtifactMetadataRequestHeaders(headers http.Header, path string) {
 	for _, name := range []string{
 		"Accept-Encoding",
 		"If-Match",
@@ -52,6 +52,9 @@ func stripCodeArtifactMetadataRequestHeaders(headers http.Header) {
 		"Range",
 	} {
 		headers.Del(name)
+	}
+	if codeArtifactPackageFormat(path) == codeArtifactCargoFormat {
+		headers.Set("Accept", "application/json")
 	}
 }
 
