@@ -344,9 +344,13 @@ func (c *CodeArtifact) allowPackage(w http.ResponseWriter, r *http.Request) bool
 	}
 	purl, ok := packagepolicy.PackageURLForCodeArtifact(c.originURL(r).Path)
 	if !ok {
+		c.packagePolicy.ObserveNotApplicable(r.Context())
 		return true
 	}
 	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
+	if err != nil {
+		c.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
+	}
 	return packagepolicy.AllowRequest(w, decision, err)
 }
 

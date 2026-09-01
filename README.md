@@ -70,9 +70,17 @@ gomod {
 ```
 
 When `package-policy` is configured, Cachew evaluates the PURL for each cold,
-versioned public module before it contacts the Go module origin. Cached module
-files bypass the check. The `socket` provider sends the PURL to Socket; modules
-matching `private-paths` are not sent.
+canonical-version public module before it contacts the Go module origin. Branch
+and revision `.info` queries pass through so the Go proxy can resolve them; the
+resulting canonical version's module files are evaluated before download. Cached
+module files bypass the check. The `socket` provider sends the PURL to Socket;
+modules matching `private-paths` are not sent.
+
+The warm-path cache probe does not read or backfill the module body. It also
+disables origin fallback for that request. If the object is evicted between the
+probe and goproxy's body read, goproxy returns its temporary `404` rather than
+fetching an unevaluated body; a later client retry performs a normal miss and
+policy evaluation.
 
 ### Hermit
 
@@ -162,6 +170,12 @@ resolve, returns `403`. Pending analysis or an unavailable Socket API returns
 CodeArtifact. Cache hits do not recheck the policy because Cachew only admits
 complete, origin-declared immutable bodies.
 
+A later policy change does not automatically invalidate an admitted object.
+Operators can purge it through Cachew's existing `delete` operation in the
+`codeartifact` namespace. Run the deletion against every Cachew deployment that
+may hold a local tier; a tiered deployment deletes the key from all of its
+configured backends.
+
 Socket receives the public ecosystem, package name, and version from the
 CodeArtifact request path. Cachew does not send package contents, CodeArtifact
 credentials, repository names, or AWS identity to Socket. Operators should
@@ -177,9 +191,12 @@ be exposed to package-manager clients.
 
 Policy outcomes and API latency are exported as
 `cachew.package_policy.evaluations_total` and
-`cachew.package_policy.evaluation_duration_seconds`. Their attributes are the
-bounded provider and outcome (`allow`, `deny`, `pending`, or `unavailable`);
-package names and versions are not metric labels.
+`cachew.package_policy.evaluation_duration_seconds`. The evaluation counter has
+bounded provider and outcome attributes (`allow`, `deny`, `pending`,
+`unavailable`, or `not_applicable`); package names and versions are not metric
+labels. The latency histogram covers actual provider evaluations. Unsupported
+ecosystems, non-package metadata or query paths, and excluded private Go modules
+record `not_applicable` so gaps in enforcement coverage remain visible.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,

@@ -116,7 +116,12 @@ func New(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux
 func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/gomod/")
 	purl, ok := packagepolicy.PackageURLForGoModule("/" + path)
-	if !ok || s.packagePolicy == nil || s.privateModulePath(path) {
+	if s.packagePolicy == nil {
+		s.proxyHandler.ServeHTTP(w, r)
+		return
+	}
+	if !ok || s.privateModulePath(path) {
+		s.packagePolicy.ObserveNotApplicable(r.Context())
 		s.proxyHandler.ServeHTTP(w, r)
 		return
 	}
@@ -126,6 +131,9 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	decision, err := s.packagePolicy.Evaluate(r.Context(), purl)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
+	}
 	if !packagepolicy.AllowRequest(w, decision, err) {
 		return
 	}
@@ -136,12 +144,7 @@ func (s *Strategy) cached(path string, r *http.Request) bool {
 	if s.cacher == nil || r.URL.RawQuery != "" || r.Header.Get("Range") != "" {
 		return false
 	}
-	body, err := s.cacher.Get(r.Context(), path)
-	if err != nil {
-		return false
-	}
-	_ = body.Close()
-	return true
+	return s.cacher.Exists(r.Context(), path)
 }
 
 func (s *Strategy) privateModulePath(requestPath string) bool {
@@ -156,7 +159,7 @@ func (s *Strategy) privateModulePath(requestPath string) bool {
 	if err != nil {
 		return false
 	}
-	return (&CompositeFetcher{patterns: s.config.PrivatePaths}).IsPrivate(modulePath)
+	return isPrivateModule(s.config.PrivatePaths, modulePath)
 }
 
 func (s *Strategy) String() string {
