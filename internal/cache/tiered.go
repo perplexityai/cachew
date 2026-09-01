@@ -97,7 +97,6 @@ func (t Tiered) Create(ctx context.Context, key Key, headers http.Header, ttl ti
 		return nil, err
 	}
 
-	// The first error will cancel all outstanding writes.
 	ctx, cancel := context.WithCancelCause(ctx)
 
 	tw := &tieredWriter{
@@ -108,26 +107,62 @@ func (t Tiered) Create(ctx context.Context, key Key, headers http.Header, ttl ti
 		etag:        quotedETag,
 		replaceETag: replaceETag,
 	}
-	// Note: we can't use errgroup here because we do not want to cancel the context on Wait().
-	wg := sync.WaitGroup{}
+	type createResult struct {
+		index  int
+		writer Writer
+		err    error
+	}
+	// An unbuffered result forces a writer that finishes after cancellation to
+	// take the context branch and abort itself instead of becoming orphaned.
+	results := make(chan createResult)
 	for i, cache := range t.caches {
-		wg.Go(func() {
+		go func() {
 			w, err := cache.Create(ctx, key, headers, ttl, createOpts...)
-			if err != nil {
-				cancel(err)
+			result := createResult{index: i, writer: w, err: err}
+			select {
+			case results <- result:
+			case <-ctx.Done():
+				if w != nil {
+					_ = w.Abort(context.Cause(ctx)) //nolint:errcheck // The caller has already returned; abort still releases local resources.
+				}
 			}
-			tw.writers[i] = w
-		})
+		}()
 	}
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-		return tw, nil
+	for range t.caches {
+		select {
+		case result := <-results:
+			tw.writers[result.index] = result.writer
+			if result.err != nil {
+				cancel(result.err)
+				return nil, errors.Join(errors.WithStack(result.err), abortTieredWriters(tw.writers, result.err))
+			}
+			if result.writer == nil {
+				err := errors.New("cache returned a nil writer")
+				cancel(err)
+				return nil, errors.Join(err, abortTieredWriters(tw.writers, err))
+			}
+		case <-ctx.Done():
+			cause := context.Cause(ctx)
+			return nil, errors.Join(errors.WithStack(cause), abortTieredWriters(tw.writers, cause))
+		}
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return nil, errors.Join(errors.WithStack(cause), abortTieredWriters(tw.writers, cause))
+	}
+	return tw, nil
+}
 
-	case <-ctx.Done():
-		return nil, errors.WithStack(context.Cause(ctx))
+func abortTieredWriters(writers []Writer, cause error) error {
+	wg := sync.WaitGroup{}
+	errs := make([]error, len(writers))
+	for i, writer := range writers {
+		if writer == nil {
+			continue
+		}
+		wg.Go(func() { errs[i] = errors.WithStack(writer.Abort(cause)) })
 	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 func (t Tiered) replacementETag(ctx context.Context, key Key, newETag string) (bool, error) {
@@ -714,6 +749,7 @@ func (t *tieredWriter) Close() error {
 		return nil
 	}
 	t.closed = true
+	defer t.cancel(nil)
 
 	wg := sync.WaitGroup{}
 	errs := make([]error, len(t.writers))
