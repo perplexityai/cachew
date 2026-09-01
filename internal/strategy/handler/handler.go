@@ -2,6 +2,7 @@ package handler
 
 import (
 	"cmp"
+	"context"
 	"io"
 	"maps"
 	"net/http"
@@ -11,11 +12,18 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
+	cachewmetrics "github.com/block/cachew/internal/metrics"
 )
+
+// CacheResultHeader reports whether CacheW served a request from cache.
+const CacheResultHeader = "X-Cachew-Result"
 
 // CacheKeyParts holds the components used to build a cache key. Path is the
 // primary identifier (typically the upstream URL) and Vary captures
@@ -68,6 +76,7 @@ type Handler struct {
 	transformFunc func(*http.Request) (*http.Request, error)
 	errorHandler  func(error, http.ResponseWriter, *http.Request)
 	ttlFunc       func(*http.Request) time.Duration
+	cacheLookups  metric.Int64Counter
 }
 
 // New creates a new Handler with the given HTTP client and cache.
@@ -89,6 +98,12 @@ func New(client *http.Client, c cache.Cache) *Handler {
 		ttlFunc: func(_ *http.Request) time.Duration {
 			return 0
 		},
+		cacheLookups: cachewmetrics.NewMetric[metric.Int64Counter](
+			otel.Meter("cachew.handler"),
+			"cachew.handler.cache_lookups_total",
+			"{lookups}",
+			"Cache lookup outcomes",
+		),
 	}
 }
 
@@ -163,11 +178,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, key cache.Key) (bool, error) {
 	cr, headers, err := h.cache.Open(r.Context(), key, httputil.ConditionalOptions(r)...)
-	if handled, _, serveErr := httputil.ServeCacheHit(w, headers, cr, err); handled {
+	trustedHeaders := maps.Clone(headers)
+	trustedHeaders.Del(CacheResultHeader)
+	w.Header().Set(CacheResultHeader, "hit")
+	if handled, _, serveErr := httputil.ServeCacheHit(w, trustedHeaders, cr, err); handled {
 		logging.FromContext(r.Context()).DebugContext(r.Context(), "Cache hit")
+		h.recordCacheLookup(r.Context(), "hit")
 		return true, errors.WithStack(serveErr)
 	}
+	w.Header().Del(CacheResultHeader)
 	if errors.Is(err, os.ErrNotExist) {
+		w.Header().Set(CacheResultHeader, "miss")
+		h.recordCacheLookup(r.Context(), "miss")
 		return false, nil
 	}
 	h.errorHandler(httputil.Errorf(http.StatusInternalServerError, "failed to open cache: %w", err), w, r)
@@ -217,9 +239,12 @@ func (h *Handler) streamNonOKResponse(w http.ResponseWriter, resp *http.Response
 // Cache failures never interrupt the client stream: the cache entry is
 // discarded and the response is streamed in full.
 func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cache.Key, resp *http.Response) error {
-	maps.Copy(w.Header(), resp.Header)
-
-	cw, err := h.cache.Create(r.Context(), key, maps.Clone(resp.Header), h.ttlFunc(r))
+	ttl := h.ttlFunc(r)
+	responseHeaders := maps.Clone(resp.Header)
+	responseHeaders.Del(CacheResultHeader)
+	maps.Copy(w.Header(), responseHeaders)
+	w.Header().Set(CacheResultHeader, "miss")
+	cw, err := h.cache.Create(r.Context(), key, responseHeaders, ttl)
 	if err != nil {
 		_, copyErr := io.Copy(w, resp.Body)
 		return errors.Join(errors.Wrap(err, "create cache entry"), errors.Wrap(copyErr, "stream response"))
@@ -256,6 +281,10 @@ func (t *cacheTee) Write(p []byte) (int, error) {
 		_, t.err = t.w.Write(p)
 	}
 	return len(p), nil
+}
+
+func (h *Handler) recordCacheLookup(ctx context.Context, result string) {
+	h.cacheLookups.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
 func defaultErrorHandler(err error, w http.ResponseWriter, r *http.Request) {
