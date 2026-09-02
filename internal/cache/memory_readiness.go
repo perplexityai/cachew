@@ -20,6 +20,7 @@ type memoryReadiness struct {
 	cache       *Memory
 	keys        [memoryShardCount]Key
 	lastSuccess [memoryShardCount]atomic.Int64
+	startedAt   time.Time
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -27,10 +28,11 @@ type memoryReadiness struct {
 func newMemoryReadiness(ctx context.Context, memory *Memory) *memoryReadiness {
 	probeCtx, cancel := context.WithCancel(ctx)
 	readiness := &memoryReadiness{
-		cache:  memoryReadinessView(memory),
-		keys:   memoryReadinessKeys(),
-		ctx:    probeCtx,
-		cancel: cancel,
+		cache:     memoryReadinessView(memory),
+		keys:      memoryReadinessKeys(),
+		startedAt: time.Now(),
+		ctx:       probeCtx,
+		cancel:    cancel,
 	}
 	for shardIndex, key := range readiness.keys {
 		shard := &memory.state.shards[shardIndex]
@@ -102,13 +104,15 @@ func (r *memoryReadiness) probe(shardIndex int) {
 	if readErr != nil || closeErr != nil || !bytes.Equal(body, memoryReadinessPayload(shardIndex)) {
 		return
 	}
-	r.lastSuccess[shardIndex].Store(time.Now().UnixNano())
+	// Store elapsed monotonic time plus one so zero remains the never-succeeded sentinel.
+	r.lastSuccess[shardIndex].Store(time.Since(r.startedAt).Nanoseconds() + 1)
 }
 
 func (r *memoryReadiness) ready() bool {
-	cutoff := time.Now().Add(-memoryReadinessStaleAfter).UnixNano()
+	now := time.Since(r.startedAt)
 	for index := range r.lastSuccess {
-		if r.lastSuccess[index].Load() < cutoff {
+		lastSuccess := r.lastSuccess[index].Load()
+		if lastSuccess == 0 || now-time.Duration(lastSuccess-1) > memoryReadinessStaleAfter {
 			return false
 		}
 	}

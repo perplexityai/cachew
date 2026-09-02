@@ -1148,6 +1148,37 @@ func TestMemoryReadinessExercisesEveryShard(t *testing.T) {
 	assert.Equal(t, []string{}, namespaces)
 }
 
+func TestMemoryReadinessSentinelCannotBeReplaced(t *testing.T) {
+	memory := newMemoryTestCache(t)
+	const shardIndex = 0
+	key := memory.state.readiness.keys[shardIndex]
+	ordinaryKey := memoryKeysForShard(t, "", shardIndex, 1)[0]
+	writeMemoryTestEntry(t, memory, ordinaryKey, []byte("ordinary"), time.Hour)
+
+	writer, err := memory.state.readiness.cache.Create(t.Context(), key, nil, time.Hour)
+	assert.NoError(t, err)
+	_, err = writer.Write([]byte("replacement"))
+	assert.NoError(t, err)
+	assert.True(t, errors.Is(writer.Close(), os.ErrPermission))
+
+	reader, _, err := memory.state.readiness.cache.Open(t.Context(), key)
+	assert.NoError(t, err)
+	body, err := io.ReadAll(reader)
+	assert.NoError(t, err)
+	assert.NoError(t, reader.Close())
+	assert.Equal(t, memoryReadinessPayload(shardIndex), body)
+	reader, _, err = memory.Open(t.Context(), ordinaryKey)
+	assert.NoError(t, err)
+	body, err = io.ReadAll(reader)
+	assert.NoError(t, err)
+	assert.NoError(t, reader.Close())
+	assert.Equal(t, []byte("ordinary"), body)
+	stats, err := memory.Stats(t.Context())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), stats.Objects)
+	assert.Equal(t, int64(len("ordinary")), stats.Size)
+}
+
 func TestMemoryReadinessFailsWithoutBlockingWhenShardStalls(t *testing.T) {
 	memory := newMemoryTestCache(t)
 	deadline := time.Now().Add(2 * time.Second)
@@ -1170,7 +1201,10 @@ func TestMemoryReadinessFailsWithoutBlockingWhenShardStalls(t *testing.T) {
 		t.Fatal("readiness probe did not traverse the blocked shard")
 	case <-time.After(50 * time.Millisecond):
 	}
-	memory.state.readiness.lastSuccess[shardIndex].Store(time.Now().Add(-2 * memoryReadinessStaleAfter).UnixNano())
+	elapsed := time.Since(memory.state.readiness.startedAt)
+	memory.state.readiness.lastSuccess[shardIndex].Store(
+		elapsed.Nanoseconds() - int64(2*memoryReadinessStaleAfter) + 1,
+	)
 	assert.False(t, memory.Ready())
 	shard.mu.Unlock()
 

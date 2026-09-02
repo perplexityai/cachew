@@ -365,6 +365,9 @@ func (m *Memory) tryAdmission(
 		return false, errors.WithStack(err)
 	}
 	oldEntry, replacing := shard.entry(entry.namespace, entry.key)
+	if replacing && oldEntry.readiness {
+		return false, errors.WithStack(os.ErrPermission)
+	}
 	if replacing && oldEntry.readers.Load() == 0 {
 		delta := entry.charge - oldEntry.charge
 		if delta > 0 && !m.reserveAdmission(mode, retainedLimit, delta) {

@@ -426,6 +426,7 @@ func TestHandlerMethodChaining(t *testing.T) {
 		OnError(func(_ error, _ http.ResponseWriter, _ *http.Request) {}).
 		TTL(func(_ *http.Request) time.Duration { return time.Hour })
 
+	// Compare identity because deep equality traverses the cache's live atomic state.
 	assert.True(t, h == result, "methods should return the same handler instance")
 }
 
