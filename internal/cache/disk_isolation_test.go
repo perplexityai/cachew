@@ -50,6 +50,15 @@ func (r *recordingDiskMetrics) snapshot() []recordedDiskReadEvent {
 	return append([]recordedDiskReadEvent(nil), r.events...)
 }
 
+func waitForDiskReadEvents(t *testing.T, metrics *recordingDiskMetrics, count int) []recordedDiskReadEvent {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for len(metrics.snapshot()) < count && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	return metrics.snapshot()
+}
+
 func waitForDiskSlots(t *testing.T, isolation *diskReadIsolation) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -110,6 +119,10 @@ func TestDiskReadIsolationTimesOutBlockedStat(t *testing.T) {
 	assert.IsError(t, err, ErrTierUnavailable)
 	assert.True(t, time.Since(begin) < time.Second)
 	<-started
+	wantEvents := []recordedDiskReadEvent{{
+		event: diskReadEventBreakerTrip, operation: diskReadOperationStat, tier: backendDisk,
+	}}
+	assert.Equal(t, wantEvents, metrics.snapshot())
 
 	_, err = isolation.stat(t.Context(), func(context.Context) (http.Header, error) {
 		attempts.Add(1)
@@ -117,9 +130,7 @@ func TestDiskReadIsolationTimesOutBlockedStat(t *testing.T) {
 	})
 	assert.IsError(t, err, ErrTierUnavailable)
 	assert.Equal(t, int64(1), attempts.Load())
-	assert.Equal(t, []recordedDiskReadEvent{{
-		event: diskReadEventBreakerTrip, operation: diskReadOperationStat, tier: backendDisk,
-	}}, metrics.snapshot())
+	assert.Equal(t, wantEvents, metrics.snapshot())
 
 	close(release)
 	waitForDiskSlots(t, isolation)
@@ -127,16 +138,33 @@ func TestDiskReadIsolationTimesOutBlockedStat(t *testing.T) {
 
 func TestDiskReadIsolationTimesOutBlockedOpen(t *testing.T) {
 	isolation := newTestDiskReadIsolation(t, 1, diskIsolationTestTimeout, time.Second)
+	metrics := &recordingDiskMetrics{}
+	isolation.metrics = metrics
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var attempts atomic.Int64
 
 	_, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		attempts.Add(1)
 		close(started)
 		<-release
 		return io.NopCloser(nil), http.Header{}, nil
 	})
 	assert.IsError(t, err, ErrTierUnavailable)
 	<-started
+	wantEvents := []recordedDiskReadEvent{{
+		event: diskReadEventBreakerTrip, operation: diskReadOperationOpen, tier: backendDisk,
+	}}
+	assert.Equal(t, wantEvents, metrics.snapshot())
+
+	_, _, err = isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		attempts.Add(1)
+		return io.NopCloser(nil), http.Header{}, nil
+	})
+	assert.IsError(t, err, ErrTierUnavailable)
+	assert.Equal(t, int64(1), attempts.Load())
+	assert.Equal(t, wantEvents, metrics.snapshot())
+
 	close(release)
 	waitForDiskSlots(t, isolation)
 }
@@ -459,6 +487,74 @@ func TestDiskReadIsolationBoundsLateOpenCleanup(t *testing.T) {
 	assert.Equal(t, 1, len(isolation.readerSlots))
 	source.release()
 	waitForDiskReaderSlots(t, isolation)
+}
+
+func TestDiskReadIsolationTimesOutBackgroundClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	isolation := newDiskReadIsolation(t.Context(), DiskConfig{
+		ReadConcurrency:  1,
+		OpenReaderLimit:  1,
+		OperationTimeout: diskIsolationTestTimeout,
+		ReadIdleTimeout:  time.Second,
+	})
+	metrics := &recordingDiskMetrics{}
+	isolation.metrics = metrics
+	source := newCloseBlockingReader()
+	t.Cleanup(source.release)
+	_, _, err := isolation.open(ctx, func(context.Context) (io.ReadCloser, http.Header, error) {
+		return source, http.Header{}, nil
+	})
+	assert.NoError(t, err)
+
+	cancel()
+	select {
+	case <-source.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background reader Close did not start")
+	}
+	assert.Equal(t, []recordedDiskReadEvent{{
+		event: diskReadEventBreakerTrip, operation: diskReadOperationClose, tier: backendDisk,
+	}}, waitForDiskReadEvents(t, metrics, 1))
+	source.release()
+	waitForDiskReaderSlots(t, isolation)
+}
+
+func TestDiskOpenDirectTransfersReaderCleanupOnFailure(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	disk, err := NewDisk(ctx, DiskConfig{Root: t.TempDir(), MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, disk.Close()) })
+
+	tests := []struct {
+		name    string
+		expired bool
+		opts    []Option
+		wantErr error
+	}{
+		{name: "conditional", opts: []Option{IfMatch(`"stale"`)}, wantErr: ErrPreconditionFailed},
+		{name: "range", opts: []Option{Range(100, 200)}, wantErr: ErrRangeNotSatisfiable},
+		{name: "expired", expired: true, wantErr: os.ErrNotExist},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key := NewKey("cleanup-" + tt.name)
+			writeMemoryTestEntry(t, disk, key, []byte("payload"), time.Hour)
+			if tt.expired {
+				assert.NoError(t, disk.db.setTTL(disk.namespace, key, time.Now().Add(-time.Second)))
+			}
+
+			reader, _, err := disk.openDirect(t.Context(), key, tt.opts...)
+			assert.IsError(t, err, tt.wantErr)
+			assert.NotZero(t, reader)
+			if reader != nil {
+				assert.NoError(t, reader.Close())
+			}
+			if tt.expired {
+				_, err = disk.Stat(t.Context(), key)
+				assert.IsError(t, err, os.ErrNotExist)
+			}
+		})
+	}
 }
 
 func TestDiskReadIsolationDrainsReadersOnShutdown(t *testing.T) {

@@ -239,9 +239,10 @@ bounded resources, and a stuck read cannot prevent its close from running.
 readers, readers returned after a timed-out `Open`, and readers waiting in the
 fixed close dispatcher. This also bounds file descriptors and cleanup ownership
 when `Close` itself stalls.
-`operation-timeout` applies to setup and close; `read-idle-timeout` applies only
-while a body `Read` is blocked and does not cap the total transfer duration. A
-timeout marks reads degraded for 30 seconds. During that window a tiered cache
+`operation-timeout` applies to setup and the full close lifecycle, including
+queue wait and post-close cleanup; `read-idle-timeout` applies only while a body
+`Read` is blocked and does not cap the total transfer duration. A timeout marks
+reads degraded for 30 seconds. During that window a tiered cache
 tries deeper storage, while an unavailable authoritative disk is treated as a
 miss so the caller can regenerate or fetch the object upstream instead of
 returning HTTP 500. The request whose body stalls still fails because its

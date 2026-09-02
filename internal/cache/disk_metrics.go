@@ -66,15 +66,3 @@ func (m *diskMetrics) record(
 		attribute.String("tier", string(tier)),
 	))
 }
-
-func recordDiskReadEvent(
-	ctx context.Context,
-	metrics diskMetricRecorder,
-	event diskReadEvent,
-	operation diskReadOperation,
-	tier BackendType,
-) {
-	if metrics != nil {
-		metrics.record(ctx, event, operation, tier)
-	}
-}

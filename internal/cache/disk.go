@@ -43,16 +43,16 @@ type DiskConfig struct {
 }
 
 type Disk struct {
-	logger       *slog.Logger
-	config       DiskConfig
-	namespace    Namespace
-	db           *diskMetaDB
-	size         *atomic.Int64
-	runEviction  chan struct{}
-	stop         context.CancelFunc
-	evictionDone chan struct{}
-	locks        *[diskLockStripes]sync.RWMutex
-	reads        *diskReadIsolation
+	logger        *slog.Logger
+	config        DiskConfig
+	namespace     Namespace
+	db            *diskMetaDB
+	size          *atomic.Int64
+	runEviction   chan struct{}
+	stop          context.CancelFunc
+	evictionDone  chan struct{}
+	locks         *[diskLockStripes]sync.RWMutex
+	readIsolation *diskReadIsolation
 }
 
 const diskLockStripes = 1024
@@ -146,15 +146,15 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	ctx, stop := context.WithCancel(ctx)
 
 	disk := &Disk{
-		logger:       logger,
-		config:       config,
-		db:           db,
-		size:         &atomic.Int64{},
-		runEviction:  make(chan struct{}),
-		stop:         stop,
-		evictionDone: make(chan struct{}),
-		locks:        &[diskLockStripes]sync.RWMutex{},
-		reads:        newDiskReadIsolation(ctx, config),
+		logger:        logger,
+		config:        config,
+		db:            db,
+		size:          &atomic.Int64{},
+		runEviction:   make(chan struct{}),
+		stop:          stop,
+		evictionDone:  make(chan struct{}),
+		locks:         &[diskLockStripes]sync.RWMutex{},
+		readIsolation: newDiskReadIsolation(ctx, config),
 	}
 	disk.size.Store(size)
 
@@ -288,7 +288,7 @@ func (d *Disk) Invalidate(ctx context.Context, key Key) error {
 }
 
 func (d *Disk) Stat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
-	return d.reads.stat(ctx, func(opCtx context.Context) (http.Header, error) {
+	return d.readIsolation.stat(ctx, func(opCtx context.Context) (http.Header, error) {
 		return d.statDirect(opCtx, key, opts...)
 	})
 }
@@ -334,24 +334,24 @@ func (d *Disk) openLocked(key Key, fullPath string, now time.Time) (f *os.File, 
 	}
 	expiresAt, err := d.db.getTTL(d.namespace, key)
 	if err != nil {
-		return nil, nil, false, errors.Join(err, f.Close())
+		return f, nil, false, errors.WithStack(err)
 	}
 	if now.After(expiresAt) {
 		return f, nil, true, nil
 	}
 	headers, err = d.db.getHeaders(d.namespace, key)
 	if err != nil {
-		return nil, nil, false, errors.Join(errors.Errorf("failed to get headers: %w", err), f.Close())
+		return f, nil, false, errors.Errorf("failed to get headers: %w", err)
 	}
 	ttl := min(expiresAt.Sub(now), d.config.MaxTTL)
 	if err := d.db.setTTL(d.namespace, key, now.Add(ttl)); err != nil {
-		return nil, nil, false, errors.Join(errors.Errorf("failed to update expiration time: %w", err), f.Close())
+		return f, nil, false, errors.Errorf("failed to update expiration time: %w", err)
 	}
 	return f, headers, false, nil
 }
 
 func (d *Disk) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
-	return d.reads.open(ctx, func(opCtx context.Context) (io.ReadCloser, http.Header, error) {
+	return d.readIsolation.open(ctx, func(opCtx context.Context) (io.ReadCloser, http.Header, error) {
 		return d.openDirect(opCtx, key, opts...)
 	})
 }
@@ -362,34 +362,46 @@ func (d *Disk) openDirect(ctx context.Context, key Key, opts ...Option) (io.Read
 
 	f, headers, expired, err := d.openLocked(key, fullPath, time.Now())
 	if err != nil {
-		return nil, nil, err
+		return f, nil, err
 	}
 	if expired {
-		return nil, nil, errors.Join(fs.ErrNotExist, f.Close(), d.Delete(ctx, key))
+		return &diskCleanupReader{
+			ReadCloser: f,
+			cleanup:    func() error { return d.Invalidate(context.WithoutCancel(ctx), key) },
+		}, nil, fs.ErrNotExist
 	}
 
 	finfo, err := f.Stat()
 	if err != nil {
-		return nil, nil, errors.Join(errors.Errorf("failed to stat file for size: %w", err), f.Close())
+		return f, nil, errors.Errorf("failed to stat file for size: %w", err)
 	}
 	headers.Set("Content-Length", strconv.FormatInt(finfo.Size(), 10))
 
 	if h, condErr := conditionalShortCircuit(headers, opts); condErr != nil {
-		return nil, h, errors.Join(condErr, f.Close())
+		return f, h, condErr
 	}
 
 	start, length, partial, rangeErr := rangeShortCircuit(headers, finfo.Size(), opts)
 	if rangeErr != nil {
-		return nil, headers, errors.Join(rangeErr, f.Close())
+		return f, headers, rangeErr
 	}
 	if partial {
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
-			return nil, headers, errors.Join(errors.Errorf("failed to seek for range: %w", err), f.Close())
+			return f, headers, errors.Errorf("failed to seek for range: %w", err)
 		}
 		return newLimitedReadCloser(f, length), headers, nil
 	}
 
 	return f, headers, nil
+}
+
+type diskCleanupReader struct {
+	io.ReadCloser
+	cleanup func() error
+}
+
+func (r *diskCleanupReader) Close() error {
+	return errors.Join(r.ReadCloser.Close(), r.cleanup())
 }
 
 func (d *Disk) keyToPath(namespace Namespace, key Key) string {

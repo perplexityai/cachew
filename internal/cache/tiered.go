@@ -57,7 +57,7 @@ type authoritativeCache struct {
 func (c authoritativeCache) Stat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
 	headers, err := c.Cache.Stat(ctx, key, opts...)
 	if errors.Is(err, ErrTierUnavailable) {
-		recordDiskReadEvent(ctx, defaultDiskMetrics, diskReadEventAuthoritativeMiss, diskReadOperationStat, cacheBackendType(c.Cache))
+		defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationStat, cacheBackendType(c.Cache))
 		return nil, os.ErrNotExist
 	}
 	return headers, errors.WithStack(err)
@@ -66,7 +66,7 @@ func (c authoritativeCache) Stat(ctx context.Context, key Key, opts ...Option) (
 func (c authoritativeCache) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
 	body, headers, err := c.Cache.Open(ctx, key, opts...)
 	if errors.Is(err, ErrTierUnavailable) {
-		recordDiskReadEvent(ctx, defaultDiskMetrics, diskReadEventAuthoritativeMiss, diskReadOperationOpen, cacheBackendType(c.Cache))
+		defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationOpen, cacheBackendType(c.Cache))
 		return nil, nil, os.ErrNotExist
 	}
 	return body, headers, errors.WithStack(err)
@@ -259,7 +259,7 @@ func (t Tiered) Stat(ctx context.Context, key Key, opts ...Option) (http.Header,
 		switch {
 		case errors.Is(err, ErrTierUnavailable):
 			if i == len(t.caches)-1 {
-				recordDiskReadEvent(ctx, defaultDiskMetrics, diskReadEventAuthoritativeMiss, diskReadOperationStat, cacheBackendType(c))
+				defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationStat, cacheBackendType(c))
 				if len(probeErrs) > 0 {
 					return nil, errors.Join(probeErrs...)
 				}
@@ -307,8 +307,8 @@ var _ AuthoritativeStater = (*Tiered)(nil)
 func (t Tiered) AuthoritativeStat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
 	headers, err := t.caches[len(t.caches)-1].Stat(ctx, key, opts...)
 	if errors.Is(err, ErrTierUnavailable) {
-		recordDiskReadEvent(
-			ctx, defaultDiskMetrics, diskReadEventAuthoritativeMiss, diskReadOperationAuthoritativeStat,
+		defaultDiskMetrics.record(
+			ctx, diskReadEventAuthoritativeMiss, diskReadOperationAuthoritativeStat,
 			cacheBackendType(t.caches[len(t.caches)-1]),
 		)
 		return nil, os.ErrNotExist
@@ -377,7 +377,7 @@ func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.R
 		switch {
 		case errors.Is(err, ErrTierUnavailable):
 			if i == len(t.caches)-1 {
-				recordDiskReadEvent(ctx, defaultDiskMetrics, diskReadEventAuthoritativeMiss, diskReadOperationOpen, cacheBackendType(c))
+				defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationOpen, cacheBackendType(c))
 				if len(probeErrs) > 0 {
 					if fallback != nil {
 						probeErrs = append(probeErrs, fallback.Close())
