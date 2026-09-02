@@ -95,6 +95,31 @@ func (c createFuncCache) Create(
 	return c.create(ctx, key, headers, ttl, opts...)
 }
 
+type blockedCreateCache struct {
+	cache.Cache
+	started chan struct{}
+	release chan struct{}
+	creates atomic.Int32
+	once    sync.Once
+}
+
+func (c *blockedCreateCache) Create(
+	ctx context.Context,
+	key cache.Key,
+	headers http.Header,
+	ttl time.Duration,
+	opts ...cache.Option,
+) (cache.Writer, error) {
+	c.creates.Add(1)
+	c.once.Do(func() { close(c.started) })
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return c.Cache.Create(ctx, key, headers, ttl, opts...)
+}
+
 func newRecordingNoOpWriter(t *testing.T, committed, aborted chan struct{}) cache.Writer {
 	t.Helper()
 	writer, err := cache.NoOpCache().Create(t.Context(), cache.NewKey("recording-noop"), nil, time.Hour)
@@ -221,6 +246,23 @@ func tieredMemoryDiskPermutations() []struct {
 	}
 }
 
+type invalidETagCache struct {
+	cache.Cache
+}
+
+func (c invalidETagCache) Open(
+	ctx context.Context,
+	key cache.Key,
+	opts ...cache.Option,
+) (io.ReadCloser, http.Header, error) {
+	reader, headers, err := c.Cache.Open(ctx, key, opts...)
+	if err == nil {
+		headers = headers.Clone()
+		headers.Set(cache.ETagKey, "invalid")
+	}
+	return reader, headers, err //nolint:wrapcheck
+}
+
 func TestTieredCachePermutations(t *testing.T) {
 	for _, perm := range tieredMemoryDiskPermutations() {
 		t.Run(perm.name, func(t *testing.T) {
@@ -261,13 +303,86 @@ func TestTieredBackfillPermutations(t *testing.T) {
 			assert.Equal(t, etag, headers.Get(cache.ETagKey))
 			assert.Equal(t, cache.BackendType(strings.ToLower(perm.upper.name)), source)
 
-			// Now lower tier should have the entry via backfill.
-			r2, lowerHeaders, err := lower.Open(ctx, key)
-			assert.NoError(t, err)
-			assert.Equal(t, content, readAllAndClose(t, r2))
-			assert.Equal(t, etag, lowerHeaders.Get(cache.ETagKey))
+			eventually(t, func() bool { return tierHolds(ctx, t, lower, key, content, etag) })
 		})
 	}
+}
+
+func TestTieredBackfillCoalescesWithoutDelayingReads(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	lowerMemory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	lower := &blockedCreateCache{
+		Cache:   lowerMemory,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(lower.release) }) }
+	defer release()
+	upper, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	tiered := newTiered(ctx, lower, upper)
+	defer tiered.Close()
+
+	key := cache.NewKey("coalesced-backfill")
+	content := bytes.Repeat([]byte("backfill"), 1024)
+	seedTier(ctx, t, upper, key, content, "coalesced-etag")
+
+	opened := make(chan io.ReadCloser, 1)
+	go func() {
+		r, _, openErr := tiered.Open(ctx, key)
+		if openErr == nil {
+			opened <- r
+			return
+		}
+		opened <- nil
+	}()
+	select {
+	case <-lower.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backfill writer creation did not start")
+	}
+
+	var readers []io.ReadCloser
+	select {
+	case r := <-opened:
+		assert.NotZero(t, r)
+		readers = append(readers, r)
+	case <-time.After(2 * time.Second):
+		t.Fatal("optional backfill delayed the cache hit")
+	}
+	for range 7 {
+		r, _, err := tiered.Open(ctx, key)
+		assert.NoError(t, err)
+		readers = append(readers, r)
+	}
+	assert.Equal(t, int32(1), lower.creates.Load())
+
+	release()
+	for _, r := range readers {
+		assert.Equal(t, content, readAllAndClose(t, r))
+	}
+	eventually(t, func() bool { return tierHolds(ctx, t, lowerMemory, key, content, `"coalesced-etag"`) })
+}
+
+func TestTieredBackfillSkipsInvalidETagWithoutFailingRead(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	upper, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	tiered := newTiered(ctx, lower, invalidETagCache{Cache: upper})
+	t.Cleanup(func() { assert.NoError(t, tiered.Close()) })
+	key := cache.NewKey("invalid-etag-backfill")
+	content := []byte("served without optional backfill")
+	seedTier(ctx, t, upper, key, content, "valid-source-etag")
+
+	reader, _, err := tiered.Open(ctx, key)
+	assert.NoError(t, err)
+	assert.Equal(t, content, readAllAndClose(t, reader))
+	_, _, err = lower.Open(ctx, key)
+	assert.IsError(t, err, os.ErrNotExist)
 }
 
 func TestTieredBackfillDiscardsIncompleteStreams(t *testing.T) {
@@ -682,10 +797,7 @@ func TestTieredMetadataInvalidatesStaleLowerBeforeNotModified(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("fresh"), readAllAndClose(t, r))
 	assert.Equal(t, `"fresh-etag"`, headers.Get(cache.ETagKey))
-	r, headers, err = lower.Open(ctx, key)
-	assert.NoError(t, err)
-	assert.Equal(t, []byte("fresh"), readAllAndClose(t, r))
-	assert.Equal(t, `"fresh-etag"`, headers.Get(cache.ETagKey))
+	eventually(t, func() bool { return tierHolds(ctx, t, lower, key, []byte("fresh"), `"fresh-etag"`) })
 }
 
 func TestTieredMetadataReturnsHardStatErrorBeforeInvalidating(t *testing.T) {
@@ -903,9 +1015,7 @@ func TestTieredDivergentValidatorPermutations(t *testing.T) {
 
 				// A full-body serve from the upper tier heals the divergent
 				// lower tier via the usual backfill.
-				r2, _, err := lower.Open(ctx, keyHeal)
-				assert.NoError(t, err)
-				assert.Equal(t, pinned, readAllAndClose(t, r2))
+				eventually(t, func() bool { return tierHolds(ctx, t, lower, keyHeal, pinned, pinnedETag) })
 			})
 		})
 	}
