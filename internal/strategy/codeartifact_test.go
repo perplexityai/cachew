@@ -122,12 +122,15 @@ func (s *localTokenServer) tokenManager(now func() time.Time) *codeArtifactToken
 
 func testCodeArtifactConfig(target string) CodeArtifactConfig {
 	return CodeArtifactConfig{
-		Target:       target,
-		ProxyBaseURL: "https://cachew.example.com",
-		Domain:       testCodeArtifactDomain,
-		DomainOwner:  testCodeArtifactDomainOwner,
-		Region:       testCodeArtifactRegion,
-		RoleARN:      testCodeArtifactRoleARN,
+		Target:                target,
+		ProxyBaseURL:          "https://cachew.example.com",
+		Domain:                testCodeArtifactDomain,
+		DomainOwner:           testCodeArtifactDomainOwner,
+		Region:                testCodeArtifactRegion,
+		RoleARN:               testCodeArtifactRoleARN,
+		OriginHeaderTimeout:   defaultCodeArtifactOriginHeaderTimeout,
+		OriginReadIdleTimeout: defaultCodeArtifactOriginReadIdleTimeout,
+		CredentialTimeout:     defaultCodeArtifactCredentialTimeout,
 	}
 }
 
@@ -293,6 +296,76 @@ func TestCodeArtifactBoundsOriginBodyReadIdle(t *testing.T) {
 	}
 	_ = response.Body.Close()
 	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "read_idle_timeout", format: "maven", size: 1}}, recorded.origin)
+}
+
+func TestCodeArtifactOriginReadIdleIgnoresConsumerPause(t *testing.T) {
+	originCtx, cancel := context.WithCancelCause(t.Context())
+	body := newCodeArtifactOriginBody(
+		originCtx,
+		io.NopCloser(strings.NewReader("ab")),
+		cancel,
+		25*time.Millisecond,
+	)
+	defer func() { assert.NoError(t, body.Close()) }()
+
+	buffer := make([]byte, 1)
+	n, err := body.Read(buffer)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
+	time.Sleep(50 * time.Millisecond)
+	n, err = body.Read(buffer)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, "b", string(buffer))
+}
+
+func TestCodeArtifactOriginReadIdleResetsOnProgress(t *testing.T) {
+	originCtx, cancel := context.WithCancelCause(t.Context())
+	reader, writer := io.Pipe()
+	body := newCodeArtifactOriginBody(originCtx, reader, cancel, 200*time.Millisecond)
+	defer func() { assert.NoError(t, body.Close()) }()
+
+	go func() {
+		for _, value := range []byte("abcd") {
+			time.Sleep(75 * time.Millisecond)
+			_, _ = writer.Write([]byte{value})
+		}
+		_ = writer.Close()
+	}()
+	payload, err := io.ReadAll(body)
+	assert.NoError(t, err)
+	assert.Equal(t, "abcd", string(payload))
+}
+
+func TestCodeArtifactParentCancellationIsNotOriginReadTimeout(t *testing.T) {
+	parentCtx, cancelParent := context.WithCancel(t.Context())
+	originCtx, cancelOrigin := context.WithCancelCause(parentCtx)
+	reader, writer := io.Pipe()
+	go func() {
+		<-originCtx.Done()
+		_ = writer.CloseWithError(originCtx.Err())
+	}()
+	recorded := &recordingCodeArtifactMetrics{}
+	body := &observedCodeArtifactBody{
+		ReadCloser: newCodeArtifactOriginBody(originCtx, reader, cancelOrigin, time.Second),
+		ctx:        parentCtx,
+		metric:     recorded,
+		status:     http.StatusOK,
+		format:     "maven",
+		started:    time.Now(),
+	}
+	readResult := make(chan error, 1)
+	go func() {
+		_, err := body.Read(make([]byte, 1))
+		readResult <- err
+	}()
+
+	cancelParent()
+	err := <-readResult
+	assert.True(t, errors.Is(err, context.Canceled))
+	assert.False(t, errors.Is(err, errCodeArtifactOriginReadIdleTimeout))
+	assert.NoError(t, body.Close())
+	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "200", format: "maven"}}, recorded.origin)
 }
 
 func TestCodeArtifactRejectsNegativeTimeouts(t *testing.T) {
@@ -1352,6 +1425,60 @@ func TestCodeArtifactTokenReuseContinuesDuringProactiveRefresh(t *testing.T) {
 	assert.Equal(t, "token-2", refreshed.value)
 	assert.Equal(t, codeArtifactAuthRefresh, refreshed.event)
 	assert.Equal(t, int32(2), requests.Load())
+}
+
+func TestCodeArtifactProactiveRefreshOutlivesCallerCancellation(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	currentTime := now
+	refreshStarted := make(chan struct{})
+	callerCanceled := make(chan struct{})
+	var requests atomic.Int32
+	client := codeArtifactAuthorizationClientFunc(func(
+		ctx context.Context,
+		_ *awscodeartifact.GetAuthorizationTokenInput,
+		_ ...func(*awscodeartifact.Options),
+	) (*awscodeartifact.GetAuthorizationTokenOutput, error) {
+		request := requests.Add(1)
+		expiresAt := now.Add(12 * time.Hour)
+		if request == 2 {
+			close(refreshStarted)
+			<-callerCanceled
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			expiresAt = now.Add(23 * time.Hour)
+		}
+		return &awscodeartifact.GetAuthorizationTokenOutput{
+			AuthorizationToken: aws.String(fmt.Sprintf("token-%d", request)),
+			Expiration:         &expiresAt,
+		}, nil
+	})
+	manager := newCodeArtifactTokenManagerWithClient(
+		testCodeArtifactConfig("https://codeartifact.example.com"),
+		client,
+		func() time.Time { return currentTime },
+	)
+	first, err := manager.Token(t.Context(), 0)
+	assert.NoError(t, err)
+	currentTime = now.Add(11 * time.Hour)
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	result := make(chan codeArtifactToken, 1)
+	resultErr := make(chan error, 1)
+	go func() {
+		token, refreshErr := manager.Token(requestCtx, 0)
+		result <- token
+		resultErr <- refreshErr
+	}()
+	<-refreshStarted
+	cancelRequest()
+	close(callerCanceled)
+
+	assert.NoError(t, <-resultErr)
+	refreshed := <-result
+	assert.Equal(t, "token-2", refreshed.value)
+	assert.Equal(t, codeArtifactAuthRefresh, refreshed.event)
+	assert.Equal(t, first.generation+1, refreshed.generation)
+	assert.True(t, manager.retryAfter.IsZero())
 }
 
 func TestCodeArtifactRefreshesBeforeExpiration(t *testing.T) {

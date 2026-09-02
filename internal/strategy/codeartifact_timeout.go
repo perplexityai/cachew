@@ -19,7 +19,9 @@ type codeArtifactOriginBody struct {
 
 	mu         sync.Mutex
 	timer      *time.Timer
-	generation uint64
+	timerWG    sync.WaitGroup
+	timerArmed bool
+	reading    bool
 	closed     bool
 	closeOnce  sync.Once
 	closeErr   error
@@ -35,15 +37,15 @@ func newCodeArtifactOriginBody(
 		timeout = defaultCodeArtifactOriginReadIdleTimeout
 	}
 	r := &codeArtifactOriginBody{body: body, ctx: ctx, cancel: cancel, timeout: timeout}
-	r.resetTimer()
+	r.timer = time.AfterFunc(timeout, r.timeoutRead)
+	r.timer.Stop()
 	return r
 }
 
 func (r *codeArtifactOriginBody) Read(p []byte) (int, error) {
+	r.startRead()
 	n, err := r.body.Read(p)
-	if n > 0 {
-		r.resetTimer()
-	}
+	r.finishRead()
 	if errors.Is(context.Cause(r.ctx), errCodeArtifactOriginReadIdleTimeout) {
 		return n, errCodeArtifactOriginReadIdleTimeout
 	}
@@ -54,39 +56,56 @@ func (r *codeArtifactOriginBody) Close() error {
 	r.closeOnce.Do(func() {
 		r.mu.Lock()
 		r.closed = true
-		r.generation++
-		if r.timer != nil {
-			r.timer.Stop()
-		}
 		r.mu.Unlock()
+		r.stopReadTimer()
 		r.cancel(nil)
 		r.closeErr = r.body.Close()
 	})
 	return errors.WithStack(r.closeErr)
 }
 
-func (r *codeArtifactOriginBody) resetTimer() {
+func (r *codeArtifactOriginBody) startRead() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return
 	}
-	// Replacing the timer is not enough because a callback may already be
-	// runnable. The generation prevents stale callbacks from cancelling a body
-	// after a later read made progress and armed a fresh idle window.
-	r.generation++
-	generation := r.generation
-	if r.timer != nil {
-		r.timer.Stop()
+	r.reading = true
+	r.timerArmed = true
+	r.timerWG.Add(1)
+	r.timer.Reset(r.timeout)
+}
+
+func (r *codeArtifactOriginBody) finishRead() {
+	r.stopReadTimer()
+}
+
+func (r *codeArtifactOriginBody) stopReadTimer() {
+	r.mu.Lock()
+	r.reading = false
+	if !r.timerArmed {
+		r.mu.Unlock()
+		return
 	}
-	r.timer = time.AfterFunc(r.timeout, func() {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		if r.closed || generation != r.generation {
-			return
-		}
-		r.cancel(errCodeArtifactOriginReadIdleTimeout)
-	})
+	r.timerArmed = false
+	stopped := r.timer.Stop()
+	r.mu.Unlock()
+	// A false Stop means the callback may still be waiting for r.mu. Waiting
+	// here prevents that callback from leaking into a later Reset cycle.
+	if stopped {
+		r.timerWG.Done()
+	}
+	r.timerWG.Wait()
+}
+
+func (r *codeArtifactOriginBody) timeoutRead() {
+	defer r.timerWG.Done()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || !r.reading {
+		return
+	}
+	r.cancel(errCodeArtifactOriginReadIdleTimeout)
 }
 
 var _ io.ReadCloser = (*codeArtifactOriginBody)(nil)

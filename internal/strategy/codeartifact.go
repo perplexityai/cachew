@@ -33,9 +33,9 @@ type CodeArtifactConfig struct {
 	DomainOwner           string        `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
 	Region                string        `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
 	RoleARN               string        `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
-	OriginHeaderTimeout   time.Duration `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers."`
-	OriginReadIdleTimeout time.Duration `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time an origin response body may make no read progress."`
-	CredentialTimeout     time.Duration `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh."`
+	OriginHeaderTimeout   time.Duration `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
+	OriginReadIdleTimeout time.Duration `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
+	CredentialTimeout     time.Duration `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
@@ -86,7 +86,6 @@ func newCodeArtifact(
 	configuredCache cache.Cache,
 	allowHTTP bool,
 ) (*CodeArtifact, error) {
-	config = codeArtifactConfigWithDefaults(config)
 	target, proxyBase, err := validateCodeArtifactConfig(config, allowHTTP)
 	if err != nil {
 		return nil, err

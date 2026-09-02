@@ -56,7 +56,6 @@ type codeArtifactToken struct {
 }
 
 func newCodeArtifactTokenManager(ctx context.Context, config CodeArtifactConfig) (*codeArtifactTokenManager, error) {
-	config = codeArtifactConfigWithDefaults(config)
 	loadCtx, cancel := context.WithTimeout(ctx, config.CredentialTimeout)
 	defer cancel()
 	awsConfig, err := awsconfig.LoadDefaultConfig(loadCtx, awsconfig.WithRegion(config.Region))
@@ -75,7 +74,7 @@ func newCodeArtifactTokenManagerWithClient(
 	now func() time.Time,
 ) *codeArtifactTokenManager {
 	return &codeArtifactTokenManager{
-		config:  codeArtifactConfigWithDefaults(config),
+		config:  config,
 		client:  client,
 		now:     now,
 		refresh: semaphore.NewWeighted(1),
@@ -88,7 +87,13 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 		return token, nil
 	}
 
-	refreshCtx, cancel := context.WithTimeout(ctx, m.config.CredentialTimeout)
+	refreshParent := ctx
+	if state == codeArtifactTokenRefreshDue {
+		// The current request can disappear without invalidating an early refresh
+		// that benefits every later request using this token manager.
+		refreshParent = context.WithoutCancel(ctx)
+	}
+	refreshCtx, cancel := context.WithTimeout(refreshParent, m.config.CredentialTimeout)
 	defer cancel()
 	initialGeneration := token.generation
 	if state == codeArtifactTokenRefreshDue {
