@@ -372,6 +372,13 @@ metrics {
 
 Admin endpoints: `/_liveness`, `/_readiness`, `PUT /admin/log/level`, `/admin/pprof/`.
 
+Memory-cache readiness is local and shard-aware. Cachew keeps one private
+sentinel object in each memory shard and assigns one persistent probe worker to
+each shard. `/_readiness` fails when any sentinel has not traversed the normal
+memory `Open` path successfully within five seconds. A stuck shard can strand
+only its existing worker; readiness checks read atomic probe timestamps and do
+not launch additional goroutines. `/_liveness` remains process-only.
+
 ## Full Configuration Example
 
 ```hcl
