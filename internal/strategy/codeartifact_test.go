@@ -1290,36 +1290,121 @@ func TestCodeArtifactTokenReuseContinuesDuringForcedRefresh(t *testing.T) {
 	assert.Equal(t, int32(2), requests.Load())
 }
 
-func TestCodeArtifactRefreshesBeforeExpiration(t *testing.T) {
+func TestCodeArtifactTokenReuseContinuesDuringProactiveRefresh(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
-	tokenServer := newLocalTokenServer(
-		t,
-		tokenResponse{token: "near-expiry", expiresAt: now.Add(time.Minute)},
-		tokenResponse{token: "fresh", expiresAt: now.Add(time.Hour)},
-	)
-	manager := tokenServer.tokenManager(func() time.Time { return now })
-
+	currentTime := now
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	defer release()
+	var requests atomic.Int32
+	client := codeArtifactAuthorizationClientFunc(func(
+		ctx context.Context,
+		_ *awscodeartifact.GetAuthorizationTokenInput,
+		_ ...func(*awscodeartifact.Options),
+	) (*awscodeartifact.GetAuthorizationTokenOutput, error) {
+		request := requests.Add(1)
+		expiresAt := now.Add(12 * time.Hour)
+		if request == 2 {
+			close(refreshStarted)
+			select {
+			case <-releaseRefresh:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			expiresAt = now.Add(23 * time.Hour)
+		}
+		return &awscodeartifact.GetAuthorizationTokenOutput{
+			AuthorizationToken: aws.String(fmt.Sprintf("token-%d", request)),
+			Expiration:         &expiresAt,
+		}, nil
+	})
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.CredentialTimeout = time.Second
+	manager := newCodeArtifactTokenManagerWithClient(config, client, func() time.Time { return currentTime })
 	first, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
-	second, err := manager.Token(t.Context(), 0)
-	assert.NoError(t, err)
+	currentTime = now.Add(11 * time.Hour)
 
-	assert.Equal(t, "near-expiry", first.value)
-	assert.Equal(t, "fresh", second.value)
-	assert.Equal(t, 2, tokenServer.requestCount())
+	refreshResult := make(chan codeArtifactToken, 1)
+	refreshError := make(chan error, 1)
+	go func() {
+		token, refreshErr := manager.Token(t.Context(), 0)
+		refreshResult <- token
+		refreshError <- refreshErr
+	}()
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("proactive credential refresh did not start")
+	}
+
+	reuseCtx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	reused, err := manager.Token(reuseCtx, 0)
+	assert.NoError(t, err)
+	assert.Equal(t, first.value, reused.value)
+	assert.Equal(t, codeArtifactAuthReuse, reused.event)
+	release()
+	assert.NoError(t, <-refreshError)
+	refreshed := <-refreshResult
+	assert.Equal(t, "token-2", refreshed.value)
+	assert.Equal(t, codeArtifactAuthRefresh, refreshed.event)
+	assert.Equal(t, int32(2), requests.Load())
+}
+
+func TestCodeArtifactRefreshesBeforeExpiration(t *testing.T) {
+	testCases := []struct {
+		name         string
+		lifetime     time.Duration
+		refreshAfter time.Duration
+	}{
+		{name: "default lifetime", lifetime: 12 * time.Hour, refreshAfter: 11 * time.Hour},
+		{name: "short lifetime", lifetime: 30 * time.Minute, refreshAfter: 15 * time.Minute},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			now := time.Unix(1_800_000_000, 0)
+			currentTime := now
+			tokenServer := newLocalTokenServer(
+				t,
+				tokenResponse{token: "token-1", expiresAt: now.Add(testCase.lifetime)},
+				tokenResponse{token: "token-2", expiresAt: now.Add(2 * testCase.lifetime)},
+			)
+			manager := tokenServer.tokenManager(func() time.Time { return currentTime })
+
+			first, err := manager.Token(t.Context(), 0)
+			assert.NoError(t, err)
+			currentTime = now.Add(testCase.refreshAfter - time.Nanosecond)
+			reused, err := manager.Token(t.Context(), 0)
+			assert.NoError(t, err)
+			assert.Equal(t, first.value, reused.value)
+			assert.Equal(t, 1, tokenServer.requestCount())
+
+			currentTime = now.Add(testCase.refreshAfter)
+			refreshed, err := manager.Token(t.Context(), 0)
+			assert.NoError(t, err)
+			assert.Equal(t, "token-2", refreshed.value)
+			assert.Equal(t, codeArtifactAuthRefresh, refreshed.event)
+			assert.Equal(t, 2, tokenServer.requestCount())
+		})
+	}
 }
 
 func TestCodeArtifactRefreshFailureFallsBackOnlyToUnrejectedToken(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
+	currentTime := now
 	tokenServer := newLocalTokenServer(
 		t,
 		tokenResponse{token: "near-expiry", expiresAt: now.Add(time.Minute)},
 		tokenResponse{status: http.StatusServiceUnavailable},
 	)
-	manager := tokenServer.tokenManager(func() time.Time { return now })
+	manager := tokenServer.tokenManager(func() time.Time { return currentTime })
 
 	first, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
+	currentTime = now.Add(30 * time.Second)
 	fallback, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
 	assert.Equal(t, first.value, fallback.value)
@@ -1333,7 +1418,7 @@ func TestCodeArtifactRefreshFailureFallsBackOnlyToUnrejectedToken(t *testing.T) 
 func TestCodeArtifactFailedProactiveRefreshesBackOff(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	currentTime := now
-	expiresAt := now.Add(4 * time.Minute)
+	expiresAt := now.Add(12 * time.Hour)
 	var requests atomic.Int32
 	client := codeArtifactAuthorizationClientFunc(func(
 		context.Context,
@@ -1354,6 +1439,7 @@ func TestCodeArtifactFailedProactiveRefreshesBackOff(t *testing.T) {
 
 	first, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
+	currentTime = now.Add(11 * time.Hour)
 
 	const callers = 16
 	start := make(chan struct{})
@@ -1388,7 +1474,7 @@ func TestCodeArtifactFailedProactiveRefreshesBackOff(t *testing.T) {
 	assert.Equal(t, callers-1, events[codeArtifactAuthReuse])
 	assert.Equal(t, int32(2), requests.Load(), "failed proactive refreshes should back off")
 
-	currentTime = now.Add(codeArtifactTokenRefreshFailureBackoff)
+	currentTime = now.Add(11*time.Hour + codeArtifactTokenRefreshFailureBackoff)
 	retry, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
 	assert.Equal(t, codeArtifactAuthFailure, retry.event)

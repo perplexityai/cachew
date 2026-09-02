@@ -15,8 +15,16 @@ import (
 )
 
 const (
-	codeArtifactTokenRefreshBuffer         = 5 * time.Minute
-	codeArtifactTokenRefreshFailureBackoff = time.Minute
+	codeArtifactTokenProactiveRefreshWindow = time.Hour
+	codeArtifactTokenRefreshFailureBackoff  = time.Minute
+)
+
+type codeArtifactTokenState uint8
+
+const (
+	codeArtifactTokenNeedsRefresh codeArtifactTokenState = iota
+	codeArtifactTokenReusable
+	codeArtifactTokenRefreshDue
 )
 
 type codeArtifactAuthorizationClient interface {
@@ -36,6 +44,7 @@ type codeArtifactTokenManager struct {
 	refresh    *semaphore.Weighted
 	token      string
 	expiresAt  time.Time
+	refreshAt  time.Time
 	generation uint64
 	retryAfter time.Time
 }
@@ -74,22 +83,41 @@ func newCodeArtifactTokenManagerWithClient(
 }
 
 func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration uint64) (codeArtifactToken, error) {
-	if token, ok := m.reusableToken(rejectedGeneration); ok {
+	token, state := m.currentToken(rejectedGeneration)
+	if state == codeArtifactTokenReusable {
 		return token, nil
 	}
 
 	refreshCtx, cancel := context.WithTimeout(ctx, m.config.CredentialTimeout)
 	defer cancel()
-	if err := m.refresh.Acquire(refreshCtx, 1); err != nil {
-		return codeArtifactToken{}, errors.Wrap(err, "wait for CodeArtifact authorization refresh")
+	initialGeneration := token.generation
+	if state == codeArtifactTokenRefreshDue {
+		// A valid token can keep serving while one caller refreshes it early. Only
+		// rejected or expired generations need to queue behind an active refresh.
+		if !m.refresh.TryAcquire(1) {
+			return token, nil
+		}
+	} else {
+		if err := m.refresh.Acquire(refreshCtx, 1); err != nil {
+			return codeArtifactToken{}, errors.Wrap(err, "wait for CodeArtifact authorization refresh")
+		}
 	}
 	defer m.refresh.Release(1)
 
-	if token, ok := m.reusableToken(rejectedGeneration); ok {
+	token, state = m.currentToken(rejectedGeneration)
+	if state == codeArtifactTokenReusable ||
+		(state == codeArtifactTokenRefreshDue && token.generation != initialGeneration) {
 		return token, nil
 	}
 
-	output, err := m.client.GetAuthorizationToken(refreshCtx, &awscodeartifact.GetAuthorizationTokenInput{
+	return m.refreshToken(refreshCtx, rejectedGeneration)
+}
+
+func (m *codeArtifactTokenManager) refreshToken(
+	ctx context.Context,
+	rejectedGeneration uint64,
+) (codeArtifactToken, error) {
+	output, err := m.client.GetAuthorizationToken(ctx, &awscodeartifact.GetAuthorizationTokenInput{
 		Domain:      aws.String(m.config.Domain),
 		DomainOwner: aws.String(m.config.DomainOwner),
 	})
@@ -109,6 +137,7 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 
 	m.token = *output.AuthorizationToken
 	m.expiresAt = *output.Expiration
+	m.refreshAt = codeArtifactTokenRefreshTime(m.now(), m.expiresAt)
 	m.generation++
 	m.retryAfter = time.Time{}
 	event := codeArtifactAuthRefresh
@@ -118,25 +147,36 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 	return codeArtifactToken{value: m.token, generation: m.generation, event: event}, nil
 }
 
-func (m *codeArtifactTokenManager) reusableToken(rejectedGeneration uint64) (codeArtifactToken, bool) {
+func (m *codeArtifactTokenManager) currentToken(
+	rejectedGeneration uint64,
+) (codeArtifactToken, codeArtifactTokenState) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if !m.usableTokenLocked(rejectedGeneration) {
-		return codeArtifactToken{}, false
+	now := m.now()
+	token := codeArtifactToken{value: m.token, generation: m.generation, event: codeArtifactAuthReuse}
+	if m.token == "" || !now.Before(m.expiresAt) {
+		return token, codeArtifactTokenNeedsRefresh
 	}
-	return codeArtifactToken{value: m.token, generation: m.generation, event: codeArtifactAuthReuse}, true
+	if rejectedGeneration != 0 {
+		if rejectedGeneration < m.generation {
+			return token, codeArtifactTokenReusable
+		}
+		return token, codeArtifactTokenNeedsRefresh
+	}
+	if now.Before(m.retryAfter) || now.Before(m.refreshAt) {
+		return token, codeArtifactTokenReusable
+	}
+	return token, codeArtifactTokenRefreshDue
 }
 
-func (m *codeArtifactTokenManager) usableTokenLocked(rejectedGeneration uint64) bool {
-	now := m.now()
-	if m.token == "" || !now.Before(m.expiresAt) {
-		return false
+func codeArtifactTokenRefreshTime(now, expiresAt time.Time) time.Time {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return expiresAt
 	}
-	if rejectedGeneration == 0 && now.Before(m.retryAfter) {
-		return true
+	window := codeArtifactTokenProactiveRefreshWindow
+	if halfLifetime := remaining / 2; halfLifetime < window {
+		window = halfLifetime
 	}
-	if !now.Add(codeArtifactTokenRefreshBuffer).Before(m.expiresAt) {
-		return false
-	}
-	return rejectedGeneration == 0 || rejectedGeneration < m.generation
+	return expiresAt.Add(-window)
 }

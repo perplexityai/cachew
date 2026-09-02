@@ -117,6 +117,11 @@ subject to a fixed total-duration limit. A body idle timeout cancels the origin
 request and is reported as `status=read_idle_timeout` in the CodeArtifact origin
 metrics.
 
+Authorization tokens are reused in-process. The default 12-hour token enters
+proactive refresh one hour before expiration; one request performs each refresh
+attempt while concurrent requests continue using the valid token. Shorter-lived
+tokens enter proactive refresh halfway through their lifetime.
+
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,
 complete response with a positive shared freshness lifetime and an origin policy
