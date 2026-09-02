@@ -95,6 +95,10 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
   domain-owner   = "111122223333"
   region         = "us-east-1"
   role-arn       = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
+
+  credential-timeout       = "15s"
+  origin-header-timeout    = "30s"
+  origin-read-idle-timeout = "30s"
 }
 ```
 
@@ -105,6 +109,13 @@ continue downloading through the unauthenticated proxy.
 The role needs `codeartifact:GetAuthorizationToken` and its underlying principal
 needs `sts:GetServiceBearerToken`. Repository read permissions remain governed by
 the CodeArtifact resource policy.
+
+Credential refresh, including time spent waiting for another refresh, and
+origin response headers have whole-operation deadlines. Response bodies use an
+idle deadline that resets whenever bytes arrive, so large downloads are not
+subject to a fixed total-duration limit. A body idle timeout cancels the origin
+request and is reported as `status=read_idle_timeout` in the CodeArtifact origin
+metrics.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,

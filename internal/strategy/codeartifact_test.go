@@ -214,6 +214,119 @@ func TestCodeArtifactSanitizesOriginTransportErrors(t *testing.T) {
 	assert.EqualError(t, err, "request CodeArtifact origin")
 }
 
+func TestCodeArtifactBoundsOriginHeaderWait(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseOrigin := make(chan struct{})
+	defer close(releaseOrigin)
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(requestStarted)
+		<-releaseOrigin
+	}))
+	t.Cleanup(origin.Close)
+
+	config := testCodeArtifactConfig(origin.URL)
+	config.OriginHeaderTimeout = 25 * time.Millisecond
+	mux := http.NewServeMux()
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	strategy, err := newCodeArtifact(ctx, config, mux, nil, cache.NoOpCache(), true)
+	assert.NoError(t, err)
+	request := httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/maven/repository/package"), nil)
+	result := make(chan error, 1)
+	go func() {
+		_, requestErr := strategy.do(request, "token")
+		result <- requestErr
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("origin request did not start")
+	}
+	select {
+	case requestErr := <-result:
+		assert.EqualError(t, requestErr, "request CodeArtifact origin")
+	case <-time.After(time.Second):
+		t.Fatal("origin header wait exceeded its deadline")
+	}
+}
+
+func TestCodeArtifactBoundsOriginBodyReadIdle(t *testing.T) {
+	releaseOrigin := make(chan struct{})
+	defer close(releaseOrigin)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "2")
+		_, _ = w.Write([]byte("a"))
+		flusher, ok := w.(http.Flusher)
+		assert.True(t, ok)
+		flusher.Flush()
+		<-releaseOrigin
+	}))
+	t.Cleanup(origin.Close)
+
+	config := testCodeArtifactConfig(origin.URL)
+	config.OriginReadIdleTimeout = 25 * time.Millisecond
+	mux := http.NewServeMux()
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	strategy, err := newCodeArtifact(ctx, config, mux, nil, cache.NoOpCache(), true)
+	assert.NoError(t, err)
+	recorded := &recordingCodeArtifactMetrics{}
+	strategy.metric = recorded
+	request := httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/maven/repository/package"), nil)
+	response, err := strategy.do(request, "token")
+	assert.NoError(t, err)
+
+	first := make([]byte, 1)
+	n, err := response.Body.Read(first)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.Equal(t, "a", string(first))
+	readResult := make(chan error, 1)
+	go func() {
+		_, readErr := response.Body.Read(make([]byte, 1))
+		readResult <- readErr
+	}()
+	select {
+	case readErr := <-readResult:
+		assert.True(t, errors.Is(readErr, errCodeArtifactOriginReadIdleTimeout))
+	case <-time.After(time.Second):
+		t.Fatal("origin body read exceeded its idle deadline")
+	}
+	_ = response.Body.Close()
+	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "read_idle_timeout", format: "maven", size: 1}}, recorded.origin)
+}
+
+func TestCodeArtifactRejectsNegativeTimeouts(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*CodeArtifactConfig)
+		wantError string
+	}{
+		{
+			name:      "origin header",
+			configure: func(config *CodeArtifactConfig) { config.OriginHeaderTimeout = -time.Second },
+			wantError: "codeartifact: origin-header-timeout must not be negative",
+		},
+		{
+			name:      "origin read idle",
+			configure: func(config *CodeArtifactConfig) { config.OriginReadIdleTimeout = -time.Second },
+			wantError: "codeartifact: origin-read-idle-timeout must not be negative",
+		},
+		{
+			name:      "credential",
+			configure: func(config *CodeArtifactConfig) { config.CredentialTimeout = -time.Second },
+			wantError: "codeartifact: credential-timeout must not be negative",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := testCodeArtifactConfig("https://codeartifact.example.com")
+			test.configure(&config)
+			_, _, err := validateCodeArtifactConfig(config, false)
+			assert.EqualError(t, err, test.wantError)
+		})
+	}
+}
+
 func TestCodeArtifactCachesOriginDeclaredImmutableResponses(t *testing.T) {
 	paths := []string{
 		"/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar",
@@ -1046,6 +1159,135 @@ func TestCodeArtifactTokenRefreshesCoalesce(t *testing.T) {
 		assert.Equal(t, "token-1", token)
 	}
 	assert.Equal(t, 2, tokenServer.requestCount(), "forced refreshes should coalesce")
+}
+
+func TestCodeArtifactTokenRefreshHasDeadline(t *testing.T) {
+	client := codeArtifactAuthorizationClientFunc(func(
+		ctx context.Context,
+		_ *awscodeartifact.GetAuthorizationTokenInput,
+		_ ...func(*awscodeartifact.Options),
+	) (*awscodeartifact.GetAuthorizationTokenOutput, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.CredentialTimeout = 25 * time.Millisecond
+	manager := newCodeArtifactTokenManagerWithClient(config, client, time.Now)
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.Token(t.Context(), 0)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		assert.True(t, errors.Is(err, context.DeadlineExceeded))
+	case <-time.After(time.Second):
+		t.Fatal("credential refresh exceeded its deadline")
+	}
+}
+
+func TestCodeArtifactTokenWaitRespectsCallerDeadline(t *testing.T) {
+	refreshStarted := make(chan struct{}, 1)
+	releaseRefresh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	defer release()
+	var requests atomic.Int32
+	expiresAt := time.Now().Add(time.Hour)
+	client := codeArtifactAuthorizationClientFunc(func(
+		ctx context.Context,
+		_ *awscodeartifact.GetAuthorizationTokenInput,
+		_ ...func(*awscodeartifact.Options),
+	) (*awscodeartifact.GetAuthorizationTokenOutput, error) {
+		requests.Add(1)
+		refreshStarted <- struct{}{}
+		select {
+		case <-releaseRefresh:
+			return &awscodeartifact.GetAuthorizationTokenOutput{
+				AuthorizationToken: aws.String("token"),
+				Expiration:         &expiresAt,
+			}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.CredentialTimeout = time.Second
+	manager := newCodeArtifactTokenManagerWithClient(config, client, time.Now)
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Token(t.Context(), 0)
+		firstResult <- err
+	}()
+
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("credential refresh did not start")
+	}
+	waitCtx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	_, err := manager.Token(waitCtx, 0)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded))
+	release()
+	assert.NoError(t, <-firstResult)
+	assert.Equal(t, int32(1), requests.Load())
+}
+
+func TestCodeArtifactTokenReuseContinuesDuringForcedRefresh(t *testing.T) {
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	defer release()
+	var requests atomic.Int32
+	expiresAt := time.Now().Add(time.Hour)
+	client := codeArtifactAuthorizationClientFunc(func(
+		ctx context.Context,
+		_ *awscodeartifact.GetAuthorizationTokenInput,
+		_ ...func(*awscodeartifact.Options),
+	) (*awscodeartifact.GetAuthorizationTokenOutput, error) {
+		if requests.Add(1) == 2 {
+			close(refreshStarted)
+			select {
+			case <-releaseRefresh:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return &awscodeartifact.GetAuthorizationTokenOutput{
+			AuthorizationToken: aws.String(fmt.Sprintf("token-%d", requests.Load())),
+			Expiration:         &expiresAt,
+		}, nil
+	})
+	config := testCodeArtifactConfig("https://codeartifact.example.com")
+	config.CredentialTimeout = time.Second
+	manager := newCodeArtifactTokenManagerWithClient(config, client, time.Now)
+	first, err := manager.Token(t.Context(), 0)
+	assert.NoError(t, err)
+	forcedResult := make(chan codeArtifactToken, 1)
+	forcedError := make(chan error, 1)
+	go func() {
+		token, refreshErr := manager.Token(t.Context(), first.generation)
+		forcedResult <- token
+		forcedError <- refreshErr
+	}()
+
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("forced credential refresh did not start")
+	}
+	reused, err := manager.Token(t.Context(), 0)
+	assert.NoError(t, err)
+	assert.Equal(t, first.value, reused.value)
+	assert.Equal(t, codeArtifactAuthReuse, reused.event)
+	release()
+	assert.NoError(t, <-forcedError)
+	refreshed := <-forcedResult
+	assert.Equal(t, "token-2", refreshed.value)
+	assert.Equal(t, int32(2), requests.Load())
 }
 
 func TestCodeArtifactRefreshesBeforeExpiration(t *testing.T) {
