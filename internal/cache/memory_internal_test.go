@@ -148,6 +148,9 @@ func assertMemoryAccounting(
 		shard.mu.RLock()
 		for _, namespaceEntries := range shard.entries {
 			for _, entry := range namespaceEntries {
+				if entry.readiness {
+					continue
+				}
 				entries[entry] = struct{}{}
 				payloadSize += int64(len(entry.data))
 				objectCount++
@@ -1113,6 +1116,70 @@ func TestMemoryConcurrentReplacementDoesNotExposeCapacity(t *testing.T) {
 	assert.True(t, admissions.Load() > 0)
 	assert.True(t, observedMaximum.Load() <= retainedCeiling,
 		"retained charge exceeded ceiling: got %d, ceiling %d", observedMaximum.Load(), retainedCeiling)
+}
+
+func TestMemoryReadinessExercisesEveryShard(t *testing.T) {
+	memory := newMemoryTestCache(t)
+	deadline := time.Now().Add(2 * time.Second)
+	for !memory.Ready() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	assert.True(t, memory.Ready())
+
+	seen := make(map[int]bool, memoryShardCount)
+	for index, key := range memory.state.readiness.keys {
+		shardIndex := memoryShardIndex(memoryReadinessNamespace, key)
+		assert.Equal(t, index, shardIndex)
+		seen[shardIndex] = true
+		reader, _, err := memory.state.readiness.cache.Open(t.Context(), key)
+		assert.NoError(t, err)
+		body, err := io.ReadAll(reader)
+		assert.NoError(t, err)
+		assert.NoError(t, reader.Close())
+		assert.Equal(t, memoryReadinessPayload(index), body)
+	}
+	assert.Equal(t, memoryShardCount, len(seen))
+	stats, err := memory.Stats(t.Context())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), stats.Objects)
+	assert.Equal(t, int64(0), stats.Size)
+	namespaces, err := memory.ListNamespaces(t.Context())
+	assert.NoError(t, err)
+	assert.Equal(t, []string{}, namespaces)
+}
+
+func TestMemoryReadinessFailsWithoutBlockingWhenShardStalls(t *testing.T) {
+	memory := newMemoryTestCache(t)
+	deadline := time.Now().Add(2 * time.Second)
+	for !memory.Ready() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	assert.True(t, memory.Ready())
+
+	const shardIndex = 3
+	shard := &memory.state.shards[shardIndex]
+	shard.mu.Lock()
+	probeDone := make(chan struct{})
+	go func() {
+		memory.state.readiness.probe(shardIndex)
+		close(probeDone)
+	}()
+	select {
+	case <-probeDone:
+		shard.mu.Unlock()
+		t.Fatal("readiness probe did not traverse the blocked shard")
+	case <-time.After(50 * time.Millisecond):
+	}
+	memory.state.readiness.lastSuccess[shardIndex].Store(time.Now().Add(-2 * memoryReadinessStaleAfter).UnixNano())
+	assert.False(t, memory.Ready())
+	shard.mu.Unlock()
+
+	select {
+	case <-probeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readiness probe did not recover after the shard was released")
+	}
+	assert.True(t, memory.Ready())
 }
 
 func TestMemoryUncommittedPlanDoesNotHideEntries(t *testing.T) {

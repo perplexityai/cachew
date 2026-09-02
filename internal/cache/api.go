@@ -231,6 +231,12 @@ type Cache interface {
 	Close() error
 }
 
+// Readier is implemented by caches with a local health signal suitable for
+// removing an unhealthy process from service.
+type Readier interface {
+	Ready() bool
+}
+
 // BackendType is a bounded cache implementation identifier suitable for
 // operational attribution.
 type BackendType string
