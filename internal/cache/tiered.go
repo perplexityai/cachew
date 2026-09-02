@@ -26,7 +26,7 @@ type Tiered struct {
 	metadata  *metadatadb.Store
 	etags     *metadatadb.Map[Key, string]
 	namespace Namespace
-	healer    *tieredHealer
+	backfills *tieredBackfills
 }
 
 // MaybeNewTiered creates a [Tiered] cache from one or more caches.
@@ -43,7 +43,12 @@ func MaybeNewTiered(ctx context.Context, caches []Cache, metadata *metadatadb.St
 	if metadata == nil {
 		panic("Tiered cache requires a metadata store")
 	}
-	return Tiered{caches: caches, metadata: metadata, etags: tieredETags(metadata, ""), healer: newTieredHealer(ctx)}
+	return Tiered{
+		caches:    caches,
+		metadata:  metadata,
+		etags:     tieredETags(metadata, ""),
+		backfills: newTieredBackfills(ctx),
+	}
 }
 
 type authoritativeCache struct {
@@ -88,10 +93,9 @@ var _ Cache = (*Tiered)(nil)
 
 // Close all underlying caches.
 func (t Tiered) Close() error {
-	// Drain in-flight heals before closing the caches they operate on.
-	if t.healer != nil {
-		t.healer.cancel()
-		t.healer.wg.Wait()
+	// Drain opportunistic work before closing the caches it operates on.
+	if t.backfills != nil {
+		t.backfills.close()
 	}
 	wg := sync.WaitGroup{}
 	errs := make([]error, len(t.caches))
@@ -136,9 +140,7 @@ func (t Tiered) Create(ctx context.Context, key Key, headers http.Header, ttl ti
 	for i, cache := range t.caches {
 		go func() {
 			w, err := cache.Create(ctx, key, headers, ttl, createOpts...)
-			if w != nil || err != nil { // keep a nil writer detectable below
-				w = observeWriter(ctx, cache, i, w, err)
-			}
+			w = observeWriter(ctx, cache, i, w, err)
 			result := createResult{index: i, writer: w, err: err}
 			select {
 			case results <- result:
@@ -348,8 +350,8 @@ func StatAuthoritative(ctx context.Context, c Cache, key Key, opts ...Option) (h
 
 // Open returns a reader from the first cache that succeeds.
 // When a higher tier hits but lower tiers missed, the returned reader
-// transparently backfills the lowest tier as the caller reads, so that
-// subsequent Opens are served locally.
+// opportunistically backfills tier zero as the caller reads. Once the
+// asynchronous fill commits, subsequent Opens are served locally.
 //
 // A tier that holds a different version than the request's validators name —
 // a failed If-Match, or an If-Range miss — is not definitive: deeper tiers are
@@ -464,27 +466,29 @@ func discardTieredReader(ctx context.Context, key Key, r io.ReadCloser) {
 	}
 }
 
-// backfillReader wraps src so that every byte read is also written to dst.
-// On successful close the dst entry becomes available for future reads.
-// On error or partial read the dst entry is discarded per the Cache contract
-// (the context is cancelled, causing the writer to discard on Close).
+// backfillReader wraps src with an optional asynchronous fill. Admission,
+// writer creation, writes, and commit never block the caller; saturation or an
+// incomplete source stream discards only the fill.
 func (t Tiered) backfillReader(ctx context.Context, key Key, src io.ReadCloser, headers http.Header, dst Cache) io.ReadCloser {
-	ctx = metrics.WithCachePurpose(ctx, "backfill")
-	logger := logging.FromContext(ctx)
-	// Use a cancellable context so we can abort the write on failure.
-	// The Cache contract guarantees that cancelled-context writes are discarded.
-	writeCtx, cancel := context.WithCancel(ctx)
-	createOpts := backfillCreateOptions(headers)
-	ttl := cacheEntryTTL(headers, time.Now())
-	w, err := dst.Create(writeCtx, key, headers, ttl, createOpts...)
-	w = observeWriter(writeCtx, dst, 0, w, err)
-	if err != nil {
-		cancel()
-		metrics.RecordCacheFill(ctx, "create_error")
-		logger.WarnContext(ctx, "Tier backfill: failed to create writer, skipping", "error", err)
+	if t.backfills == nil {
 		return src
 	}
-	return newBackfillReadCloser(writeCtx, src, w, cancel)
+	servedETag := headers.Get(ETagKey)
+	rawETag, err := RawETagFromHeader(servedETag)
+	if err != nil {
+		return src
+	}
+	lease, ok := t.backfills.start(ctx, tieredBackfillKey{namespace: t.namespace, key: key, etag: servedETag}, "backfill")
+	if !ok {
+		return src
+	}
+	backfillHeaders := headers.Clone()
+	ttl := cacheEntryTTL(backfillHeaders, time.Now())
+	create := func(ctx context.Context) (Writer, error) {
+		w, err := dst.Create(ctx, key, backfillHeaders, ttl, WithETag(rawETag))
+		return observeWriter(ctx, dst, 0, w, err), err
+	}
+	return newBackfillReadCloser(src, create, lease)
 }
 
 const tieredETagsMap = "cache-etags"
@@ -523,67 +527,7 @@ func (t Tiered) invalidateStaleConditional(
 	return true
 }
 
-func backfillCreateOptions(headers http.Header) []Option {
-	rawETag, err := RawETagFromHeader(headers.Get(ETagKey))
-	if err != nil {
-		return nil
-	}
-	return []Option{WithETag(rawETag)}
-}
-
-const tieredHealTimeout = 5 * time.Minute
-
-type healKey struct {
-	namespace Namespace
-	key       Key
-}
-
-const tieredHealMaxConcurrency = 8
-
 var errHealSuperseded = errors.New("heal superseded by concurrent write")
-
-type tieredHealer struct {
-	mu       sync.Mutex
-	inflight map[healKey]struct{}
-	sem      chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-}
-
-func newTieredHealer(ctx context.Context) *tieredHealer {
-	hctx, cancel := context.WithCancel(context.WithoutCancel(ctx)) //nolint:gosec // cancel is stored and called in Close
-	return &tieredHealer{inflight: map[healKey]struct{}{}, sem: make(chan struct{}, tieredHealMaxConcurrency), ctx: hctx, cancel: cancel}
-}
-
-func (h *tieredHealer) trigger(reqCtx context.Context, id healKey, heal func(context.Context)) {
-	h.mu.Lock()
-	if _, ok := h.inflight[id]; ok {
-		h.mu.Unlock()
-		return
-	}
-	// Opportunistically skip when saturated; a later divergent read re-triggers.
-	select {
-	case h.sem <- struct{}{}:
-	default:
-		h.mu.Unlock()
-		return
-	}
-	h.inflight[id] = struct{}{}
-	h.mu.Unlock()
-
-	ctx := logging.ContextWithLogger(h.ctx, logging.FromContext(reqCtx))
-	ctx = metrics.ContinueArtifactRequest(ctx, reqCtx)
-	h.wg.Go(func() {
-		defer func() {
-			h.mu.Lock()
-			delete(h.inflight, id)
-			h.mu.Unlock()
-			<-h.sem
-		}()
-		heal(ctx)
-	})
-}
 
 func (t Tiered) convergeTier0(ctx context.Context, key Key, r io.ReadCloser, headers http.Header, source Cache, tier int, partial bool) io.ReadCloser {
 	switch {
@@ -600,7 +544,11 @@ func (t Tiered) convergeTier0(ctx context.Context, key Key, r io.ReadCloser, hea
 }
 
 func (t Tiered) healTier0(reqCtx context.Context, key Key, source Cache, servedETag string) {
-	if t.healer == nil || servedETag == "" {
+	if t.backfills == nil || servedETag == "" {
+		return
+	}
+	rawETag, err := RawETagFromHeader(servedETag)
+	if err != nil {
 		return
 	}
 	// Skip if tier 0 is legitimately newer than the served version, so a lagging
@@ -609,19 +557,15 @@ func (t Tiered) healTier0(reqCtx context.Context, key Key, source Cache, servedE
 	if !ok || want != servedETag {
 		return
 	}
-	t.healer.trigger(reqCtx, healKey{namespace: t.namespace, key: key}, func(ctx context.Context) {
-		t.backfillTier0FromSource(ctx, key, source, want)
+	t.backfills.trigger(reqCtx, tieredBackfillKey{namespace: t.namespace, key: key, etag: servedETag}, "heal", func(ctx context.Context) {
+		t.backfillTier0FromSource(ctx, key, source, want, rawETag)
 	})
 }
 
-func (t Tiered) backfillTier0FromSource(ctx context.Context, key Key, source Cache, wantETag string) {
-	ctx = metrics.WithCachePurpose(ctx, "heal")
+func (t Tiered) backfillTier0FromSource(ctx context.Context, key Key, source Cache, wantETag, rawETag string) {
 	logger := logging.FromContext(ctx)
 	result := writeSuccess
 	defer func() { metrics.RecordCacheFill(ctx, result) }()
-	ctx, cancel := context.WithTimeout(ctx, tieredHealTimeout)
-	defer cancel()
-
 	r, headers, err := source.Open(ctx, key, IfMatch(wantETag))
 	if err != nil {
 		result = "read_error"
@@ -635,7 +579,7 @@ func (t Tiered) backfillTier0FromSource(ctx context.Context, key Key, source Cac
 	}
 
 	ttl := cacheEntryTTL(headers, time.Now())
-	w, err := t.caches[0].Create(ctx, key, headers, ttl, backfillCreateOptions(headers)...)
+	w, err := t.caches[0].Create(ctx, key, headers, ttl, WithETag(rawETag))
 	w = observeWriter(ctx, t.caches[0], 0, w, err)
 	if err != nil {
 		result = "create_error"
@@ -663,128 +607,6 @@ func (t Tiered) backfillTier0FromSource(ctx context.Context, key Key, source Cac
 	} else if ctx.Err() != nil {
 		result = writeCanceled
 	}
-}
-
-// backfillReadCloser tees reads from src into dst asynchronously. Chunks are
-// sent to a background goroutine via a buffered channel so the Read path is
-// never blocked by disk I/O (up to ~32 MB of buffer). Only a stream consumed
-// through to io.EOF commits the dst entry; a mid-stream read error or a Close
-// before EOF cancels the write context so the partial entry is discarded. On
-// any write failure the backfill is abandoned but reads continue unaffected.
-type backfillReadCloser struct {
-	src     io.ReadCloser
-	ch      chan []byte
-	ctx     context.Context
-	cancel  context.CancelFunc
-	done    chan error
-	closeMu sync.Mutex
-	closed  bool
-	eof     bool
-}
-
-const backfillBufSize = 128 // number of chunks buffered (~32 MB at 256 KB each)
-
-func newBackfillReadCloser(ctx context.Context, src io.ReadCloser, dst io.WriteCloser, cancel context.CancelFunc) *backfillReadCloser {
-	ch := make(chan []byte, backfillBufSize)
-	done := make(chan error, 1)
-	b := &backfillReadCloser{src: src, ch: ch, ctx: ctx, cancel: cancel, done: done}
-	go func() {
-		var err error
-		for chunk := range ch {
-			if err == nil {
-				if _, wErr := dst.Write(chunk); wErr != nil {
-					logging.FromContext(ctx).WarnContext(ctx, "Tier backfill: write failed, abandoning", "error", wErr)
-					err = wErr
-					cancel()
-					// Keep draining the channel so the producer isn't blocked.
-				}
-			}
-		}
-		closeErr := dst.Close()
-		result := writeSuccess
-		switch {
-		case err != nil:
-			result = "write_error"
-		case ctx.Err() != nil:
-			result = writeCanceled
-		case closeErr != nil:
-			result = writeCommitError
-		}
-		metrics.RecordCacheFill(ctx, result)
-		switch {
-		case err != nil:
-			done <- err
-		case closeErr != nil:
-			cancel()
-			done <- closeErr
-		default:
-			done <- nil
-		}
-	}()
-	return b
-}
-
-func (b *backfillReadCloser) closeChan() {
-	b.closeMu.Lock()
-	defer b.closeMu.Unlock()
-	if !b.closed {
-		b.closed = true
-		close(b.ch)
-	}
-}
-
-func (b *backfillReadCloser) Read(p []byte) (int, error) {
-	n, err := b.src.Read(p)
-	if n > 0 {
-		b.closeMu.Lock()
-		if !b.closed {
-			// Copy the data — p is reused by the caller.
-			chunk := make([]byte, n)
-			copy(chunk, p[:n])
-			select {
-			case b.ch <- chunk:
-			default:
-				// Buffer full — abandon backfill.
-				b.closed = true
-				close(b.ch)
-				b.cancel()
-			}
-		}
-		b.closeMu.Unlock()
-	}
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			b.closeMu.Lock()
-			b.eof = true
-			b.closeMu.Unlock()
-		} else {
-			// Mid-stream failure: cancel so the writer discards the partial
-			// entry instead of committing a truncated object.
-			b.cancel()
-		}
-		b.closeChan()
-	}
-	return n, err //nolint:wrapcheck // must return unwrapped io.EOF per io.Reader contract
-}
-
-func (b *backfillReadCloser) Close() error {
-	srcErr := b.src.Close()
-	b.closeMu.Lock()
-	complete := b.eof
-	b.closeMu.Unlock()
-	if !complete {
-		// Closed before EOF: the stream was abandoned or failed, so the
-		// partial entry must be discarded, not committed.
-		b.cancel()
-	}
-	b.closeChan()
-	// Wait for the background writer to finish.
-	bgErr := <-b.done
-	if srcErr != nil || bgErr != nil {
-		b.cancel()
-		return errors.WithStack(srcErr)
-	}
-	return nil
 }
 
 func (t Tiered) String() string {
@@ -890,7 +712,13 @@ func (t Tiered) Namespace(namespace Namespace) Cache {
 	for i, c := range t.caches {
 		namespaced[i] = c.Namespace(namespace)
 	}
-	return Tiered{caches: namespaced, metadata: t.metadata, etags: tieredETags(t.metadata, namespace), namespace: namespace, healer: t.healer}
+	return Tiered{
+		caches:    namespaced,
+		metadata:  t.metadata,
+		etags:     tieredETags(t.metadata, namespace),
+		namespace: namespace,
+		backfills: t.backfills,
+	}
 }
 
 // ListNamespaces returns unique namespaces from all underlying caches.

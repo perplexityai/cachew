@@ -27,26 +27,28 @@ func TestObservedBackfillEarlyClose(t *testing.T) {
 	defer func() { otel.SetMeterProvider(previous); assert.NoError(t, provider.Shutdown(context.Background())) }()
 	_, ctx := logging.Configure(t.Context(), logging.Config{})
 	ctx = metrics.NewArtifactMetrics().WithRequest(ctx, "host", "registry.example", true)
-	ctx = metrics.WithCachePurpose(ctx, "backfill")
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	c, err := NewMemory(ctx, MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()
 	key := NewKey("artifact")
-	w, err := c.Create(ctx, key, nil, time.Hour)
-	assert.NoError(t, err)
-	w = observeWriter(ctx, c, 0, w, nil)
-	r := newBackfillReadCloser(ctx, io.NopCloser(strings.NewReader("artifact")), w, cancel)
+	backfills := newTieredBackfills(ctx)
+	lease, ok := backfills.start(ctx, tieredBackfillKey{key: key, etag: "v1"}, "backfill")
+	assert.True(t, ok)
+	r := newBackfillReadCloser(io.NopCloser(strings.NewReader("artifact")), func(ctx context.Context) (Writer, error) {
+		w, err := c.Create(ctx, key, nil, time.Hour)
+		return observeWriter(ctx, c, 0, w, err), err
+	}, lease)
 	p := make([]byte, 2)
 	_, err = r.Read(p)
 	assert.NoError(t, err)
 	assert.NoError(t, r.Close())
+	backfills.close() // waits for the asynchronous writer to finish
 	_, _, err = c.Open(t.Context(), key)
 	assert.IsError(t, err, os.ErrNotExist)
 	var data metricdata.ResourceMetrics
 	assert.NoError(t, reader.Collect(t.Context(), &data))
-	for _, name := range []string{"cachew.cache.fills", "cachew.cache.tier_writes"} {
+	// The fill was canceled; its writer was aborted before commit.
+	for name, want := range map[string]string{"cachew.cache.fills": "canceled", "cachew.cache.tier_writes": "aborted"} {
 		count := int64(0)
 		for _, scope := range data.ScopeMetrics {
 			for _, m := range scope.Metrics {
@@ -56,7 +58,7 @@ func TestObservedBackfillEarlyClose(t *testing.T) {
 				sum := m.Data.(metricdata.Sum[int64])
 				for _, point := range sum.DataPoints {
 					result, _ := point.Attributes.Value("result")
-					assert.Equal(t, "canceled", result.AsString())
+					assert.Equal(t, want, result.AsString())
 					count += point.Value
 				}
 			}

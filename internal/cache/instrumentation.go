@@ -51,6 +51,9 @@ func observeWriter(ctx context.Context, c Cache, tier int, w Writer, err error) 
 		metrics.RecordCacheWrite(ctx, backend, tier, "create_error")
 		return w
 	}
+	if w == nil {
+		return nil // keep a broken backend's nil writer detectable by callers
+	}
 	return &observedWriter{Writer: w, ctx: ctx, backend: backend, tier: tier}
 }
 
