@@ -87,6 +87,10 @@ var ErrRangeNotSatisfiable = client.ErrRangeNotSatisfiable
 // ErrStatsUnavailable is returned when a cache backend cannot provide statistics.
 var ErrStatsUnavailable = client.ErrStatsUnavailable
 
+// ErrTierUnavailable reports a transient local-tier failure that a tiered
+// cache may bypass while consulting deeper storage.
+var ErrTierUnavailable = errors.New("cache tier unavailable")
+
 type registryEntry struct {
 	schema  *hcl.Block
 	factory func(ctx context.Context, config *hcl.Block, vars map[string]string) (Cache, error)
