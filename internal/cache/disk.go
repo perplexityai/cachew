@@ -32,22 +32,27 @@ func RegisterDisk(r *Registry) {
 }
 
 type DiskConfig struct {
-	Root          string        `hcl:"root,optional" help:"Root directory for the disk storage." default:"${CACHEW_STATE}/cache"`
-	LimitMB       int           `hcl:"limit-mb,optional" help:"Maximum size of the disk cache in megabytes (defaults to 10GB)." default:"10240"`
-	MaxTTL        time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
-	EvictInterval time.Duration `hcl:"evict-interval,optional" help:"Interval at which to check files for eviction (defaults to 1 minute)." default:"1m"`
+	Root             string        `hcl:"root,optional" help:"Root directory for the disk storage." default:"${CACHEW_STATE}/cache"`
+	LimitMB          int           `hcl:"limit-mb,optional" help:"Maximum size of the disk cache in megabytes (defaults to 10GB)." default:"10240"`
+	MaxTTL           time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
+	EvictInterval    time.Duration `hcl:"evict-interval,optional" help:"Interval at which to check files for eviction (defaults to 1 minute)." default:"1m"`
+	ReadConcurrency  int           `hcl:"read-concurrency,optional" help:"Maximum concurrent disk setup/read operations and, separately, reader close operations (defaults to 64)." default:"64"`
+	OpenReaderLimit  int           `hcl:"open-reader-limit,optional" help:"Maximum concurrent Open lifecycles, including readers awaiting cleanup (defaults to 4096)." default:"4096"`
+	OperationTimeout time.Duration `hcl:"operation-timeout,optional" help:"Maximum disk Open, Stat, and reader Close latency (defaults to 2 seconds)." default:"2s"`
+	ReadIdleTimeout  time.Duration `hcl:"read-idle-timeout,optional" help:"Maximum time a disk body Read may make no progress (defaults to 30 seconds)." default:"30s"`
 }
 
 type Disk struct {
-	logger       *slog.Logger
-	config       DiskConfig
-	namespace    Namespace
-	db           *diskMetaDB
-	size         *atomic.Int64
-	runEviction  chan struct{}
-	stop         context.CancelFunc
-	evictionDone chan struct{}
-	locks        *[diskLockStripes]sync.RWMutex
+	logger        *slog.Logger
+	config        DiskConfig
+	namespace     Namespace
+	db            *diskMetaDB
+	size          *atomic.Int64
+	runEviction   chan struct{}
+	stop          context.CancelFunc
+	evictionDone  chan struct{}
+	locks         *[diskLockStripes]sync.RWMutex
+	readIsolation *diskReadIsolation
 }
 
 const diskLockStripes = 1024
@@ -75,6 +80,30 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	}
 	if config.EvictInterval == 0 {
 		config.EvictInterval = time.Minute
+	}
+	if config.ReadConcurrency == 0 {
+		config.ReadConcurrency = defaultDiskReadConcurrency
+	}
+	if config.OpenReaderLimit == 0 {
+		config.OpenReaderLimit = defaultDiskOpenReaderLimit
+	}
+	if config.OperationTimeout == 0 {
+		config.OperationTimeout = defaultDiskOperationTimeout
+	}
+	if config.ReadIdleTimeout == 0 {
+		config.ReadIdleTimeout = defaultDiskReadIdleTimeout
+	}
+	if config.ReadConcurrency < 0 || config.ReadConcurrency > maxDiskReadConcurrency {
+		return nil, errors.Errorf("read-concurrency must be non-negative and at most %d", maxDiskReadConcurrency)
+	}
+	if config.OpenReaderLimit < 0 || config.OpenReaderLimit > maxDiskOpenReaderLimit {
+		return nil, errors.Errorf("open-reader-limit must be non-negative and at most %d", maxDiskOpenReaderLimit)
+	}
+	if config.OperationTimeout < 0 {
+		return nil, errors.New("operation-timeout must not be negative")
+	}
+	if config.ReadIdleTimeout < 0 {
+		return nil, errors.New("read-idle-timeout must not be negative")
 	}
 	var err error
 	config.Root, err = filepath.Abs(config.Root)
@@ -117,14 +146,15 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	ctx, stop := context.WithCancel(ctx)
 
 	disk := &Disk{
-		logger:       logger,
-		config:       config,
-		db:           db,
-		size:         &atomic.Int64{},
-		runEviction:  make(chan struct{}),
-		stop:         stop,
-		evictionDone: make(chan struct{}),
-		locks:        &[diskLockStripes]sync.RWMutex{},
+		logger:        logger,
+		config:        config,
+		db:            db,
+		size:          &atomic.Int64{},
+		runEviction:   make(chan struct{}),
+		stop:          stop,
+		evictionDone:  make(chan struct{}),
+		locks:         &[diskLockStripes]sync.RWMutex{},
+		readIsolation: newDiskReadIsolation(ctx, config),
 	}
 	disk.size.Store(size)
 
@@ -258,6 +288,12 @@ func (d *Disk) Invalidate(ctx context.Context, key Key) error {
 }
 
 func (d *Disk) Stat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
+	return d.readIsolation.stat(ctx, func(opCtx context.Context) (http.Header, error) {
+		return d.statDirect(opCtx, key, opts...)
+	})
+}
+
+func (d *Disk) statDirect(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
 	path := d.keyToPath(d.namespace, key)
 	fullPath := filepath.Join(d.config.Root, path)
 
@@ -298,56 +334,74 @@ func (d *Disk) openLocked(key Key, fullPath string, now time.Time) (f *os.File, 
 	}
 	expiresAt, err := d.db.getTTL(d.namespace, key)
 	if err != nil {
-		return nil, nil, false, errors.Join(err, f.Close())
+		return f, nil, false, errors.WithStack(err)
 	}
 	if now.After(expiresAt) {
 		return f, nil, true, nil
 	}
 	headers, err = d.db.getHeaders(d.namespace, key)
 	if err != nil {
-		return nil, nil, false, errors.Join(errors.Errorf("failed to get headers: %w", err), f.Close())
+		return f, nil, false, errors.Errorf("failed to get headers: %w", err)
 	}
 	ttl := min(expiresAt.Sub(now), d.config.MaxTTL)
 	if err := d.db.setTTL(d.namespace, key, now.Add(ttl)); err != nil {
-		return nil, nil, false, errors.Join(errors.Errorf("failed to update expiration time: %w", err), f.Close())
+		return f, nil, false, errors.Errorf("failed to update expiration time: %w", err)
 	}
 	return f, headers, false, nil
 }
 
 func (d *Disk) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
+	return d.readIsolation.open(ctx, func(opCtx context.Context) (io.ReadCloser, http.Header, error) {
+		return d.openDirect(opCtx, key, opts...)
+	})
+}
+
+func (d *Disk) openDirect(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
 	path := d.keyToPath(d.namespace, key)
 	fullPath := filepath.Join(d.config.Root, path)
 
 	f, headers, expired, err := d.openLocked(key, fullPath, time.Now())
 	if err != nil {
-		return nil, nil, err
+		return f, nil, err
 	}
 	if expired {
-		return nil, nil, errors.Join(fs.ErrNotExist, f.Close(), d.Delete(ctx, key))
+		return &diskCleanupReader{
+			ReadCloser: f,
+			cleanup:    func() error { return d.Invalidate(context.WithoutCancel(ctx), key) },
+		}, nil, fs.ErrNotExist
 	}
 
 	finfo, err := f.Stat()
 	if err != nil {
-		return nil, nil, errors.Join(errors.Errorf("failed to stat file for size: %w", err), f.Close())
+		return f, nil, errors.Errorf("failed to stat file for size: %w", err)
 	}
 	headers.Set("Content-Length", strconv.FormatInt(finfo.Size(), 10))
 
 	if h, condErr := conditionalShortCircuit(headers, opts); condErr != nil {
-		return nil, h, errors.Join(condErr, f.Close())
+		return f, h, condErr
 	}
 
 	start, length, partial, rangeErr := rangeShortCircuit(headers, finfo.Size(), opts)
 	if rangeErr != nil {
-		return nil, headers, errors.Join(rangeErr, f.Close())
+		return f, headers, rangeErr
 	}
 	if partial {
 		if _, err := f.Seek(start, io.SeekStart); err != nil {
-			return nil, headers, errors.Join(errors.Errorf("failed to seek for range: %w", err), f.Close())
+			return f, headers, errors.Errorf("failed to seek for range: %w", err)
 		}
 		return newLimitedReadCloser(f, length), headers, nil
 	}
 
 	return f, headers, nil
+}
+
+type diskCleanupReader struct {
+	io.ReadCloser
+	cleanup func() error
+}
+
+func (r *diskCleanupReader) Close() error {
+	return errors.Join(r.ReadCloser.Close(), r.cleanup())
 }
 
 func (d *Disk) keyToPath(namespace Namespace, key Key) string {
