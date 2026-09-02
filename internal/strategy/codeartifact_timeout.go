@@ -33,9 +33,6 @@ func newCodeArtifactOriginBody(
 	cancel context.CancelCauseFunc,
 	timeout time.Duration,
 ) io.ReadCloser {
-	if timeout <= 0 {
-		timeout = defaultCodeArtifactOriginReadIdleTimeout
-	}
 	return &codeArtifactOriginBody{body: body, ctx: ctx, cancel: cancel, timeout: timeout}
 }
 
