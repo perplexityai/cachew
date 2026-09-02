@@ -239,7 +239,7 @@ func (t Tiered) Stat(ctx context.Context, key Key, opts ...Option) (http.Header,
 			continue
 		}
 		switch {
-		case errors.Is(err, os.ErrNotExist):
+		case errors.Is(err, os.ErrNotExist) || (errors.Is(err, ErrTierUnavailable) && i < len(t.caches)-1):
 			continue
 		case errors.Is(err, ErrPreconditionFailed):
 			rejected = true
@@ -341,7 +341,7 @@ func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.R
 		r, headers, err = unexpiredCacheResult(r, headers, err, time.Now())
 		errs[i] = err
 		switch {
-		case errors.Is(err, os.ErrNotExist):
+		case errors.Is(err, os.ErrNotExist) || (errors.Is(err, ErrTierUnavailable) && i < len(t.caches)-1):
 			continue
 		case errors.Is(err, ErrPreconditionFailed):
 			rejected = true

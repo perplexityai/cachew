@@ -33,6 +33,26 @@ func TestDiskCache(t *testing.T) {
 	})
 }
 
+func TestDiskRejectsInvalidReadIsolationConfig(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	tests := []struct {
+		name   string
+		config cache.DiskConfig
+	}{
+		{name: "negative concurrency", config: cache.DiskConfig{ReadConcurrency: -1}},
+		{name: "excessive concurrency", config: cache.DiskConfig{ReadConcurrency: 4097}},
+		{name: "negative operation timeout", config: cache.DiskConfig{OperationTimeout: -1}},
+		{name: "negative read idle timeout", config: cache.DiskConfig{ReadIdleTimeout: -1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.config.Root = t.TempDir()
+			_, err := cache.NewDisk(ctx, tt.config)
+			assert.Error(t, err)
+		})
+	}
+}
+
 func TestDiskCacheSoak(t *testing.T) {
 	if os.Getenv("SOAK_TEST") == "" {
 		t.Skip("Skipping soak test; set SOAK_TEST=1 to run")
@@ -138,4 +158,45 @@ func TestDiskOpenRevisionAtomic(t *testing.T) {
 		close(stop)
 	}()
 	wg.Wait()
+}
+
+func BenchmarkDiskHit(b *testing.B) {
+	_, ctx := logging.Configure(b.Context(), logging.Config{Level: slog.LevelError})
+	c, err := cache.NewDisk(ctx, cache.DiskConfig{Root: b.TempDir(), MaxTTL: time.Hour})
+	assert.NoError(b, err)
+	b.Cleanup(func() { assert.NoError(b, c.Close()) })
+	key := cache.NewKey("benchmark-disk-hit")
+	body := bytes.Repeat([]byte{0x5a}, 4<<20)
+	writer, err := c.Create(ctx, key, http.Header{}, time.Hour)
+	assert.NoError(b, err)
+	_, err = writer.Write(body)
+	assert.NoError(b, err)
+	assert.NoError(b, writer.Close())
+	read := func(b *testing.B) {
+		b.Helper()
+		reader, _, err := c.Open(ctx, key)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			b.Fatal(err)
+		}
+		if err := reader.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.Run("Sequential", func(b *testing.B) {
+		b.SetBytes(int64(len(body)))
+		for range b.N {
+			read(b)
+		}
+	})
+	b.Run("Parallel", func(b *testing.B) {
+		b.SetBytes(int64(len(body)))
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				read(b)
+			}
+		})
+	})
 }

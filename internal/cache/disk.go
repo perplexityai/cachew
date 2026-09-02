@@ -32,10 +32,13 @@ func RegisterDisk(r *Registry) {
 }
 
 type DiskConfig struct {
-	Root          string        `hcl:"root,optional" help:"Root directory for the disk storage." default:"${CACHEW_STATE}/cache"`
-	LimitMB       int           `hcl:"limit-mb,optional" help:"Maximum size of the disk cache in megabytes (defaults to 10GB)." default:"10240"`
-	MaxTTL        time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
-	EvictInterval time.Duration `hcl:"evict-interval,optional" help:"Interval at which to check files for eviction (defaults to 1 minute)." default:"1m"`
+	Root             string        `hcl:"root,optional" help:"Root directory for the disk storage." default:"${CACHEW_STATE}/cache"`
+	LimitMB          int           `hcl:"limit-mb,optional" help:"Maximum size of the disk cache in megabytes (defaults to 10GB)." default:"10240"`
+	MaxTTL           time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
+	EvictInterval    time.Duration `hcl:"evict-interval,optional" help:"Interval at which to check files for eviction (defaults to 1 minute)." default:"1m"`
+	ReadConcurrency  int           `hcl:"read-concurrency,optional" help:"Maximum concurrent disk read lifecycles (defaults to 64)." default:"64"`
+	OperationTimeout time.Duration `hcl:"operation-timeout,optional" help:"Maximum disk Open, Stat, and reader Close latency (defaults to 2 seconds)." default:"2s"`
+	ReadIdleTimeout  time.Duration `hcl:"read-idle-timeout,optional" help:"Maximum time a disk body Read may make no progress (defaults to 30 seconds)." default:"30s"`
 }
 
 type Disk struct {
@@ -48,6 +51,7 @@ type Disk struct {
 	stop         context.CancelFunc
 	evictionDone chan struct{}
 	locks        *[diskLockStripes]sync.RWMutex
+	reads        *diskReadIsolation
 }
 
 const diskLockStripes = 1024
@@ -75,6 +79,24 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	}
 	if config.EvictInterval == 0 {
 		config.EvictInterval = time.Minute
+	}
+	if config.ReadConcurrency == 0 {
+		config.ReadConcurrency = defaultDiskReadConcurrency
+	}
+	if config.OperationTimeout == 0 {
+		config.OperationTimeout = defaultDiskOperationTimeout
+	}
+	if config.ReadIdleTimeout == 0 {
+		config.ReadIdleTimeout = defaultDiskReadIdleTimeout
+	}
+	if config.ReadConcurrency < 0 || config.ReadConcurrency > maxDiskReadConcurrency {
+		return nil, errors.Errorf("read-concurrency must be non-negative and at most %d", maxDiskReadConcurrency)
+	}
+	if config.OperationTimeout < 0 {
+		return nil, errors.New("operation-timeout must be positive")
+	}
+	if config.ReadIdleTimeout < 0 {
+		return nil, errors.New("read-idle-timeout must be positive")
 	}
 	var err error
 	config.Root, err = filepath.Abs(config.Root)
@@ -125,6 +147,7 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 		stop:         stop,
 		evictionDone: make(chan struct{}),
 		locks:        &[diskLockStripes]sync.RWMutex{},
+		reads:        newDiskReadIsolation(ctx, config.ReadConcurrency, config.OperationTimeout, config.ReadIdleTimeout),
 	}
 	disk.size.Store(size)
 
@@ -258,6 +281,12 @@ func (d *Disk) Invalidate(ctx context.Context, key Key) error {
 }
 
 func (d *Disk) Stat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
+	return d.reads.stat(ctx, func(opCtx context.Context) (http.Header, error) {
+		return d.statDirect(opCtx, key, opts...)
+	})
+}
+
+func (d *Disk) statDirect(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
 	path := d.keyToPath(d.namespace, key)
 	fullPath := filepath.Join(d.config.Root, path)
 
@@ -315,6 +344,12 @@ func (d *Disk) openLocked(key Key, fullPath string, now time.Time) (f *os.File, 
 }
 
 func (d *Disk) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
+	return d.reads.open(ctx, func(opCtx context.Context) (io.ReadCloser, http.Header, error) {
+		return d.openDirect(opCtx, key, opts...)
+	})
+}
+
+func (d *Disk) openDirect(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
 	path := d.keyToPath(d.namespace, key)
 	fullPath := filepath.Join(d.config.Root, path)
 

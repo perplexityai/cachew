@@ -230,10 +230,23 @@ memory {
 
 On-disk LRU cache with TTL-based eviction.
 
+Disk reads are isolated behind a fixed lifecycle budget. A slot covers `Stat`
+or the complete `Open` → body `Read` → reader `Close` sequence, so a blocked
+filesystem call can strand only bounded resources. `operation-timeout` applies
+to setup and close; `read-idle-timeout` resets whenever the body makes progress
+and does not cap the total transfer duration. A timeout temporarily marks disk
+reads degraded, and tiered caches bypass the local disk tier for deeper storage.
+The request whose body stalls still fails because its response may already have
+started; subsequent requests can fall through. Saturation also bypasses disk
+without queueing.
+
 ```hcl
 disk {
-  limit-mb = 250000
-  max-ttl  = "8h"
+  limit-mb          = 250000
+  max-ttl           = "8h"
+  read-concurrency  = 64
+  operation-timeout = "2s"
+  read-idle-timeout = "30s"
 }
 ```
 
@@ -436,8 +449,11 @@ host "https://ghcr.io" {
 }
 
 disk {
-  limit-mb = 250000
-  max-ttl  = "8h"
+  limit-mb          = 250000
+  max-ttl           = "8h"
+  read-concurrency  = 64
+  operation-timeout = "2s"
+  read-idle-timeout = "30s"
 }
 
 proxy {}
