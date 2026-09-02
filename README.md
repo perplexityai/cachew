@@ -426,6 +426,24 @@ cachew git restore <repo-url> <directory> [--no-bundle]
 
 **Global flags:** `--url` (`CACHEW_URL`), `--authorization` (`CACHEW_AUTHORIZATION`), `--platform` (prefix keys with `os-arch`), `--daily`/`--hourly` (prefix keys with date).
 
+## Request Admission
+
+Request admission is disabled by default for compatibility. A positive limit
+adds a non-blocking process-wide ceiling held through response completion.
+Normal traffic is capped at `limit - reserved` slots. Liveness, readiness, and
+authorized `/admin` requests may use any available slot up to `limit`; the
+reserve is protected capacity for those requests, not a cap on them. Saturated
+requests receive HTTP 503 with `Retry-After: 1` instead of waiting in-process.
+
+```hcl
+request-admission {
+  limit    = 512
+  reserved = 8
+}
+```
+
+`reserved` defaults to zero and must be smaller than a positive `limit`.
+
 ## Observability
 
 ```hcl
@@ -488,6 +506,11 @@ Use `cachew.cache.result` and `cachew.cache.source` to compare local/shared hits
 state = "./state"
 bind  = "0.0.0.0:8080"
 url   = "http://cachew.example.com:8080/"
+
+request-admission {
+  limit    = 512
+  reserved = 8
+}
 
 log {
   level = "info"
