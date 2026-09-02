@@ -3,6 +3,8 @@ package admission_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,14 @@ import (
 )
 
 const admissionTestTimeout = 2 * time.Second
+
+func observeAdmissionPeak(peak *atomic.Int64, current int64) {
+	for previous := peak.Load(); current > previous; previous = peak.Load() {
+		if peak.CompareAndSwap(previous, current) {
+			return
+		}
+	}
+}
 
 func startAdmissionRequest(handler http.Handler, path string) <-chan int {
 	result := make(chan int, 1)
@@ -161,4 +171,77 @@ func TestAdmissionDisabledPassesThrough(t *testing.T) {
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/artifact", nil))
 	assert.Equal(t, http.StatusCreated, w.Code)
+}
+
+func TestAdmissionConcurrentRequestsStayWithinLimits(t *testing.T) {
+	const (
+		limit        = 8
+		reserved     = 2
+		requestCount = 64
+	)
+	limiter, err := admission.New(admission.Config{Limit: limit, Reserved: reserved})
+	assert.NoError(t, err)
+	entered := make(chan struct{}, limit)
+	release := make(chan struct{})
+	var activeTotal atomic.Int64
+	var activeNormal atomic.Int64
+	var peakTotal atomic.Int64
+	var peakNormal atomic.Int64
+	handler := limiter.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		total := activeTotal.Add(1)
+		observeAdmissionPeak(&peakTotal, total)
+		normal := r.URL.Path != "/_readiness"
+		if normal {
+			observeAdmissionPeak(&peakNormal, activeNormal.Add(1))
+		}
+		entered <- struct{}{}
+		<-release
+		if normal {
+			activeNormal.Add(-1)
+		}
+		activeTotal.Add(-1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	start := make(chan struct{})
+	results := make(chan int, requestCount)
+	var wait sync.WaitGroup
+	for index := range requestCount {
+		wait.Go(func() {
+			<-start
+			path := "/artifact"
+			if index%2 == 0 {
+				path = "/_readiness"
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+			results <- response.Code
+		})
+	}
+	close(start)
+	for range limit {
+		select {
+		case <-entered:
+		case <-time.After(admissionTestTimeout):
+			t.Fatal("admission did not fill configured capacity")
+		}
+	}
+	for range requestCount - limit {
+		select {
+		case status := <-results:
+			assert.Equal(t, http.StatusServiceUnavailable, status)
+		case <-time.After(admissionTestTimeout):
+			t.Fatal("saturated request did not fail without queueing")
+		}
+	}
+	close(release)
+	wait.Wait()
+	for range limit {
+		assert.Equal(t, http.StatusNoContent, <-results)
+	}
+
+	assert.True(t, peakTotal.Load() <= limit)
+	assert.True(t, peakNormal.Load() <= limit-reserved)
+	assert.Equal(t, int64(0), activeTotal.Load())
+	assert.Equal(t, int64(0), activeNormal.Load())
 }
