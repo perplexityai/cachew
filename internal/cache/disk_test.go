@@ -41,6 +41,8 @@ func TestDiskRejectsInvalidReadIsolationConfig(t *testing.T) {
 	}{
 		{name: "negative concurrency", config: cache.DiskConfig{ReadConcurrency: -1}},
 		{name: "excessive concurrency", config: cache.DiskConfig{ReadConcurrency: 4097}},
+		{name: "negative open reader limit", config: cache.DiskConfig{OpenReaderLimit: -1}},
+		{name: "excessive open reader limit", config: cache.DiskConfig{OpenReaderLimit: 65537}},
 		{name: "negative operation timeout", config: cache.DiskConfig{OperationTimeout: -1}},
 		{name: "negative read idle timeout", config: cache.DiskConfig{ReadIdleTimeout: -1}},
 	}

@@ -15,6 +15,7 @@ type diskReadEvent string
 const (
 	diskReadEventBreakerTrip       diskReadEvent = "breaker_trip"
 	diskReadEventAuthoritativeMiss diskReadEvent = "authoritative_miss"
+	diskReadEventReaderLimit       diskReadEvent = "reader_limit"
 )
 
 type diskReadOperation string
@@ -48,7 +49,7 @@ func newDiskMetrics() diskMetricRecorder {
 			meter,
 			"cachew.disk.read_events_total",
 			"{events}",
-			"Disk read breaker trips and authoritative misses, by operation and tier",
+			"Disk read breaker trips, reader-limit rejections, and authoritative misses, by operation and tier",
 		),
 	}
 }

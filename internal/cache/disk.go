@@ -37,6 +37,7 @@ type DiskConfig struct {
 	MaxTTL           time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
 	EvictInterval    time.Duration `hcl:"evict-interval,optional" help:"Interval at which to check files for eviction (defaults to 1 minute)." default:"1m"`
 	ReadConcurrency  int           `hcl:"read-concurrency,optional" help:"Maximum concurrent disk setup/read operations and, separately, reader close operations (defaults to 64)." default:"64"`
+	OpenReaderLimit  int           `hcl:"open-reader-limit,optional" help:"Maximum concurrent Open lifecycles, including readers awaiting cleanup (defaults to 4096)." default:"4096"`
 	OperationTimeout time.Duration `hcl:"operation-timeout,optional" help:"Maximum disk Open, Stat, and reader Close latency (defaults to 2 seconds)." default:"2s"`
 	ReadIdleTimeout  time.Duration `hcl:"read-idle-timeout,optional" help:"Maximum time a disk body Read may make no progress (defaults to 30 seconds)." default:"30s"`
 }
@@ -83,6 +84,9 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	if config.ReadConcurrency == 0 {
 		config.ReadConcurrency = defaultDiskReadConcurrency
 	}
+	if config.OpenReaderLimit == 0 {
+		config.OpenReaderLimit = defaultDiskOpenReaderLimit
+	}
 	if config.OperationTimeout == 0 {
 		config.OperationTimeout = defaultDiskOperationTimeout
 	}
@@ -91,6 +95,9 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	}
 	if config.ReadConcurrency < 0 || config.ReadConcurrency > maxDiskReadConcurrency {
 		return nil, errors.Errorf("read-concurrency must be non-negative and at most %d", maxDiskReadConcurrency)
+	}
+	if config.OpenReaderLimit < 0 || config.OpenReaderLimit > maxDiskOpenReaderLimit {
+		return nil, errors.Errorf("open-reader-limit must be non-negative and at most %d", maxDiskOpenReaderLimit)
 	}
 	if config.OperationTimeout < 0 {
 		return nil, errors.New("operation-timeout must not be negative")
@@ -147,7 +154,7 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 		stop:         stop,
 		evictionDone: make(chan struct{}),
 		locks:        &[diskLockStripes]sync.RWMutex{},
-		reads:        newDiskReadIsolation(ctx, config.ReadConcurrency, config.OperationTimeout, config.ReadIdleTimeout),
+		reads:        newDiskReadIsolation(ctx, config),
 	}
 	disk.size.Store(size)
 

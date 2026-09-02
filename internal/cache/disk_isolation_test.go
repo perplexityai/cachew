@@ -68,8 +68,32 @@ func waitForDiskCloseSlots(t *testing.T, isolation *diskReadIsolation) {
 	assert.Equal(t, 0, len(isolation.closeSlots))
 }
 
+func waitForDiskReaderSlots(t *testing.T, isolation *diskReadIsolation) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for len(isolation.readerSlots) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	assert.Equal(t, 0, len(isolation.readerSlots))
+}
+
+func newTestDiskReadIsolation(
+	t *testing.T,
+	concurrency int,
+	operationTimeout time.Duration,
+	readIdleTimeout time.Duration,
+) *diskReadIsolation {
+	t.Helper()
+	return newDiskReadIsolation(t.Context(), DiskConfig{
+		ReadConcurrency:  concurrency,
+		OpenReaderLimit:  defaultDiskOpenReaderLimit,
+		OperationTimeout: operationTimeout,
+		ReadIdleTimeout:  readIdleTimeout,
+	})
+}
+
 func TestDiskReadIsolationTimesOutBlockedStat(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, diskIsolationTestTimeout, time.Second)
+	isolation := newTestDiskReadIsolation(t, 1, diskIsolationTestTimeout, time.Second)
 	metrics := &recordingDiskMetrics{}
 	isolation.metrics = metrics
 	started := make(chan struct{})
@@ -102,7 +126,7 @@ func TestDiskReadIsolationTimesOutBlockedStat(t *testing.T) {
 }
 
 func TestDiskReadIsolationTimesOutBlockedOpen(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, diskIsolationTestTimeout, time.Second)
+	isolation := newTestDiskReadIsolation(t, 1, diskIsolationTestTimeout, time.Second)
 	started := make(chan struct{})
 	release := make(chan struct{})
 
@@ -118,7 +142,7 @@ func TestDiskReadIsolationTimesOutBlockedOpen(t *testing.T) {
 }
 
 func TestDiskReadIsolationBoundsBlockedOpen(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 2, time.Hour, time.Hour)
+	isolation := newTestDiskReadIsolation(t, 2, time.Hour, time.Hour)
 	release := make(chan struct{})
 	started := make(chan struct{}, 2)
 	results := make(chan error, 2)
@@ -159,7 +183,7 @@ func TestDiskReadIsolationBoundsBlockedOpen(t *testing.T) {
 }
 
 func TestDiskReadIsolationDoesNotHoldSlotAcrossReaderLifetime(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, time.Second, time.Second)
+	isolation := newTestDiskReadIsolation(t, 1, time.Second, time.Second)
 	readers := make([]io.ReadCloser, 0, 65)
 	reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
 		return io.NopCloser(strings.NewReader("healthy")), http.Header{}, nil
@@ -185,7 +209,7 @@ func TestDiskReadIsolationDoesNotHoldSlotAcrossReaderLifetime(t *testing.T) {
 }
 
 func TestDiskReadIsolationIgnoresConsumerPause(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, time.Second, diskIsolationTestTimeout)
+	isolation := newTestDiskReadIsolation(t, 1, time.Second, diskIsolationTestTimeout)
 	reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
 		return io.NopCloser(strings.NewReader("ab")), http.Header{}, nil
 	})
@@ -205,7 +229,7 @@ func TestDiskReadIsolationIgnoresConsumerPause(t *testing.T) {
 }
 
 func TestIsolatedDiskReaderExposesUntouchedFile(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, time.Second, time.Second)
+	isolation := newTestDiskReadIsolation(t, 1, time.Second, time.Second)
 	path := filepath.Join(t.TempDir(), "artifact")
 	assert.NoError(t, os.WriteFile(path, []byte("artifact"), 0600))
 	file, err := os.Open(path)
@@ -242,7 +266,7 @@ func (r *readBlockingCloser) Close() error {
 }
 
 func TestDiskReadIsolationTimesOutBlockedBodyRead(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, time.Second, diskIsolationTestTimeout)
+	isolation := newTestDiskReadIsolation(t, 1, time.Second, diskIsolationTestTimeout)
 	source := newReadBlockingCloser()
 	reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
 		return source, http.Header{}, nil
@@ -260,6 +284,7 @@ type closeBlockingReader struct {
 	closeStarted chan struct{}
 	releaseClose chan struct{}
 	closeOnce    sync.Once
+	releaseOnce  sync.Once
 }
 
 type lateReadCloser struct {
@@ -279,7 +304,7 @@ func (r *lateReadCloser) Close() error {
 }
 
 func TestDiskReadIsolationDiscardsLateReadAfterTimeout(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, time.Second, diskIsolationTestTimeout)
+	isolation := newTestDiskReadIsolation(t, 1, time.Second, diskIsolationTestTimeout)
 	source := &lateReadCloser{readStarted: make(chan struct{}), releaseRead: make(chan struct{})}
 	reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
 		return source, http.Header{}, nil
@@ -313,8 +338,12 @@ func (r *closeBlockingReader) Close() error {
 	return nil
 }
 
+func (r *closeBlockingReader) release() {
+	r.releaseOnce.Do(func() { close(r.releaseClose) })
+}
+
 func TestDiskReadIsolationBoundsBlockedReaderClose(t *testing.T) {
-	isolation := newDiskReadIsolation(t.Context(), 1, diskIsolationTestTimeout, time.Second)
+	isolation := newTestDiskReadIsolation(t, 1, diskIsolationTestTimeout, time.Second)
 	source := newCloseBlockingReader()
 	reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
 		return source, http.Header{}, nil
@@ -328,8 +357,130 @@ func TestDiskReadIsolationBoundsBlockedReaderClose(t *testing.T) {
 	assert.IsError(t, err, ErrTierUnavailable)
 	assert.Equal(t, 1, len(isolation.closeSlots))
 
-	close(source.releaseClose)
+	source.release()
 	waitForDiskCloseSlots(t, isolation)
+}
+
+func TestDiskReadIsolationBoundsReadersAwaitingClose(t *testing.T) {
+	isolation := newDiskReadIsolation(t.Context(), DiskConfig{
+		ReadConcurrency:  1,
+		OpenReaderLimit:  3,
+		OperationTimeout: diskIsolationTestTimeout,
+		ReadIdleTimeout:  time.Second,
+	})
+	sources := []*closeBlockingReader{
+		newCloseBlockingReader(),
+		newCloseBlockingReader(),
+		newCloseBlockingReader(),
+	}
+	for _, source := range sources {
+		t.Cleanup(source.release)
+		isolation.degradedUntil.Store(0)
+		reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+			return source, http.Header{}, nil
+		})
+		assert.NoError(t, err)
+		err = reader.Close()
+		assert.IsError(t, err, ErrTierUnavailable)
+	}
+
+	assert.Equal(t, 3, len(isolation.readerSlots))
+	assert.Equal(t, 1, len(isolation.closeSlots))
+	for _, source := range sources[1:] {
+		select {
+		case <-source.closeStarted:
+			t.Fatal("queued reader Close started without an available close slot")
+		default:
+		}
+	}
+
+	isolation.degradedUntil.Store(0)
+	var extraOpen atomic.Bool
+	_, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		extraOpen.Store(true)
+		return io.NopCloser(strings.NewReader("extra")), http.Header{}, nil
+	})
+	assert.IsError(t, err, ErrTierUnavailable)
+	assert.False(t, extraOpen.Load())
+
+	for _, source := range sources {
+		source.release()
+	}
+	waitForDiskReaderSlots(t, isolation)
+	waitForDiskCloseSlots(t, isolation)
+
+	isolation.degradedUntil.Store(0)
+	reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		return io.NopCloser(strings.NewReader("healthy")), http.Header{}, nil
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, reader.Close())
+}
+
+func TestDiskReadIsolationBoundsLateOpenCleanup(t *testing.T) {
+	isolation := newDiskReadIsolation(t.Context(), DiskConfig{
+		ReadConcurrency:  1,
+		OpenReaderLimit:  1,
+		OperationTimeout: diskIsolationTestTimeout,
+		ReadIdleTimeout:  time.Second,
+	})
+	source := newCloseBlockingReader()
+	t.Cleanup(source.release)
+	openStarted := make(chan struct{})
+	releaseOpen := make(chan struct{})
+	var releaseOpenOnce sync.Once
+	releaseBlockedOpen := func() { releaseOpenOnce.Do(func() { close(releaseOpen) }) }
+	t.Cleanup(releaseBlockedOpen)
+
+	_, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		close(openStarted)
+		<-releaseOpen
+		return source, http.Header{}, nil
+	})
+	assert.IsError(t, err, ErrTierUnavailable)
+	<-openStarted
+	assert.Equal(t, 1, len(isolation.readerSlots))
+
+	isolation.degradedUntil.Store(0)
+	var extraOpen atomic.Bool
+	_, _, err = isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		extraOpen.Store(true)
+		return io.NopCloser(strings.NewReader("extra")), http.Header{}, nil
+	})
+	assert.IsError(t, err, ErrTierUnavailable)
+	assert.False(t, extraOpen.Load())
+
+	releaseBlockedOpen()
+	select {
+	case <-source.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("late Open reader was not closed")
+	}
+	assert.Equal(t, 1, len(isolation.readerSlots))
+	source.release()
+	waitForDiskReaderSlots(t, isolation)
+}
+
+func TestDiskReadIsolationDrainsReadersOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	isolation := newDiskReadIsolation(ctx, DiskConfig{
+		ReadConcurrency:  1,
+		OpenReaderLimit:  1,
+		OperationTimeout: time.Second,
+		ReadIdleTimeout:  time.Second,
+	})
+	_, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		return io.NopCloser(strings.NewReader("healthy")), http.Header{}, nil
+	})
+	assert.NoError(t, err)
+
+	cancel()
+	select {
+	case <-isolation.dispatcherDone:
+	case <-time.After(time.Second):
+		t.Fatal("close dispatcher did not drain open readers on shutdown")
+	}
+	assert.Equal(t, 0, len(isolation.readerSlots))
 }
 
 type unavailableReadCache struct {

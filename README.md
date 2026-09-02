@@ -233,8 +233,12 @@ On-disk LRU cache with TTL-based eviction.
 Disk reads are isolated behind fixed operation budgets. Separate pools, each
 sized by `read-concurrency`, bound `Stat`/`Open`/body `Read` calls and reader
 `Close` calls rather than client-paced stream lifetimes. Idle clients therefore
-consume no disk slot while stalled filesystem calls can strand only bounded
-resources, and a stuck read cannot prevent its close from running.
+consume no operation slot while stalled filesystem calls can strand only
+bounded resources, and a stuck read cannot prevent its close from running.
+`open-reader-limit` bounds all concurrent `Open` lifecycles, including live
+readers, readers returned after a timed-out `Open`, and readers waiting in the
+fixed close dispatcher. This also bounds file descriptors and cleanup ownership
+when `Close` itself stalls.
 `operation-timeout` applies to setup and close; `read-idle-timeout` applies only
 while a body `Read` is blocked and does not cap the total transfer duration. A
 timeout marks reads degraded for 30 seconds. During that window a tiered cache
@@ -242,13 +246,20 @@ tries deeper storage, while an unavailable authoritative disk is treated as a
 miss so the caller can regenerate or fetch the object upstream instead of
 returning HTTP 500. The request whose body stalls still fails because its
 response may already have started. `cachew.disk.read_events_total` attributes
-breaker trips and authoritative misses by operation and tier.
+breaker trips, open-reader-limit rejections, and authoritative misses by
+operation and tier.
+
+Git snapshot bundle responses expose an untouched file to `http.ServeContent`
+so the kernel sendfile path remains available. Those transfers intentionally
+bypass per-`Read` isolation, but still hold an `open-reader-limit` slot until the
+response closes the file.
 
 ```hcl
 disk {
   limit-mb          = 250000
   max-ttl           = "8h"
   read-concurrency  = 64
+  open-reader-limit = 4096
   operation-timeout = "2s"
   read-idle-timeout = "30s"
 }
@@ -456,6 +467,7 @@ disk {
   limit-mb          = 250000
   max-ttl           = "8h"
   read-concurrency  = 64
+  open-reader-limit = 4096
   operation-timeout = "2s"
   read-idle-timeout = "30s"
 }
