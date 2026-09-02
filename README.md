@@ -336,8 +336,9 @@ cachew git restore <repo-url> <directory> [--no-bundle]
 
 Request admission is disabled by default for compatibility. A positive limit
 adds a non-blocking process-wide ceiling held through response completion.
-Normal traffic can use `limit - reserved` slots; liveness, readiness, and
-authorized `/admin` requests can also use the reserved slots. Saturated
+Normal traffic is capped at `limit - reserved` slots. Liveness, readiness, and
+authorized `/admin` requests may use any available slot up to `limit`; the
+reserve is protected capacity for those requests, not a cap on them. Saturated
 requests receive HTTP 503 with `Retry-After: 1` instead of waiting in-process.
 
 ```hcl
