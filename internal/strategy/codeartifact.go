@@ -19,28 +19,38 @@ import (
 
 const codeArtifactUsername = "aws"
 
+const (
+	defaultCodeArtifactOriginHeaderTimeout   = 30 * time.Second
+	defaultCodeArtifactOriginReadIdleTimeout = 30 * time.Second
+	defaultCodeArtifactCredentialTimeout     = 15 * time.Second
+)
+
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	Target       string `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	ProxyBaseURL string `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
-	Domain       string `hcl:"domain" help:"The CodeArtifact domain name."`
-	DomainOwner  string `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
-	Region       string `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
-	RoleARN      string `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	Target                string        `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
+	ProxyBaseURL          string        `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
+	Domain                string        `hcl:"domain" help:"The CodeArtifact domain name."`
+	DomainOwner           string        `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
+	Region                string        `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
+	RoleARN               string        `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	OriginHeaderTimeout   time.Duration `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
+	OriginReadIdleTimeout time.Duration `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
+	CredentialTimeout     time.Duration `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
 // authenticated reads through.
 type CodeArtifact struct {
-	target    *url.URL
-	proxyBase *url.URL
-	prefix    string
-	tokens    codeArtifactTokenSource
-	cache     cache.Cache
-	client    *http.Client
-	logger    *slog.Logger
-	metric    codeArtifactMetricRecorder
-	fills     singleflight.Group
+	target                *url.URL
+	proxyBase             *url.URL
+	prefix                string
+	tokens                codeArtifactTokenSource
+	cache                 cache.Cache
+	client                *http.Client
+	logger                *slog.Logger
+	metric                codeArtifactMetricRecorder
+	fills                 singleflight.Group
+	originReadIdleTimeout time.Duration
 }
 
 var _ Strategy = (*CodeArtifact)(nil)
@@ -57,6 +67,7 @@ func RegisterCodeArtifact(r *Registry) {
 }
 
 func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredCache cache.Cache, mux Mux) (*CodeArtifact, error) {
+	config = codeArtifactConfigWithDefaults(config)
 	if _, _, err := validateCodeArtifactConfig(config, false); err != nil {
 		return nil, err
 	}
@@ -82,6 +93,7 @@ func newCodeArtifact(
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DisableCompression = true
+	transport.ResponseHeaderTimeout = config.OriginHeaderTimeout
 
 	c := &CodeArtifact{
 		target:    target,
@@ -95,8 +107,9 @@ func newCodeArtifact(
 				return http.ErrUseLastResponse
 			},
 		},
-		logger: logging.FromContext(ctx),
-		metric: newCodeArtifactMetrics(),
+		logger:                logging.FromContext(ctx),
+		metric:                newCodeArtifactMetrics(),
+		originReadIdleTimeout: config.OriginReadIdleTimeout,
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
@@ -108,7 +121,34 @@ func newCodeArtifact(
 	return c, nil
 }
 
+func codeArtifactConfigWithDefaults(config CodeArtifactConfig) CodeArtifactConfig {
+	if config.OriginHeaderTimeout == 0 {
+		config.OriginHeaderTimeout = defaultCodeArtifactOriginHeaderTimeout
+	}
+	if config.OriginReadIdleTimeout == 0 {
+		config.OriginReadIdleTimeout = defaultCodeArtifactOriginReadIdleTimeout
+	}
+	if config.CredentialTimeout == 0 {
+		config.CredentialTimeout = defaultCodeArtifactCredentialTimeout
+	}
+	return config
+}
+
 func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, *url.URL, error) {
+	timeouts := []struct {
+		name  string
+		value time.Duration
+	}{
+		{name: "origin-header-timeout", value: config.OriginHeaderTimeout},
+		{name: "origin-read-idle-timeout", value: config.OriginReadIdleTimeout},
+		{name: "credential-timeout", value: config.CredentialTimeout},
+	}
+	for _, timeout := range timeouts {
+		if timeout.value < 0 {
+			return nil, nil, errors.Errorf("codeartifact: %s must not be negative", timeout.name)
+		}
+	}
+
 	missing := make([]string, 0, 6)
 	configured := []struct {
 		name  string
@@ -296,9 +336,11 @@ func (c *CodeArtifact) rewriteOriginMetadata(
 func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error) {
 	target := c.originURL(r)
 	started := time.Now()
+	originCtx, cancel := context.WithCancelCause(r.Context())
 
-	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
+	upstream, err := http.NewRequestWithContext(originCtx, r.Method, target.String(), nil)
 	if err != nil {
+		cancel(nil)
 		return nil, errors.New("build CodeArtifact request")
 	}
 	copyHeaders(upstream.Header, codeArtifactRequestHeaders(r.Header))
@@ -309,6 +351,7 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 
 	resp, err := c.client.Do(upstream)
 	if err != nil {
+		cancel(nil)
 		if c.metric != nil {
 			c.metric.recordOrigin(r.Context(), codeArtifactOriginObservation{
 				status: "transport_error", format: codeArtifactMetricFormat(target.Path), duration: time.Since(started),
@@ -318,6 +361,7 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 		// client-controlled value because callers log this error.
 		return nil, errors.New("request CodeArtifact origin")
 	}
+	resp.Body = newCodeArtifactOriginBody(originCtx, resp.Body, cancel, c.originReadIdleTimeout)
 	c.observeOriginResponse(r.Context(), resp, target.Path, started)
 	return resp, nil
 }
@@ -383,8 +427,10 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 		return nil, errors.New("CodeArtifact origin returned an insecure cross-origin redirect")
 	}
 
-	redirected, err := http.NewRequestWithContext(r.Context(), r.Method, resolved.String(), nil)
+	redirectCtx, cancel := context.WithCancelCause(r.Context())
+	redirected, err := http.NewRequestWithContext(redirectCtx, r.Method, resolved.String(), nil)
 	if err != nil {
+		cancel(nil)
 		return nil, errors.New("build CodeArtifact redirect request")
 	}
 	copyHeaders(redirected.Header, codeArtifactRequestHeaders(r.Header))
@@ -394,6 +440,7 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 
 	resp, err := c.client.Do(redirected)
 	if err != nil {
+		cancel(nil)
 		if c.metric != nil {
 			c.metric.recordOrigin(r.Context(), codeArtifactOriginObservation{
 				status: "transport_error", format: codeArtifactMetricFormat(resolved.Path), duration: time.Since(started),
@@ -403,6 +450,7 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 		// http.Client error because it includes the full request URL.
 		return nil, errors.New("request CodeArtifact redirect")
 	}
+	resp.Body = newCodeArtifactOriginBody(redirectCtx, resp.Body, cancel, c.originReadIdleTimeout)
 	c.observeOriginResponse(r.Context(), resp, resolved.Path, started)
 	return resp, nil
 }
