@@ -66,8 +66,39 @@ type failingCache struct {
 	err error
 }
 
+type readinessCache struct {
+	cache.Cache
+	ready bool
+}
+
+func (c readinessCache) Ready() bool { return c.ready }
+
 func newFailingCache(err error) cache.Cache {
 	return failingCache{Cache: cache.NoOpCache(), err: err}
+}
+
+func TestTieredReadyRequiresEveryTier(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		ready []bool
+		want  bool
+	}{
+		{name: "AllReady", ready: []bool{true, true}, want: true},
+		{name: "FirstUnready", ready: []bool{false, true}, want: false},
+		{name: "LastUnready", ready: []bool{true, false}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+			caches := make([]cache.Cache, len(test.ready))
+			for index, ready := range test.ready {
+				caches[index] = readinessCache{Cache: cache.NoOpCache(), ready: ready}
+			}
+			tiered := cache.MaybeNewTiered(ctx, caches, newMetadataStore(ctx))
+			readier, ok := tiered.(cache.Readier)
+			assert.True(t, ok)
+			assert.Equal(t, test.want, readier.Ready())
+		})
+	}
 }
 
 func (c failingCache) String() string { return "failing" }

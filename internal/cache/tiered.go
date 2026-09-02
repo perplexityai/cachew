@@ -62,6 +62,11 @@ func (c authoritativeCache) Namespace(namespace Namespace) Cache {
 	return authoritativeCache{Cache: c.Cache.Namespace(namespace)}
 }
 
+func (c authoritativeCache) Ready() bool {
+	readier, ok := c.Cache.(Readier)
+	return !ok || readier.Ready()
+}
+
 func (c authoritativeCache) OpenWithTier(
 	ctx context.Context,
 	key Key,
@@ -72,6 +77,7 @@ func (c authoritativeCache) OpenWithTier(
 }
 
 var _ Cache = (*Tiered)(nil)
+var _ Readier = (*Tiered)(nil)
 
 // Close all underlying caches.
 func (t Tiered) Close() error {
@@ -560,6 +566,16 @@ func (t Tiered) Stats(ctx context.Context) (Stats, error) {
 		combined.Capacity += s.Capacity
 	}
 	return combined, nil
+}
+
+// Ready reports false when any local tier with a readiness signal is unhealthy.
+func (t Tiered) Ready() bool {
+	for _, cache := range t.caches {
+		if readier, ok := cache.(Readier); ok && !readier.Ready() {
+			return false
+		}
+	}
+	return true
 }
 
 type tieredWriter struct {

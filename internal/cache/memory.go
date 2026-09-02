@@ -66,6 +66,7 @@ type memoryEntry struct {
 	next           *memoryEntry
 	retired        atomic.Bool
 	released       bool
+	readiness      bool
 }
 
 type memoryShard struct {
@@ -147,6 +148,7 @@ type memoryState struct {
 	evictionCursor  atomic.Uint32
 	closed          atomic.Bool
 	metrics         memoryMetricRecorder
+	readiness       *memoryReadiness
 }
 
 // Memory shares capacity across namespace views so each view cannot consume limit-mb independently.
@@ -201,7 +203,9 @@ func NewMemory(ctx context.Context, config MemoryConfig) (*Memory, error) {
 	}
 	logging.FromContext(ctx).InfoContext(ctx, "Constructing in-memory Cache", "limit-mb", config.LimitMB,
 		"inflight-limit-mb", config.InflightLimitMB, "max-ttl", config.MaxTTL)
-	return &Memory{config: config, state: state}, nil
+	memory := &Memory{config: config, state: state}
+	state.readiness = newMemoryReadiness(ctx, memory)
+	return memory, nil
 }
 
 func memoryShardIndex(namespace Namespace, key Key) int {
@@ -361,6 +365,9 @@ func (m *Memory) tryAdmission(
 		return false, errors.WithStack(err)
 	}
 	oldEntry, replacing := shard.entry(entry.namespace, entry.key)
+	if replacing && oldEntry.readiness {
+		return false, errors.WithStack(os.ErrPermission)
+	}
 	if replacing && oldEntry.readers.Load() == 0 {
 		delta := entry.charge - oldEntry.charge
 		if delta > 0 && !m.reserveAdmission(mode, retainedLimit, delta) {
@@ -730,7 +737,7 @@ func (m *Memory) Delete(_ context.Context, key Key) error {
 	}
 
 	entry, exists := shard.entry(m.namespace, key)
-	if !exists {
+	if !exists || entry.readiness {
 		return os.ErrNotExist
 	}
 	m.removeActiveLocked(shard, entry)
@@ -750,6 +757,9 @@ func (m *Memory) Invalidate(ctx context.Context, key Key) error {
 func (m *Memory) Close() error {
 	if !m.state.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+	if m.state.readiness != nil {
+		m.state.readiness.stop()
 	}
 	for index := range m.state.shards {
 		shard := &m.state.shards[index]
@@ -1033,7 +1043,7 @@ func (m *Memory) ListNamespaces(_ context.Context) ([]string, error) {
 		shard := &m.state.shards[index]
 		shard.mu.RLock()
 		for namespace, namespaceEntries := range shard.entries {
-			if namespace != "" && len(namespaceEntries) > 0 {
+			if namespace != "" && namespace != memoryReadinessNamespace && len(namespaceEntries) > 0 {
 				namespaces[namespace] = struct{}{}
 			}
 		}
