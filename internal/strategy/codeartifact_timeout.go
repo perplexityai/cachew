@@ -36,10 +36,7 @@ func newCodeArtifactOriginBody(
 	if timeout <= 0 {
 		timeout = defaultCodeArtifactOriginReadIdleTimeout
 	}
-	r := &codeArtifactOriginBody{body: body, ctx: ctx, cancel: cancel, timeout: timeout}
-	r.timer = time.AfterFunc(timeout, r.timeoutRead)
-	r.timer.Stop()
-	return r
+	return &codeArtifactOriginBody{body: body, ctx: ctx, cancel: cancel, timeout: timeout}
 }
 
 func (r *codeArtifactOriginBody) Read(p []byte) (int, error) {
@@ -73,6 +70,10 @@ func (r *codeArtifactOriginBody) startRead() {
 	r.reading = true
 	r.timerArmed = true
 	r.timerWG.Add(1)
+	if r.timer == nil {
+		r.timer = time.AfterFunc(r.timeout, r.timeoutRead)
+		return
+	}
 	r.timer.Reset(r.timeout)
 }
 
