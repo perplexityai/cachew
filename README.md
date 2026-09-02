@@ -230,15 +230,18 @@ memory {
 
 On-disk LRU cache with TTL-based eviction.
 
-Disk reads are isolated behind a fixed lifecycle budget. A slot covers `Stat`
-or the complete `Open` → body `Read` → reader `Close` sequence, so a blocked
-filesystem call can strand only bounded resources. `operation-timeout` applies
-to setup and close; `read-idle-timeout` resets whenever the body makes progress
-and does not cap the total transfer duration. A timeout temporarily marks disk
-reads degraded, and tiered caches bypass the local disk tier for deeper storage.
-The request whose body stalls still fails because its response may already have
-started; subsequent requests can fall through. Saturation also bypasses disk
-without queueing.
+Disk reads are isolated behind fixed operation budgets. Separate pools, each
+sized by `read-concurrency`, bound `Stat`/`Open`/body `Read` calls and reader
+`Close` calls rather than client-paced stream lifetimes. Idle clients therefore
+consume no disk slot while stalled filesystem calls can strand only bounded
+resources, and a stuck read cannot prevent its close from running.
+`operation-timeout` applies to setup and close; `read-idle-timeout` applies only
+while a body `Read` is blocked and does not cap the total transfer duration. A
+timeout marks reads degraded for 30 seconds. During that window a tiered cache
+tries deeper storage, while an unavailable authoritative disk is treated as a
+miss so the caller can regenerate or fetch the object upstream instead of
+returning HTTP 500. The request whose body stalls still fails because its
+response may already have started.
 
 ```hcl
 disk {

@@ -36,7 +36,7 @@ type DiskConfig struct {
 	LimitMB          int           `hcl:"limit-mb,optional" help:"Maximum size of the disk cache in megabytes (defaults to 10GB)." default:"10240"`
 	MaxTTL           time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
 	EvictInterval    time.Duration `hcl:"evict-interval,optional" help:"Interval at which to check files for eviction (defaults to 1 minute)." default:"1m"`
-	ReadConcurrency  int           `hcl:"read-concurrency,optional" help:"Maximum concurrent disk read lifecycles (defaults to 64)." default:"64"`
+	ReadConcurrency  int           `hcl:"read-concurrency,optional" help:"Maximum concurrent disk setup/read operations and, separately, reader close operations (defaults to 64)." default:"64"`
 	OperationTimeout time.Duration `hcl:"operation-timeout,optional" help:"Maximum disk Open, Stat, and reader Close latency (defaults to 2 seconds)." default:"2s"`
 	ReadIdleTimeout  time.Duration `hcl:"read-idle-timeout,optional" help:"Maximum time a disk body Read may make no progress (defaults to 30 seconds)." default:"30s"`
 }
@@ -93,10 +93,10 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 		return nil, errors.Errorf("read-concurrency must be non-negative and at most %d", maxDiskReadConcurrency)
 	}
 	if config.OperationTimeout < 0 {
-		return nil, errors.New("operation-timeout must be positive")
+		return nil, errors.New("operation-timeout must not be negative")
 	}
 	if config.ReadIdleTimeout < 0 {
-		return nil, errors.New("read-idle-timeout must be positive")
+		return nil, errors.New("read-idle-timeout must not be negative")
 	}
 	var err error
 	config.Root, err = filepath.Abs(config.Root)
