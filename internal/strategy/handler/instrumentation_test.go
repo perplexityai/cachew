@@ -40,6 +40,16 @@ func artifactReader(t *testing.T) *sdkmetric.ManualReader {
 	return reader
 }
 
+// awaitArtifactCount waits for an asynchronous tier backfill to record its outcome.
+func awaitArtifactCount(t *testing.T, reader *sdkmetric.ManualReader, want int64, name string, labels ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for artifactCount(t, reader, name, labels...) != want && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Equal(t, want, artifactCount(t, reader, name, labels...))
+}
+
 func artifactCount(t *testing.T, reader *sdkmetric.ManualReader, name string, labels ...string) int64 {
 	t.Helper()
 	var data metricdata.ResourceMetrics
@@ -77,7 +87,7 @@ func TestArtifactCacheSourcesAndBackfill(t *testing.T) {
 	defer origin.Close()
 	disk, err := cache.NewDisk(artifactContext(t), cache.DiskConfig{Root: t.TempDir()})
 	assert.NoError(t, err)
-	memory := mustNewMemoryCache()
+	memory := mustNewMemoryCache(t)
 	metadata := metadatadb.New(artifactContext(t), metadatadb.NewMemoryBackend())
 	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{disk, memory}, metadata)
 	t.Cleanup(func() { assert.NoError(t, c.Close()) })
@@ -100,6 +110,7 @@ func TestArtifactCacheSourcesAndBackfill(t *testing.T) {
 	third, labels := serve(http.Header{})
 	assert.Equal(t, "artifact", third.Body.String())
 	assert.Equal(t, map[string]string{handler.CacheResultAttribute: handler.CacheHit, handler.CacheSourceAttribute: "memory"}, labels)
+	awaitArtifactCount(t, reader, 1, "cachew.cache.fills", "purpose", "backfill", "result", "success")
 	fourth, labels := serve(http.Header{})
 	assert.Equal(t, "artifact", fourth.Body.String())
 	assert.Equal(t, "disk", labels[handler.CacheSourceAttribute])
@@ -123,7 +134,7 @@ func TestArtifactRedirectsAndThrottling(t *testing.T) {
 		_, _ = io.WriteString(w, "rate limited")
 	}))
 	defer origin.Close()
-	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{mustNewMemoryCache()}, nil)
+	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{mustNewMemoryCache(t)}, nil)
 	defer c.Close()
 	h := handler.New(originClient(origin.Client().Transport), c, newTestSpools(t)).Metrics("host", "registry.example").Transform(func(r *http.Request) (*http.Request, error) {
 		return http.NewRequestWithContext(r.Context(), http.MethodGet, origin.URL+"/redirect", nil)
@@ -156,7 +167,7 @@ func TestArtifactTransportFailures(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := artifactReader(t)
 			client := originClient(artifactTransportFunc(func(*http.Request) (*http.Response, error) { return nil, tt.err }))
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			defer c.Close()
 			h := handler.New(client, c, newTestSpools(t)).Metrics("host", "registry.example")
 			w := httptest.NewRecorder()
@@ -208,7 +219,7 @@ func TestArtifactFillFailuresKeepClientResponse(t *testing.T) {
 				_, _ = io.WriteString(w, strings.Repeat("artifact", 10000))
 			}))
 			defer origin.Close()
-			c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{artifactFailCache{Cache: mustNewMemoryCache(), phase: phase}}, nil)
+			c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{artifactFailCache{Cache: mustNewMemoryCache(t), phase: phase}}, nil)
 			defer c.Close()
 			h := handler.New(originClient(origin.Client().Transport), c, newTestSpools(t)).Transform(func(r *http.Request) (*http.Request, error) {
 				return http.NewRequestWithContext(r.Context(), http.MethodGet, origin.URL, nil)
@@ -234,7 +245,7 @@ func TestArtifactInterruptedBodyIsNotSuccessfulFill(t *testing.T) {
 		_, _ = io.WriteString(w, "partial")
 	}))
 	defer origin.Close()
-	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{mustNewMemoryCache()}, nil)
+	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{mustNewMemoryCache(t)}, nil)
 	defer c.Close()
 	h := handler.New(originClient(origin.Client().Transport), c, newTestSpools(t)).Transform(func(r *http.Request) (*http.Request, error) {
 		return http.NewRequestWithContext(r.Context(), http.MethodGet, origin.URL, nil)
@@ -280,8 +291,8 @@ func TestArtifactInternalForwardAndCardinality(t *testing.T) {
 
 func TestArtifactBackfillFailureRemainsVisible(t *testing.T) {
 	reader := artifactReader(t)
-	local := artifactFailCache{Cache: mustNewMemoryCache(), phase: "write"}
-	remote := mustNewMemoryCache()
+	local := artifactFailCache{Cache: mustNewMemoryCache(t), phase: "write"}
+	remote := mustNewMemoryCache(t)
 	key := cache.NewKey("/artifact")
 	assert.NoError(t, cache.WriteFunc(artifactContext(t), remote, key, nil, time.Hour, func(w io.Writer) error { _, err := io.WriteString(w, "artifact"); return err }))
 	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{local, remote}, metadatadb.New(artifactContext(t), metadatadb.NewMemoryBackend()))
@@ -291,7 +302,7 @@ func TestArtifactBackfillFailureRemainsVisible(t *testing.T) {
 	h.ServeHTTP(w, artifactHTTPRequest(t, "/artifact"))
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "artifact", w.Body.String())
-	assert.Equal(t, int64(1), artifactCount(t, reader, "cachew.cache.fills", "purpose", "backfill", "result", "write_error"))
+	awaitArtifactCount(t, reader, 1, "cachew.cache.fills", "purpose", "backfill", "result", "write_error")
 	assert.Equal(t, int64(1), artifactCount(t, reader, "cachew.cache.tier_writes", "purpose", "backfill", "result", "write_error"))
 	assert.Equal(t, int64(0), artifactCount(t, reader, "cachew.origin.requests"))
 }
@@ -299,7 +310,7 @@ func TestArtifactBackfillFailureRemainsVisible(t *testing.T) {
 func TestArtifactStaleTierIsNotCountedAsHit(t *testing.T) {
 	disk, err := cache.NewDisk(artifactContext(t), cache.DiskConfig{Root: t.TempDir()})
 	assert.NoError(t, err)
-	memory := mustNewMemoryCache()
+	memory := mustNewMemoryCache(t)
 	key := cache.NewKey("/artifact")
 	for _, seed := range []struct {
 		c    cache.Cache
@@ -336,7 +347,7 @@ func TestArtifactS3(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "artifact", w.Body.String())
 	assert.Equal(t, "s3", labels[handler.CacheSourceAttribute])
-	assert.Equal(t, int64(1), artifactCount(t, reader, "cachew.cache.fills", "purpose", "backfill", "result", "success"))
+	awaitArtifactCount(t, reader, 1, "cachew.cache.fills", "purpose", "backfill", "result", "success")
 	assert.Equal(t, int64(0), artifactCount(t, reader, "cachew.origin.requests"))
 }
 
@@ -375,7 +386,7 @@ func TestArtifactMetricsPrometheusExport(t *testing.T) {
 	defer func() { otel.SetMeterProvider(previous); assert.NoError(t, exporter.Close()) }()
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "artifact") }))
 	defer origin.Close()
-	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{mustNewMemoryCache()}, nil)
+	c := cache.MaybeNewTiered(artifactContext(t), []cache.Cache{mustNewMemoryCache(t)}, nil)
 	defer c.Close()
 	h := handler.New(originClient(origin.Client().Transport), c, newTestSpools(t)).Metrics("host", "registry.example").Transform(func(r *http.Request) (*http.Request, error) {
 		return http.NewRequestWithContext(r.Context(), http.MethodGet, origin.URL, nil)
@@ -397,7 +408,7 @@ func TestArtifactCooldownIsNotOriginTraffic(t *testing.T) {
 	}))
 	defer origin.Close()
 	client := &http.Client{Transport: httputil.NewBackoffTransport(metrics.NewOriginTransport(origin.Client().Transport), time.Minute, time.Hour, slog.New(slog.DiscardHandler))}
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	defer c.Close()
 	h := handler.New(client, c, newTestSpools(t)).Metrics("host", "registry.example").Transform(func(r *http.Request) (*http.Request, error) {
 		return http.NewRequestWithContext(r.Context(), http.MethodGet, origin.URL, nil)
@@ -413,7 +424,7 @@ func TestArtifactCooldownIsNotOriginTraffic(t *testing.T) {
 func TestArtifactHeadHitSource(t *testing.T) {
 	disk, err := cache.NewDisk(artifactContext(t), cache.DiskConfig{Root: t.TempDir()})
 	assert.NoError(t, err)
-	memory := mustNewMemoryCache()
+	memory := mustNewMemoryCache(t)
 	key := cache.NewKey("/artifact")
 	assert.NoError(t, cache.WriteFunc(artifactContext(t), memory, key, nil, time.Hour, func(w io.Writer) error { _, err := io.WriteString(w, "artifact"); return err }))
 	for _, tt := range []struct {

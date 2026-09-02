@@ -199,9 +199,12 @@ func Load(
 	// Second pass, instantiate strategies and bind them to the mux.
 	// Collect strategies that implement Interceptor separately — they need
 	// to run before ServeMux route matching, not as mux routes. Strategies
-	// that implement Readier are tracked so /_readiness can gate on warm-up.
+	// and local caches that implement Readier gate /_readiness.
 	var interceptors []strategy.Interceptor
 	var readiers []strategy.Readier
+	if readier, ok := cache.(strategy.Readier); ok {
+		readiers = append(readiers, readier)
+	}
 	for _, block := range classified.strategies {
 		name := block.Name
 		slogger := logger.With("strategy", name)

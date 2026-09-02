@@ -262,7 +262,7 @@ func TestBuilder(t *testing.T) {
 				delete(callCounts, path)
 			}
 
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			handler := tt.buildHandler(c)
 			ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
@@ -300,7 +300,7 @@ func TestHeaderForwarding(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
 	t.Run("ForwardsOriginalHeaders", func(t *testing.T) {
@@ -350,7 +350,7 @@ func TestHeaderForwarding(t *testing.T) {
 		}))
 		defer varyUpstream.Close()
 
-		varyCache := mustNewMemoryCache()
+		varyCache := mustNewMemoryCache(t)
 		h := handler.New(http.DefaultClient, varyCache, newTestSpools(t)).
 			Transform(func(r *http.Request) (*http.Request, error) {
 				return http.NewRequestWithContext(r.Context(), http.MethodGet, varyUpstream.URL+"/file.zip", nil)
@@ -409,7 +409,7 @@ func TestCacheResultHeaderCannotBeSpoofed(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h := handler.New(http.DefaultClient, mustNewMemoryCache(), newTestSpools(t)).
+	h := handler.New(http.DefaultClient, mustNewMemoryCache(t), newTestSpools(t)).
 		Transform(func(r *http.Request) (*http.Request, error) {
 			return http.NewRequestWithContext(r.Context(), r.Method, upstream.URL, nil)
 		})
@@ -431,17 +431,17 @@ func TestCacheResultHeaderCannotBeSpoofed(t *testing.T) {
 }
 
 func TestHandlerMethodChaining(t *testing.T) {
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	client := &http.Client{}
 
 	h := handler.New(client, c, newTestSpools(t))
-	result := h.
+	chainedHandler := h.
 		CacheKey(func(_ *http.Request) string { return "key" }).
 		Transform(func(r *http.Request) (*http.Request, error) { return r, nil }).
 		OnError(func(_ error, _ http.ResponseWriter, _ *http.Request) {}).
 		TTL(func(_ *http.Request) time.Duration { return time.Hour })
 
-	assert.True(t, h == result, "methods should return the same handler instance")
+	assert.True(t, h == chainedHandler, "methods should return the same handler instance")
 }
 
 func TestStreamAndCacheAbortsOnUpstreamError(t *testing.T) {
@@ -457,7 +457,7 @@ func TestStreamAndCacheAbortsOnUpstreamError(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
 	h := handler.New(http.DefaultClient, c, newTestSpools(t)).
@@ -518,7 +518,7 @@ func TestCacheWriteFailureDoesNotTruncateResponse(t *testing.T) {
 		{name: "CreateFails", createErr: errors.New("headers exceed S3 metadata limit")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			mem := mustNewMemoryCache()
+			mem := mustNewMemoryCache(t)
 			defer mem.Close()
 			ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
@@ -541,14 +541,16 @@ func TestCacheWriteFailureDoesNotTruncateResponse(t *testing.T) {
 	}
 }
 
-func mustNewMemoryCache() cache.Cache {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+func mustNewMemoryCache(t *testing.T) cache.Cache {
+	t.Helper()
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{
 		MaxTTL: time.Hour,
 	})
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { assert.NoError(t, c.Close()) })
 	return c
 }
 
@@ -578,7 +580,7 @@ func TestHeadRequests(t *testing.T) {
 		_, _ = fmt.Fprint(w, "content")
 	}))
 	defer upstream.Close()
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	defer c.Close()
 	h := handler.New(http.DefaultClient, c, newTestSpools(t)).Transform(upstreamTransform(upstream.URL))
 
@@ -626,7 +628,7 @@ func TestRangeMissCachesFullObject(t *testing.T) {
 				_, _ = fmt.Fprint(w, payload)
 			}))
 			defer upstream.Close()
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			defer c.Close()
 			h := handler.New(http.DefaultClient, c, newTestSpools(t)).Transform(upstreamTransform(upstream.URL))
 
@@ -650,7 +652,7 @@ func TestVary(t *testing.T) {
 		_, _ = fmt.Fprint(w, r.Header.Get("Accept"))
 	}))
 	defer upstream.Close()
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	defer c.Close()
 	h := handler.New(http.DefaultClient, c, newTestSpools(t)).
 		Transform(upstreamTransform(upstream.URL)).
@@ -694,7 +696,7 @@ func TestVerify(t *testing.T) {
 				_, _ = fmt.Fprint(w, "content")
 			}))
 			defer upstream.Close()
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			defer c.Close()
 			h := handler.New(http.DefaultClient, c, newTestSpools(t)).
 				Transform(upstreamTransform(upstream.URL)).
@@ -746,7 +748,7 @@ func TestRevalidate(t *testing.T) {
 				_, _ = fmt.Fprint(w, version)
 			}))
 			defer upstream.Close()
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			defer c.Close()
 			h := handler.New(http.DefaultClient, c, newTestSpools(t)).
 				Transform(upstreamTransform(upstream.URL)).
@@ -801,7 +803,7 @@ func TestParallelFetch(t *testing.T) {
 			})
 			upstream := httptest.NewServer(mux)
 			defer upstream.Close()
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			defer c.Close()
 			var open atomic.Int32
 			client := &http.Client{Transport: countingTransport{open: &open}}
@@ -868,7 +870,7 @@ func TestConcurrentMissesShareOneUpstreamFetch(t *testing.T) {
 		_, _ = io.WriteString(w, "second")
 	}))
 	defer upstream.Close()
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	defer c.Close()
 	h := handler.New(http.DefaultClient, c, newTestSpools(t)).
 		Transform(func(r *http.Request) (*http.Request, error) {
@@ -919,7 +921,7 @@ func TestUncoalescableRequestsFetchSeparately(t *testing.T) {
 				_, _ = io.WriteString(w, "body")
 			}))
 			defer upstream.Close()
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			defer c.Close()
 			h := handler.New(http.DefaultClient, c, newTestSpools(t)).
 				Transform(func(r *http.Request) (*http.Request, error) {
@@ -961,7 +963,7 @@ func TestCacheResultLabelsServerMetrics(t *testing.T) {
 		_, _ = io.WriteString(w, "body")
 	}))
 	defer upstream.Close()
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	defer c.Close()
 	h := handler.New(http.DefaultClient, c, newTestSpools(t)).
 		Transform(func(r *http.Request) (*http.Request, error) {
@@ -1046,7 +1048,7 @@ func TestBackoffPausesHandler(t *testing.T) {
 	defer other.Close()
 	other.URL = strings.Replace(other.URL, "127.0.0.1", "localhost", 1)
 	client := &http.Client{Transport: httputil.NewBackoffTransport(http.DefaultTransport, time.Minute, time.Hour, slog.New(slog.DiscardHandler))}
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	defer c.Close()
 	newHandler := func() *handler.Handler {
 		return handler.New(client, c, newTestSpools(t)).Transform(func(r *http.Request) (*http.Request, error) {
