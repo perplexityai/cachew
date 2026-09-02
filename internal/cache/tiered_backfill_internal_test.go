@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/assert/v2"
+	"github.com/alecthomas/errors"
 
 	"github.com/block/cachew/internal/logging"
 )
@@ -88,6 +89,63 @@ type blockingCommitWriter struct {
 	release chan struct{}
 	once    sync.Once
 	aborted atomic.Bool
+}
+
+type blockingBackfillWriteWriter struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	aborted atomic.Bool
+}
+
+func (w *blockingBackfillWriteWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+	return len(p), nil
+}
+
+func (w *blockingBackfillWriteWriter) Close() error { return nil }
+
+func (w *blockingBackfillWriteWriter) Abort(error) error {
+	w.aborted.Store(true)
+	return nil
+}
+
+func TestTieredBackfillAbandonsWhenChunkQueueSaturates(t *testing.T) {
+	ctx := backfillTestContext(t)
+	manager := newTieredBackfillsWithLimits(ctx, 1, 1<<20)
+	lease, ok := manager.start(ctx, tieredBackfillKey{key: NewKey("bounded-slots"), etag: "v1"})
+	assert.True(t, ok)
+	payload := bytes.Repeat([]byte{'x'}, tieredBackfillBufferSlots+2)
+	writer := &blockingBackfillWriteWriter{started: make(chan struct{}), release: make(chan struct{})}
+	reader := newBackfillReadCloser(
+		io.NopCloser(bytes.NewReader(payload)),
+		func(context.Context) (Writer, error) { return writer, nil },
+		lease,
+	)
+
+	actual := make([]byte, 0, len(payload))
+	buffer := make([]byte, 1)
+	n, err := reader.Read(buffer)
+	assert.NoError(t, err)
+	actual = append(actual, buffer[:n]...)
+	<-writer.started
+	for {
+		n, err = reader.Read(buffer)
+		actual = append(actual, buffer[:n]...)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, payload, actual)
+	assert.IsError(t, context.Cause(lease.ctx), errBackfillAbandoned)
+	assert.NoError(t, reader.Close())
+
+	close(writer.release)
+	manager.close()
+	assert.True(t, writer.aborted.Load())
+	assert.Equal(t, int64(0), manager.buffered.Load())
 }
 
 func (w *blockingCommitWriter) Close() error {
