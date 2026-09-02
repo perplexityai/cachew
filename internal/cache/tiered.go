@@ -54,6 +54,24 @@ type authoritativeCache struct {
 	Cache
 }
 
+func (c authoritativeCache) Stat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
+	headers, err := c.Cache.Stat(ctx, key, opts...)
+	if errors.Is(err, ErrTierUnavailable) {
+		defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationStat, cacheBackendType(c.Cache))
+		return nil, os.ErrNotExist
+	}
+	return headers, errors.WithStack(err)
+}
+
+func (c authoritativeCache) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
+	body, headers, err := c.Cache.Open(ctx, key, opts...)
+	if errors.Is(err, ErrTierUnavailable) {
+		defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationOpen, cacheBackendType(c.Cache))
+		return nil, nil, os.ErrNotExist
+	}
+	return body, headers, errors.WithStack(err)
+}
+
 func (c authoritativeCache) Invalidate(context.Context, Key) error {
 	return nil
 }
@@ -72,7 +90,7 @@ func (c authoritativeCache) OpenWithTier(
 	key Key,
 	opts ...Option,
 ) (io.ReadCloser, http.Header, BackendType, error) {
-	body, headers, err := c.Cache.Open(ctx, key, opts...)
+	body, headers, err := c.Open(ctx, key, opts...)
 	return body, headers, cacheBackendType(c.Cache), errors.WithStack(err)
 }
 
@@ -239,6 +257,15 @@ func (t Tiered) Stat(ctx context.Context, key Key, opts ...Option) (http.Header,
 			continue
 		}
 		switch {
+		case errors.Is(err, ErrTierUnavailable):
+			if i == len(t.caches)-1 {
+				defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationStat, cacheBackendType(c))
+				if len(probeErrs) > 0 {
+					return nil, errors.Join(probeErrs...)
+				}
+				return nil, os.ErrNotExist
+			}
+			continue
 		case errors.Is(err, os.ErrNotExist):
 			continue
 		case errors.Is(err, ErrPreconditionFailed):
@@ -279,6 +306,13 @@ var _ AuthoritativeStater = (*Tiered)(nil)
 // construction.
 func (t Tiered) AuthoritativeStat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
 	headers, err := t.caches[len(t.caches)-1].Stat(ctx, key, opts...)
+	if errors.Is(err, ErrTierUnavailable) {
+		defaultDiskMetrics.record(
+			ctx, diskReadEventAuthoritativeMiss, diskReadOperationAuthoritativeStat,
+			cacheBackendType(t.caches[len(t.caches)-1]),
+		)
+		return nil, os.ErrNotExist
+	}
 	if cacheEntryExpired(headers, time.Now()) {
 		return nil, os.ErrNotExist
 	}
@@ -321,7 +355,7 @@ func (t Tiered) Open(ctx context.Context, key Key, opts ...Option) (io.ReadClose
 
 // OpenWithTier reports the source before a tier-zero backfill can obscure which
 // backend supplied the representation.
-func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, BackendType, error) {
+func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, BackendType, error) { //nolint:funlen // Conditional tier probing is clearer as one state machine.
 	ro := NewRequestOptions(opts...)
 	// A Range request yields a partial body, which must never be backfilled
 	// into a lower tier as if it were the whole object.
@@ -341,6 +375,21 @@ func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.R
 		r, headers, err = unexpiredCacheResult(r, headers, err, time.Now())
 		errs[i] = err
 		switch {
+		case errors.Is(err, ErrTierUnavailable):
+			if i == len(t.caches)-1 {
+				defaultDiskMetrics.record(ctx, diskReadEventAuthoritativeMiss, diskReadOperationOpen, cacheBackendType(c))
+				if len(probeErrs) > 0 {
+					if fallback != nil {
+						probeErrs = append(probeErrs, fallback.Close())
+					}
+					return nil, nil, backendUnknown, errors.Join(probeErrs...)
+				}
+				if fallback != nil {
+					discardTieredReader(ctx, key, fallback)
+				}
+				return nil, nil, cacheBackendType(c), os.ErrNotExist
+			}
+			continue
 		case errors.Is(err, os.ErrNotExist):
 			continue
 		case errors.Is(err, ErrPreconditionFailed):

@@ -3,6 +3,7 @@ package handler_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,18 @@ type testRequest struct {
 	expectStatus   int
 	expectBody     string
 	expectContains string
+}
+
+type unavailableAuthoritativeCache struct {
+	cache.Cache
+}
+
+func (c unavailableAuthoritativeCache) Open(
+	context.Context,
+	cache.Key,
+	...cache.Option,
+) (io.ReadCloser, http.Header, error) {
+	return nil, nil, cache.ErrTierUnavailable
 }
 
 func TestBuilder(t *testing.T) {
@@ -413,6 +426,35 @@ func TestCacheResultHeaderCannotBeSpoofed(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code)
 		assert.Equal(t, expected, w.Header().Get(handler.CacheResultHeader))
 	}
+}
+
+func TestHandlerFallsBackWhenAuthoritativeTierIsUnavailable(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		_, _ = fmt.Fprint(w, "upstream artifact")
+	}))
+	t.Cleanup(upstream.Close)
+	ctx := logging.ContextWithLogger(t.Context(), slog.Default())
+	cacheBackend := cache.MaybeNewTiered(
+		ctx,
+		[]cache.Cache{unavailableAuthoritativeCache{Cache: cache.NoOpCache()}},
+		nil,
+	)
+	t.Cleanup(func() { assert.NoError(t, cacheBackend.Close()) })
+	h := handler.New(upstream.Client(), cacheBackend).
+		Transform(func(r *http.Request) (*http.Request, error) {
+			return http.NewRequestWithContext(r.Context(), http.MethodGet, upstream.URL+"/artifact", nil)
+		})
+	request := httptest.NewRequest(http.MethodGet, "http://cachew.test/artifact", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+
+	h.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, "upstream artifact", response.Body.String())
+	assert.Equal(t, "miss", response.Header().Get(handler.CacheResultHeader))
+	assert.Equal(t, 1, upstreamCalls)
 }
 
 func TestHandlerMethodChaining(t *testing.T) {
