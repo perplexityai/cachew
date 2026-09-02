@@ -253,7 +253,7 @@ func TestBuilder(t *testing.T) {
 				delete(callCounts, path)
 			}
 
-			c := mustNewMemoryCache()
+			c := mustNewMemoryCache(t)
 			handler := tt.buildHandler(c)
 			ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
@@ -291,7 +291,7 @@ func TestHeaderForwarding(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
 	t.Run("ForwardsOriginalHeaders", func(t *testing.T) {
@@ -341,7 +341,7 @@ func TestHeaderForwarding(t *testing.T) {
 		}))
 		defer varyUpstream.Close()
 
-		varyCache := mustNewMemoryCache()
+		varyCache := mustNewMemoryCache(t)
 		h := handler.New(http.DefaultClient, varyCache).
 			Transform(func(r *http.Request) (*http.Request, error) {
 				return http.NewRequestWithContext(r.Context(), http.MethodGet, varyUpstream.URL+"/file.zip", nil)
@@ -400,7 +400,7 @@ func TestCacheResultHeaderCannotBeSpoofed(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	h := handler.New(http.DefaultClient, mustNewMemoryCache()).
+	h := handler.New(http.DefaultClient, mustNewMemoryCache(t)).
 		Transform(func(r *http.Request) (*http.Request, error) {
 			return http.NewRequestWithContext(r.Context(), http.MethodGet, upstream.URL, nil)
 		})
@@ -417,17 +417,17 @@ func TestCacheResultHeaderCannotBeSpoofed(t *testing.T) {
 }
 
 func TestHandlerMethodChaining(t *testing.T) {
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	client := &http.Client{}
 
 	h := handler.New(client, c)
-	result := h.
+	chainedHandler := h.
 		CacheKey(func(_ *http.Request) string { return "key" }).
 		Transform(func(r *http.Request) (*http.Request, error) { return r, nil }).
 		OnError(func(_ error, _ http.ResponseWriter, _ *http.Request) {}).
 		TTL(func(_ *http.Request) time.Duration { return time.Hour })
 
-	assert.Equal(t, h, result, "methods should return the same handler instance")
+	assert.True(t, h == chainedHandler, "methods should return the same handler instance")
 }
 
 func TestStreamAndCacheAbortsOnUpstreamError(t *testing.T) {
@@ -443,7 +443,7 @@ func TestStreamAndCacheAbortsOnUpstreamError(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	c := mustNewMemoryCache()
+	c := mustNewMemoryCache(t)
 	ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
 	h := handler.New(http.DefaultClient, c).
@@ -504,7 +504,7 @@ func TestCacheWriteFailureDoesNotTruncateResponse(t *testing.T) {
 		{name: "CreateFails", createErr: errors.New("headers exceed S3 metadata limit")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			mem := mustNewMemoryCache()
+			mem := mustNewMemoryCache(t)
 			defer mem.Close()
 			ctx := logging.ContextWithLogger(context.Background(), slog.Default())
 
@@ -527,13 +527,15 @@ func TestCacheWriteFailureDoesNotTruncateResponse(t *testing.T) {
 	}
 }
 
-func mustNewMemoryCache() cache.Cache {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+func mustNewMemoryCache(t *testing.T) cache.Cache {
+	t.Helper()
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{
 		MaxTTL: time.Hour,
 	})
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
+	t.Cleanup(func() { assert.NoError(t, c.Close()) })
 	return c
 }
