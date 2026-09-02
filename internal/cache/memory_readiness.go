@@ -104,8 +104,8 @@ func (r *memoryReadiness) probe(shardIndex int) {
 	if readErr != nil || closeErr != nil || !bytes.Equal(body, memoryReadinessPayload(shardIndex)) {
 		return
 	}
-	// Store elapsed monotonic time plus one so zero remains the never-succeeded sentinel.
-	r.lastSuccess[shardIndex].Store(time.Since(r.startedAt).Nanoseconds() + 1)
+	nonzeroElapsed := time.Since(r.startedAt).Nanoseconds() + 1
+	r.lastSuccess[shardIndex].Store(nonzeroElapsed)
 }
 
 func (r *memoryReadiness) ready() bool {

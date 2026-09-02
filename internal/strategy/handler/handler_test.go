@@ -420,14 +420,13 @@ func TestHandlerMethodChaining(t *testing.T) {
 	client := &http.Client{}
 
 	h := handler.New(client, c)
-	result := h.
+	chainedHandler := h.
 		CacheKey(func(_ *http.Request) string { return "key" }).
 		Transform(func(r *http.Request) (*http.Request, error) { return r, nil }).
 		OnError(func(_ error, _ http.ResponseWriter, _ *http.Request) {}).
 		TTL(func(_ *http.Request) time.Duration { return time.Hour })
 
-	// Compare identity because deep equality traverses the cache's live atomic state.
-	assert.True(t, h == result, "methods should return the same handler instance")
+	assert.True(t, h == chainedHandler, "methods should return the same handler instance")
 }
 
 func TestStreamAndCacheAbortsOnUpstreamError(t *testing.T) {
