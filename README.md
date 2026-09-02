@@ -169,6 +169,14 @@ hit. Writes go to all tiers in parallel. Replica invalidations evict only non-au
 is authoritative. Tiered caches use the metadata backend to track authoritative ETags and invalidate stale lower-tier
 copies before falling through to the authoritative tier.
 
+Tier-zero backfills are opportunistic and never delay the source response. Cachew
+coalesces concurrent fills for the same namespace, key, and source ETag, runs at
+most eight fills at once, and permits at most 32 MiB of aggregate queued body
+data per process. Fills have a five-minute lifetime. A duplicate request or a
+fill that reaches any ceiling is served normally without populating tier zero;
+a later request can retry the fill. Only a body read completely through EOF and
+then closed successfully is committed.
+
 ### Memory
 
 In-memory sharded CLOCK cache with bounded admission and eviction work. Cache
