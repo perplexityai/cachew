@@ -15,6 +15,13 @@
 
 state = "./state"
 url = "http://127.0.0.1:8080"
+
+# Non-blocking process-wide load shedding. Zero disables admission.
+request-admission {
+  limit    = 0
+  reserved = 0
+}
+
 log {
   level = "debug"
 }
