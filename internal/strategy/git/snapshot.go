@@ -560,18 +560,16 @@ func (s *Strategy) streamSnapshotArtifact(_ context.Context, w http.ResponseWrit
 	return nil
 }
 
-// serveReaderFast serves the content from reader using the most efficient method
-// available. When reader is an *os.File, it uses http.ServeContent which enables
-// sendfile(2) zero-copy I/O and automatic Content-Length/Range support. For other
-// reader types it falls back to io.Copy. Returns bytes served for metrics.
 func serveReaderFast(w http.ResponseWriter, r *http.Request, reader io.Reader) (int64, error) {
-	if f, ok := reader.(*os.File); ok {
+	f, _ := reader.(*os.File)
+	if provider, ok := reader.(interface{ RawFile() *os.File }); ok {
+		f = provider.RawFile()
+	}
+	if f != nil {
 		info, err := f.Stat()
 		if err != nil {
 			return 0, errors.Wrap(err, "stat file for serving")
 		}
-		// http.ServeContent handles Content-Length, Range requests, and uses
-		// sendfile(2) for zero-copy transfer from file to socket.
 		http.ServeContent(w, r, "", time.Time{}, f)
 		return info.Size(), nil
 	}
