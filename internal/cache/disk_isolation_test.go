@@ -377,6 +377,10 @@ func TestTieredReadBypassesUnavailableLocalTier(t *testing.T) {
 }
 
 func TestTieredReadTreatsUnavailableAuthoritativeTierAsMiss(t *testing.T) {
+	metrics := &recordingDiskMetrics{}
+	previousMetrics := defaultDiskMetrics
+	defaultDiskMetrics = metrics
+	t.Cleanup(func() { defaultDiskMetrics = previousMetrics })
 	tiered := Tiered{caches: []Cache{NoOpCache(), unavailableReadCache{Cache: NoOpCache()}}}
 	key := NewKey("authoritative-unavailable")
 
@@ -390,6 +394,12 @@ func TestTieredReadTreatsUnavailableAuthoritativeTierAsMiss(t *testing.T) {
 	assert.IsError(t, err, os.ErrNotExist)
 	_, _, err = authoritative.Open(t.Context(), key)
 	assert.IsError(t, err, os.ErrNotExist)
+	assert.Equal(t, []recordedDiskReadEvent{
+		{event: diskReadEventAuthoritativeMiss, operation: diskReadOperationStat, tier: backendUnknown},
+		{event: diskReadEventAuthoritativeMiss, operation: diskReadOperationOpen, tier: backendUnknown},
+		{event: diskReadEventAuthoritativeMiss, operation: diskReadOperationStat, tier: backendUnknown},
+		{event: diskReadEventAuthoritativeMiss, operation: diskReadOperationOpen, tier: backendUnknown},
+	}, metrics.snapshot())
 }
 
 func TestTieredUnavailableAuthoritativeTierPreservesDeferredError(t *testing.T) {
