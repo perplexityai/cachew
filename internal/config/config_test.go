@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/hcl/v2"
@@ -237,4 +238,30 @@ func TestLoadRequiresMetadataBackend(t *testing.T) {
 	_, _, err = Load(ctx, cr, mr, sr, ast, http.NewServeMux(), nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "expected a metadata backend")
+}
+
+func TestLoadIncludesCacheReadiness(t *testing.T) {
+	cr := cache.NewRegistry()
+	cache.RegisterMemory(cr)
+	mr := metadatadb.NewRegistry()
+	metadatadb.RegisterMemory(mr)
+	sr := strategy.NewRegistry()
+	strategy.RegisterAPIV1(sr)
+	ast, err := hcl.Parse(strings.NewReader(`
+cache memory {}
+metadata memory {}
+`))
+	assert.NoError(t, err)
+
+	baseCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ctx := logging.ContextWithLogger(baseCtx, slog.Default())
+	_, readiers, err := Load(ctx, cr, mr, sr, ast, http.NewServeMux(), nil)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(readiers))
+	deadline := time.Now().Add(2 * time.Second)
+	for !readiers[0].Ready() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	assert.True(t, readiers[0].Ready())
 }
