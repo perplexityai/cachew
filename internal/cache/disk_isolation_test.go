@@ -15,11 +15,40 @@ import (
 	"time"
 
 	"github.com/alecthomas/assert/v2"
+	"github.com/alecthomas/errors"
 
 	"github.com/block/cachew/internal/logging"
 )
 
 const diskIsolationTestTimeout = 20 * time.Millisecond
+
+type recordedDiskReadEvent struct {
+	event     diskReadEvent
+	operation diskReadOperation
+	tier      BackendType
+}
+
+type recordingDiskMetrics struct {
+	mu     sync.Mutex
+	events []recordedDiskReadEvent
+}
+
+func (r *recordingDiskMetrics) record(
+	_ context.Context,
+	event diskReadEvent,
+	operation diskReadOperation,
+	tier BackendType,
+) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, recordedDiskReadEvent{event: event, operation: operation, tier: tier})
+}
+
+func (r *recordingDiskMetrics) snapshot() []recordedDiskReadEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]recordedDiskReadEvent(nil), r.events...)
+}
 
 func waitForDiskSlots(t *testing.T, isolation *diskReadIsolation) {
 	t.Helper()
@@ -41,6 +70,8 @@ func waitForDiskCloseSlots(t *testing.T, isolation *diskReadIsolation) {
 
 func TestDiskReadIsolationTimesOutBlockedStat(t *testing.T) {
 	isolation := newDiskReadIsolation(t.Context(), 1, diskIsolationTestTimeout, time.Second)
+	metrics := &recordingDiskMetrics{}
+	isolation.metrics = metrics
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var attempts atomic.Int64
@@ -62,6 +93,9 @@ func TestDiskReadIsolationTimesOutBlockedStat(t *testing.T) {
 	})
 	assert.IsError(t, err, ErrTierUnavailable)
 	assert.Equal(t, int64(1), attempts.Load())
+	assert.Equal(t, []recordedDiskReadEvent{{
+		event: diskReadEventBreakerTrip, operation: diskReadOperationStat, tier: backendDisk,
+	}}, metrics.snapshot())
 
 	close(release)
 	waitForDiskSlots(t, isolation)
@@ -127,12 +161,22 @@ func TestDiskReadIsolationBoundsBlockedOpen(t *testing.T) {
 func TestDiskReadIsolationDoesNotHoldSlotAcrossReaderLifetime(t *testing.T) {
 	isolation := newDiskReadIsolation(t.Context(), 1, time.Second, time.Second)
 	readers := make([]io.ReadCloser, 0, 65)
-	for range 65 {
-		reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+	reader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
+		return io.NopCloser(strings.NewReader("healthy")), http.Header{}, nil
+	})
+	assert.NoError(t, err)
+	readers = append(readers, reader)
+	buffer := make([]byte, 1)
+	_, err = reader.Read(buffer)
+	assert.NoError(t, err)
+	assert.Equal(t, byte('h'), buffer[0])
+
+	for range 64 {
+		openedReader, _, err := isolation.open(t.Context(), func(context.Context) (io.ReadCloser, http.Header, error) {
 			return io.NopCloser(strings.NewReader("healthy")), http.Header{}, nil
 		})
 		assert.NoError(t, err)
-		readers = append(readers, reader)
+		readers = append(readers, openedReader)
 	}
 	assert.Equal(t, 0, len(isolation.readSlots))
 	for _, reader := range readers {
@@ -292,6 +336,19 @@ type unavailableReadCache struct {
 	Cache
 }
 
+type errorReadCache struct {
+	Cache
+	err error
+}
+
+func (c errorReadCache) Stat(context.Context, Key, ...Option) (http.Header, error) {
+	return nil, c.err
+}
+
+func (c errorReadCache) Open(context.Context, Key, ...Option) (io.ReadCloser, http.Header, error) {
+	return nil, nil, c.err
+}
+
 func (c unavailableReadCache) Stat(context.Context, Key, ...Option) (http.Header, error) {
 	return nil, diskTierUnavailable("test tier unavailable")
 }
@@ -333,4 +390,21 @@ func TestTieredReadTreatsUnavailableAuthoritativeTierAsMiss(t *testing.T) {
 	assert.IsError(t, err, os.ErrNotExist)
 	_, _, err = authoritative.Open(t.Context(), key)
 	assert.IsError(t, err, os.ErrNotExist)
+}
+
+func TestTieredUnavailableAuthoritativeTierPreservesDeferredError(t *testing.T) {
+	hardErr := errors.New("deferred tier failure")
+	tiered := Tiered{caches: []Cache{
+		errorReadCache{Cache: NoOpCache(), err: ErrPreconditionFailed},
+		errorReadCache{Cache: NoOpCache(), err: hardErr},
+		unavailableReadCache{Cache: NoOpCache()},
+	}}
+	key := NewKey("authoritative-unavailable-after-error")
+
+	_, err := tiered.Stat(t.Context(), key)
+	assert.IsError(t, err, hardErr)
+	assert.False(t, errors.Is(err, os.ErrNotExist))
+	_, _, err = tiered.Open(t.Context(), key)
+	assert.IsError(t, err, hardErr)
+	assert.False(t, errors.Is(err, os.ErrNotExist))
 }

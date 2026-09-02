@@ -241,7 +241,8 @@ timeout marks reads degraded for 30 seconds. During that window a tiered cache
 tries deeper storage, while an unavailable authoritative disk is treated as a
 miss so the caller can regenerate or fetch the object upstream instead of
 returning HTTP 500. The request whose body stalls still fails because its
-response may already have started.
+response may already have started. `cachew.disk.read_events_total` attributes
+breaker trips and authoritative misses by operation and tier.
 
 ```hcl
 disk {

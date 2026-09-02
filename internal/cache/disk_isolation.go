@@ -46,6 +46,7 @@ type diskReadIsolation struct {
 	readIdleTimeout  time.Duration
 	degradedUntil    atomic.Int64
 	buffers          sync.Pool
+	metrics          diskMetricRecorder
 }
 
 func newDiskReadIsolation(
@@ -60,6 +61,7 @@ func newDiskReadIsolation(
 		closeSlots:       make(chan struct{}, concurrency),
 		operationTimeout: operationTimeout,
 		readIdleTimeout:  readIdleTimeout,
+		metrics:          defaultDiskMetrics,
 	}
 	isolation.buffers.New = func() any { return &diskReadBuffer{} }
 	return isolation
@@ -75,18 +77,18 @@ func (d *diskReadIsolation) putBuffer(buffer *diskReadBuffer) {
 	}
 }
 
-// acquire waits within the caller's operation deadline. Existing streams may
-// finish while the breaker is open; only new Stat and Open calls are bypassed.
-func (d *diskReadIsolation) acquire(ctx context.Context, existingStream bool) error {
+// acquire waits within the caller's operation deadline while the breaker
+// prevents new Stat and Open work from entering a degraded disk tier.
+func (d *diskReadIsolation) acquire(ctx context.Context) error {
 	if cause := context.Cause(ctx); cause != nil {
 		return errors.WithStack(cause)
 	}
-	if !existingStream && time.Now().UnixNano() < d.degradedUntil.Load() {
+	if time.Now().UnixNano() < d.degradedUntil.Load() {
 		return diskTierUnavailable("disk reads are temporarily degraded")
 	}
 	select {
 	case d.readSlots <- struct{}{}:
-		if !existingStream && time.Now().UnixNano() < d.degradedUntil.Load() {
+		if time.Now().UnixNano() < d.degradedUntil.Load() {
 			d.releaseRead()
 			return diskTierUnavailable("disk reads are temporarily degraded")
 		}
@@ -106,7 +108,7 @@ func (d *diskReadIsolation) acquireRead(ctx context.Context, timeout <-chan time
 	case d.readSlots <- struct{}{}:
 		return nil
 	case <-timeout:
-		d.trip()
+		d.trip(context.WithoutCancel(ctx), diskReadOperationRead)
 		return timeoutErr
 	case <-ctx.Done():
 		return errors.WithStack(context.Cause(ctx))
@@ -119,11 +121,15 @@ func (d *diskReadIsolation) releaseRead() {
 	<-d.readSlots
 }
 
-func (d *diskReadIsolation) trip() {
+func (d *diskReadIsolation) trip(ctx context.Context, operation diskReadOperation) {
 	until := time.Now().Add(diskDegradedDuration).UnixNano()
 	for {
 		current := d.degradedUntil.Load()
-		if current >= until || d.degradedUntil.CompareAndSwap(current, until) {
+		if current >= until {
+			return
+		}
+		if d.degradedUntil.CompareAndSwap(current, until) {
+			recordDiskReadEvent(ctx, d.metrics, diskReadEventBreakerTrip, operation, backendDisk)
 			return
 		}
 	}
@@ -136,6 +142,7 @@ func diskTierUnavailable(message string) error {
 func (d *diskReadIsolation) operationContext(
 	ctx context.Context,
 	timeoutErr error,
+	operation diskReadOperation,
 ) (context.Context, func()) {
 	parent, cancelParent := context.WithCancelCause(ctx)
 	stopDiskCancel := context.AfterFunc(d.ctx, func() {
@@ -144,7 +151,7 @@ func (d *diskReadIsolation) operationContext(
 	opCtx, cancelTimeout := context.WithTimeoutCause(parent, d.operationTimeout, timeoutErr)
 	stopTrip := context.AfterFunc(opCtx, func() {
 		if errors.Is(context.Cause(opCtx), timeoutErr) {
-			d.trip()
+			d.trip(context.WithoutCancel(opCtx), operation)
 		}
 	})
 	return opCtx, func() {
@@ -164,8 +171,8 @@ func (d *diskReadIsolation) stat(
 	ctx context.Context,
 	stat func(context.Context) (http.Header, error),
 ) (http.Header, error) {
-	opCtx, cleanup := d.operationContext(ctx, errDiskStatTimeout)
-	if err := d.acquire(opCtx, false); err != nil {
+	opCtx, cleanup := d.operationContext(ctx, errDiskStatTimeout, diskReadOperationStat)
+	if err := d.acquire(opCtx); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -197,8 +204,8 @@ func (d *diskReadIsolation) open(
 	ctx context.Context,
 	open func(context.Context) (io.ReadCloser, http.Header, error),
 ) (io.ReadCloser, http.Header, error) {
-	opCtx, cleanup := d.operationContext(ctx, errDiskOpenTimeout)
-	if err := d.acquire(opCtx, false); err != nil {
+	opCtx, cleanup := d.operationContext(ctx, errDiskOpenTimeout, diskReadOperationOpen)
+	if err := d.acquire(opCtx); err != nil {
 		cleanup()
 		return nil, nil, err
 	}
@@ -328,7 +335,7 @@ func (r *isolatedDiskReader) Read(p []byte) (int, error) {
 		}
 		return outcome.n, outcome.err //nolint:wrapcheck // Preserve io.Reader errors, including io.EOF.
 	case <-r.readTimer.C:
-		r.isolation.trip()
+		r.isolation.trip(context.WithoutCancel(r.ctx), diskReadOperationRead)
 		r.readConsumed <- struct{}{}
 		r.startClose(errDiskBodyReadTimeout)
 		return 0, errDiskBodyReadTimeout
@@ -420,7 +427,7 @@ func (r *isolatedDiskReader) Close() error {
 	case <-r.done:
 		return errors.WithStack(r.closeErr)
 	case <-timer.C:
-		r.isolation.trip()
+		r.isolation.trip(context.WithoutCancel(r.ctx), diskReadOperationClose)
 		return errDiskCloseTimeout
 	}
 }
