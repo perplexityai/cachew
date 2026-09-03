@@ -125,7 +125,11 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.proxyHandler.ServeHTTP(w, r)
 		return
 	}
-	if s.cached(path, r) {
+	cached, err := s.cached(path, r)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "Failed to inspect Go module cache", "error", err)
+	}
+	if cached {
 		r.Header.Set(disableModuleFetchHeader, "true")
 		s.proxyHandler.ServeHTTP(w, r)
 		return
@@ -140,9 +144,9 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	s.proxyHandler.ServeHTTP(w, r)
 }
 
-func (s *Strategy) cached(path string, r *http.Request) bool {
+func (s *Strategy) cached(path string, r *http.Request) (bool, error) {
 	if s.cacher == nil || r.URL.RawQuery != "" || r.Header.Get("Range") != "" {
-		return false
+		return false, nil
 	}
 	return s.cacher.Exists(r.Context(), path)
 }

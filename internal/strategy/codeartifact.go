@@ -342,6 +342,10 @@ func (c *CodeArtifact) allowPackage(w http.ResponseWriter, r *http.Request) bool
 	if c.packagePolicy == nil || r.Method != http.MethodGet {
 		return true
 	}
+	if r.URL.RawQuery != "" {
+		c.packagePolicy.ObserveNotApplicable(r.Context())
+		return true
+	}
 	purl, ok := packagepolicy.PackageURLForCodeArtifact(c.originURL(r).Path)
 	if !ok {
 		c.packagePolicy.ObserveNotApplicable(r.Context())
