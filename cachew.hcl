@@ -11,6 +11,15 @@
 #   domain-owner   = "111122223333"
 #   region         = "us-east-1"
 #   role-arn       = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
+#   package-policy {
+#     exclude-purls = ["pkg:npm/%40myorg/*", "pkg:pypi/myorg-*@*"]
+#
+#     socket {
+#       api-url      = "https://api.socket.dev"
+#       organization = "my-socket-org"
+#       token        = "${SOCKET_SECURITY_API_TOKEN}"
+#     }
+#   }
 # }
 
 state = "./state"
@@ -77,6 +86,13 @@ strategy github-releases {
 
 strategy gomod {
   proxy = "https://proxy.golang.org"
+  # package-policy {
+  #   socket {
+  #     api-url      = "https://api.socket.dev"
+  #     organization = "my-socket-org"
+  #     token        = "${SOCKET_SECURITY_API_TOKEN}"
+  #   }
+  # }
 }
 
 strategy hermit { }

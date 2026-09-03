@@ -58,8 +58,29 @@ export GOPROXY=http://cachew.example.com/gomod,direct
 gomod {
   proxy         = "https://proxy.golang.org"
   private-paths = ["github.com/myorg/*"]
+
+  package-policy {
+    socket {
+      api-url      = "https://api.socket.dev"
+      organization = "my-socket-org"
+      token        = "${SOCKET_SECURITY_API_TOKEN}"
+    }
+  }
 }
 ```
+
+When `package-policy` is configured, Cachew evaluates the PURL for each cold,
+canonical-version public module before it contacts the Go module origin. Branch
+and revision `.info` queries pass through so the Go proxy can resolve them; the
+resulting canonical version's module files are evaluated before download. Cached
+module files bypass the check. The `socket` provider sends the PURL to Socket;
+modules matching `private-paths` are not sent.
+
+The warm-path cache probe does not read or backfill the module body. It also
+disables origin fallback for that request. If the object is evicted between the
+probe and goproxy's body read, goproxy returns its temporary `404` rather than
+fetching an unevaluated body; a later client retry performs a normal miss and
+policy evaluation.
 
 ### Hermit
 
@@ -99,6 +120,16 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
   credential-timeout       = "15s"
   origin-header-timeout    = "30s"
   origin-read-idle-timeout = "30s"
+
+  package-policy {
+    exclude-purls = ["pkg:npm/%40myorg/*", "pkg:pypi/myorg-*@*"]
+
+    socket {
+      api-url      = "https://api.socket.dev"
+      organization = "my-socket-org"
+      token        = "${SOCKET_SECURITY_API_TOKEN}"
+    }
+  }
 }
 ```
 
@@ -126,6 +157,74 @@ through their lifetime.
 
 Omitting a timeout or setting it to zero uses the documented default. Negative
 timeout values are rejected.
+
+The optional `package-policy` block is a provider-independent package-admission
+interface based on standard Package URLs (PURLs). Its `socket` provider checks
+cold npm and PyPI artifact PURLs with the configured organization's [Socket
+package policy](https://docs.socket.dev/reference/batchpackagefetchbyorg) before
+Cachew mints a CodeArtifact token or contacts the repository. Another provider
+can implement the same PURL-to-decision interface without changing the
+CodeArtifact or Go module strategies.
+
+`exclude-purls` accepts Go-style path glob patterns for npm and PyPI PURLs.
+Matching packages are recorded as `not_applicable` and continue to the origin without sending their
+names or versions to the policy provider. Use it for private npm and PyPI
+packages that share a CodeArtifact repository with public dependencies.
+
+For the Socket provider, a policy action of `error`, or a package Socket cannot
+resolve, returns `403`. Pending analysis, provider failures, and malformed
+responses fail open: Cachew records the outcome and continues to the package
+origin. Cache hits do not recheck the policy because Cachew only admits complete,
+origin-declared immutable bodies.
+
+A later policy change does not automatically invalidate an admitted object.
+Cachew's generic `delete` operation accepts one exact cache key, but CodeArtifact
+can store multiple representations of one URL. The unhashed key material is the
+origin URL followed by these optional lines, in this order:
+
+```text
+https://codeartifact.example.com/npm/repository/package/-/package-1.0.0.tgz
+Accept=<comma-joined request values>
+Accept-Encoding=<comma-joined request values>
+```
+
+`cachew delete codeartifact <key-material>` hashes that material and deletes the
+matching object from every backend configured in that Cachew deployment. Run it
+against every deployment that may hold a local tier. A separate key exists for
+every observed header combination, and Cachew cannot currently list or delete
+keys by package path or PURL. The command is therefore a complete targeted purge
+only when every request variant is known. Otherwise operators must clear every
+backing tier with deployment-specific tooling or wait for the origin TTL; Cachew
+does not currently provide a reliable targeted purge for that incident.
+
+Socket receives the public ecosystem, package name, and version from the
+CodeArtifact request path. Cachew does not send package contents, CodeArtifact
+credentials, repository names, or AWS identity to Socket. Operators should
+still treat the package name and version as data crossing from their
+CodeArtifact environment to Socket's SaaS boundary.
+
+The Socket token needs only the `packages:list` scope. Keep it out of the HCL
+file by using an environment placeholder as shown above and inject
+`SOCKET_SECURITY_API_TOKEN` into the Cachew container from the deployment's
+secret manager. For example, Kubernetes can source the environment variable
+from a `Secret` with `env[].valueFrom.secretKeyRef`; the secret does not need to
+be exposed to package-manager clients.
+
+Policy outcomes and API latency are exported as
+`cachew.package_policy.evaluations_total` and
+`cachew.package_policy.evaluation_duration_seconds`. The evaluation counter has
+bounded provider and outcome attributes (`allow`, `deny`, `pending`,
+`unavailable`, or `not_applicable`); package names and versions are not metric
+labels. The latency histogram covers actual provider evaluations. Unsupported
+ecosystems, non-package metadata or query paths, and excluded private Go modules
+record `not_applicable` so gaps in enforcement coverage remain visible. Metadata
+GETs can dominate that outcome, so dashboards should chart it separately and
+exclude it from allow/deny availability ratios. `HEAD` requests are not counted
+because they cannot admit a package body.
+
+Concurrent requests for the same PURL share one in-flight provider call. Cachew
+discards the decision after that call completes: a later cold request performs a
+fresh evaluation, so coalescing does not delay a changed Socket verdict.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,
