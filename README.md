@@ -122,6 +122,8 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
   origin-read-idle-timeout = "30s"
 
   package-policy {
+    exclude-purls = ["pkg:npm/%40myorg/*", "pkg:pypi/myorg-*@*"]
+
     socket {
       api-url      = "https://api.socket.dev"
       organization = "my-socket-org"
@@ -163,6 +165,11 @@ package policy](https://docs.socket.dev/reference/batchpackagefetchbyorg) before
 Cachew mints a CodeArtifact token or contacts the repository. Another provider
 can implement the same PURL-to-decision interface without changing the
 CodeArtifact or Go module strategies.
+
+`exclude-purls` accepts Go-style path glob patterns for npm and PyPI PURLs.
+Matching packages are recorded as `not_applicable` and continue to the origin without sending their
+names or versions to the policy provider. Use it for private npm and PyPI
+packages that share a CodeArtifact repository with public dependencies.
 
 For the Socket provider, a policy action of `error`, or a package Socket cannot
 resolve, returns `403`. Pending analysis, provider failures, and malformed
