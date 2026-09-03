@@ -214,24 +214,25 @@ func (r *recordingPackagePolicy) ObserveNotApplicable(context.Context) {
 	r.notApplicable++
 }
 
-func TestCodeArtifactRecordsUnsupportedPolicyRequest(t *testing.T) {
-	target, err := url.Parse("https://codeartifact.example.com")
-	assert.NoError(t, err)
-	policy := &recordingPackagePolicy{}
-	strategy := &CodeArtifact{
-		target:        target,
-		prefix:        "/codeartifact.example.com",
-		packagePolicy: policy,
-	}
-	request := httptest.NewRequest(
-		http.MethodGet,
+func TestCodeArtifactRecordsNotApplicablePolicyRequests(t *testing.T) {
+	for _, requestURL := range []string{
 		"/codeartifact.example.com/maven/repository/example.jar",
-		nil,
-	)
+		"/codeartifact.example.com/npm/repository/example/-/example-1.0.0.tgz?download=1",
+	} {
+		target, err := url.Parse("https://codeartifact.example.com")
+		assert.NoError(t, err)
+		policy := &recordingPackagePolicy{}
+		strategy := &CodeArtifact{
+			target:        target,
+			prefix:        "/codeartifact.example.com",
+			packagePolicy: policy,
+		}
+		request := httptest.NewRequest(http.MethodGet, requestURL, nil)
 
-	assert.True(t, strategy.allowPackage(httptest.NewRecorder(), request))
-	assert.Equal(t, 1, policy.notApplicable)
-	assert.Equal(t, []string(nil), policy.purls)
+		assert.True(t, strategy.allowPackage(httptest.NewRecorder(), request))
+		assert.Equal(t, 1, policy.notApplicable)
+		assert.Equal(t, []string(nil), policy.purls)
+	}
 }
 
 func TestCodeArtifactHandlesPackagePolicyBeforeOriginAuthentication(t *testing.T) {

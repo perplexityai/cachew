@@ -29,10 +29,14 @@ type cacheProbe struct {
 	cache.Cache
 	statCalls int
 	openCalls int
+	statErr   error
 }
 
 func (c *cacheProbe) Stat(ctx context.Context, key cache.Key, opts ...cache.Option) (http.Header, error) {
 	c.statCalls++
+	if c.statErr != nil {
+		return nil, c.statErr
+	}
 	return c.Cache.Stat(ctx, key, opts...)
 }
 
@@ -136,6 +140,16 @@ func TestGoModuleCachedPackageBypassesPackagePolicy(t *testing.T) {
 	assert.Equal(t, []string(nil), policy.purls)
 	assert.Equal(t, 1, probe.statCalls)
 	assert.Equal(t, 0, probe.openCalls)
+}
+
+func TestGoModuleCacheExistsReturnsStatFailure(t *testing.T) {
+	probe := &cacheProbe{Cache: cache.NoOpCache(), statErr: io.ErrUnexpectedEOF}
+	cacher := &goproxyCacher{cache: probe}
+
+	exists, err := cacher.Exists(t.Context(), "github.com/pkg/errors/@v/v0.9.1.zip")
+
+	assert.False(t, exists)
+	assert.IsError(t, err, io.ErrUnexpectedEOF)
 }
 
 func TestGoModulePrivatePackageBypassesPackagePolicy(t *testing.T) {

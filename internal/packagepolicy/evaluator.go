@@ -34,7 +34,9 @@ type Decision struct {
 
 // Evaluator checks package URLs against a package policy.
 type Evaluator interface {
+	// Evaluate separates policy decisions from provider failures so callers can choose fail-open behavior.
 	Evaluate(context.Context, string) (Decision, error)
+	// ObserveNotApplicable keeps bypassed requests visible without sending package coordinates to the provider.
 	ObserveNotApplicable(context.Context)
 }
 
@@ -63,6 +65,7 @@ type excludingEvaluator struct {
 	patterns []string
 }
 
+// Evaluate keeps excluded package coordinates out of the provider request.
 func (e *excludingEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
 	for _, pattern := range e.patterns {
 		matched, err := path.Match(pattern, purl)
