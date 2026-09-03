@@ -68,6 +68,52 @@ func TestNewSelectsSocketProvider(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestNewExcludesPURLsBeforeProviderEvaluation(t *testing.T) {
+	var requests atomic.Int32
+	evaluator, err := New(Config{
+		ExcludePURLs: []string{"pkg:npm/%40pplx-internal/*", "pkg:pypi/pplx-*@*"},
+		Socket: &SocketConfig{
+			APIURL:       "https://socket.example.com",
+			Organization: testOrganization,
+			Token:        testToken,
+		},
+	})
+	assert.NoError(t, err)
+	excluding := evaluator.(*excludingEvaluator)
+	socket := excluding.Evaluator.(*socketEvaluator)
+	metrics := &recordingMetrics{}
+	socket.metrics = metrics
+	socket.httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, errors.New("unexpected Socket request")
+	})
+
+	for _, purl := range []string{
+		"pkg:npm/%40pplx-internal/agents@1.2.3",
+		"pkg:pypi/pplx-sdk@0.4.0",
+	} {
+		decision, err := evaluator.Evaluate(t.Context(), purl)
+		assert.NoError(t, err)
+		assert.Equal(t, VerdictNotApplicable, decision.Verdict)
+	}
+	assert.Equal(t, int32(0), requests.Load())
+	assert.Equal(t, int32(2), metrics.notApplicable.Load())
+
+	_, err = evaluator.Evaluate(t.Context(), testPURL)
+	assert.Error(t, err)
+	assert.Equal(t, int32(1), requests.Load())
+}
+
+func TestNewRejectsInvalidExclusionPatterns(t *testing.T) {
+	for _, pattern := range []string{"pkg:npm/[", "pkg:golang/github.com/ppl-ai/*"} {
+		_, err := New(Config{
+			ExcludePURLs: []string{pattern},
+			Socket:       &SocketConfig{Organization: testOrganization, Token: testToken},
+		})
+		assert.Error(t, err)
+	}
+}
+
 func TestClientEvaluatesOrganizationPolicy(t *testing.T) {
 	tests := []struct {
 		name     string

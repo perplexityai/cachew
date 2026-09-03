@@ -12,6 +12,8 @@
 #   region         = "us-east-1"
 #   role-arn       = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
 #   package-policy {
+#     exclude-purls = ["pkg:npm/%40myorg/*", "pkg:pypi/myorg-*@*"]
+#
 #     socket {
 #       api-url      = "https://api.socket.dev"
 #       organization = "my-socket-org"
