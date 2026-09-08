@@ -51,7 +51,7 @@ func Archive(ctx context.Context, w io.Writer, baseDir string, includePaths []st
 }
 
 // Extract decompresses a zstd+tar stream from r into directory, preserving
-// file permissions, ownership, and symlinks. threads controls zstd
+// file permissions, ownership, and symlinks. threads controls pzstd
 // parallelism; 0 uses all CPU cores.
 //
 // Existing read-only directories are made owner-writable so tar can replace
@@ -79,7 +79,7 @@ func Extract(ctx context.Context, r io.Reader, directory string, threads int) (r
 		return errors.Wrap(err, "failed to make target directory writable")
 	}
 
-	zstdCmd := exec.CommandContext(ctx, "zstd", "-dc", fmt.Sprintf("-T%d", threads)) //nolint:gosec
+	zstdCmd := exec.CommandContext(ctx, "pzstd", "-dc", fmt.Sprintf("-p%d", threads)) //nolint:gosec
 	tarCmd := exec.CommandContext(ctx, "tar", "-xpf", "-", "-C", directory)
 
 	pr, pw, err := os.Pipe()
@@ -98,7 +98,7 @@ func Extract(ctx context.Context, r io.Reader, directory string, threads int) (r
 	if err := zstdCmd.Start(); err != nil {
 		pw.Close() //nolint:errcheck,gosec
 		pr.Close() //nolint:errcheck,gosec
-		return errors.Wrap(err, "failed to start zstd")
+		return errors.Wrap(err, "failed to start pzstd")
 	}
 	pw.Close() //nolint:errcheck,gosec
 
