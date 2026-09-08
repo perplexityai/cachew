@@ -11,9 +11,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -385,6 +388,39 @@ func TestArchiveExtract(t *testing.T) {
 	}
 	assert.True(t, slices.Contains(names, "x.txt"))
 	assert.False(t, slices.Contains(names, "y.log"))
+}
+
+func TestExtractUsesParallelDecoder(t *testing.T) {
+	decoder, err := exec.LookPath("pzstd")
+	assert.NoError(t, err)
+	src := t.TempDir()
+	contents := bytes.Repeat([]byte("parallel snapshot data\n"), 500000)
+	assert.NoError(t, os.WriteFile(filepath.Join(src, "data"), contents, 0o644))
+	var archive bytes.Buffer
+	assert.NoError(t, client.Archive(t.Context(), &archive, src, []string{"data"}, nil, 2))
+
+	for _, threads := range []int{0, 2} {
+		t.Run(strconv.Itoa(threads), func(t *testing.T) {
+			bin := t.TempDir()
+			argsPath := filepath.Join(t.TempDir(), "args")
+			assert.NoError(t, os.WriteFile(filepath.Join(bin, "pzstd"), []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CACHEW_TEST_ARGS\"\nexec \"$CACHEW_TEST_PZSTD\" \"$@\"\n"), 0o755))
+			t.Setenv("CACHEW_TEST_PZSTD", decoder)
+			t.Setenv("CACHEW_TEST_ARGS", argsPath)
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			dst := t.TempDir()
+			assert.NoError(t, client.Extract(t.Context(), bytes.NewReader(archive.Bytes()), dst, threads))
+			got, err := os.ReadFile(filepath.Join(dst, "data"))
+			assert.NoError(t, err)
+			assert.Equal(t, contents, got)
+			args, err := os.ReadFile(argsPath)
+			assert.NoError(t, err)
+			workers := threads
+			if workers == 0 {
+				workers = runtime.GOMAXPROCS(0)
+			}
+			assert.Equal(t, []string{"-dc", "-p" + strconv.Itoa(workers)}, strings.Fields(string(args)))
+		})
+	}
 }
 
 func TestExtractOverReadOnlyTree(t *testing.T) {

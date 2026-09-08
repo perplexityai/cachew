@@ -24,6 +24,12 @@ Restore a repository from a snapshot (with automatic delta bundle to reach HEAD)
 cachew git restore https://github.com/org/repo ./repo
 ```
 
+Snapshot creation and extraction require `tar` and `pzstd` on `PATH`.
+Restores use `pzstd` to decode the parallel frames produced by Cachew's
+snapshot writer. `--zstd-threads` controls decompression workers (zero uses
+the process CPU budget); ordinary zstd archives remain readable, but a
+single-frame archive does not gain frame-level parallelism.
+
 ```hcl
 git {
   snapshot-interval = "1h"
