@@ -270,6 +270,7 @@ func newRegistries(
 	strategy.RegisterAPIV1(sr)
 	strategy.RegisterArtifactory(sr)
 	strategy.RegisterCodeArtifact(sr)
+	strategy.RegisterGitHubObjects(sr)
 	strategy.RegisterGitHubReleases(sr, tokenManagerProvider)
 	strategy.RegisterHermit(sr)
 	strategy.RegisterHost(sr)
