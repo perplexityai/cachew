@@ -11,7 +11,7 @@ import (
 
 var pypiNormalizationPattern = regexp.MustCompile(`[-_.]+`)
 
-// PackageURLForCodeArtifact derives a PURL from an immutable npm or PyPI CodeArtifact asset path.
+// PackageURLForCodeArtifact derives a PURL from an immutable npm, PyPI, Maven, or Cargo CodeArtifact asset path.
 func PackageURLForCodeArtifact(path string) (string, bool) {
 	parts, ok := decodedPathParts(path)
 	if !ok || len(parts) < 5 {
@@ -22,6 +22,10 @@ func PackageURLForCodeArtifact(path string) (string, bool) {
 		return npmPackageURL(parts)
 	case "pypi":
 		return pypiPackageURL(parts)
+	case "maven":
+		return mavenPackageURL(parts)
+	case "cargo":
+		return cargoPackageURL(parts)
 	default:
 		return "", false
 	}
@@ -56,6 +60,27 @@ func pypiPackageURL(parts []string) (string, bool) {
 	}
 	name := pypiNormalizationPattern.ReplaceAllString(strings.ToLower(parts[3]), "-")
 	return "pkg:pypi/" + escapePURLSegment(name) + "@" + escapePURLSegment(parts[4]), true
+}
+
+// mavenPackageURL maps <repo>/<group path>/<artifact>/<version>/<artifact>-<version>* files. Repository
+// metadata and mutable -SNAPSHOT versions are not package coordinates Socket can resolve, so they pass through.
+func mavenPackageURL(parts []string) (string, bool) {
+	if len(parts) < 6 {
+		return "", false
+	}
+	group, artifact, version, filename := parts[2:len(parts)-3], parts[len(parts)-3], parts[len(parts)-2], parts[len(parts)-1]
+	if strings.HasSuffix(version, "-SNAPSHOT") || !strings.HasPrefix(filename, artifact+"-"+version) {
+		return "", false
+	}
+	return "pkg:maven/" + escapePURLSegment(strings.Join(group, ".")) + "/" + escapePURLSegment(artifact) + "@" + escapePURLSegment(version), true
+}
+
+// cargoPackageURL maps the CodeArtifact crate download path <repo>/crates/<name>/<version>.
+func cargoPackageURL(parts []string) (string, bool) {
+	if len(parts) != 5 || parts[2] != "crates" {
+		return "", false
+	}
+	return "pkg:cargo/" + escapePURLSegment(parts[3]) + "@" + escapePURLSegment(parts[4]), true
 }
 
 // PackageURLForGoModule derives a PURL from a versioned Go module proxy path.

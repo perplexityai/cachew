@@ -45,9 +45,30 @@ func TestPackageURLForCodeArtifact(t *testing.T) {
 			purl: "pkg:npm/package%252Fname@1.0.0",
 			ok:   true,
 		},
+		{
+			name: "Maven jar",
+			path: "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar",
+			purl: "pkg:maven/com.perplexity/tool@1.2.3",
+			ok:   true,
+		},
+		{
+			name: "Maven pom shares the artifact coordinate",
+			path: "/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.pom",
+			purl: "pkg:maven/com.perplexity/tool@1.2.3",
+			ok:   true,
+		},
+		{
+			name: "Cargo crate",
+			path: "/cargo/repository/crates/serde/1.0.210",
+			purl: "pkg:cargo/serde@1.0.210",
+			ok:   true,
+		},
 		{name: "npm metadata", path: "/npm/repository/chromatitle-js", ok: false},
 		{name: "PyPI metadata", path: "/pypi/repository/simple/requests/", ok: false},
-		{name: "unsupported format", path: "/maven/repository/example.jar", ok: false},
+		{name: "Maven metadata", path: "/maven/repository/com/perplexity/tool/maven-metadata.xml", ok: false},
+		{name: "Maven snapshot", path: "/maven/repository/com/perplexity/tool/1.2.3-SNAPSHOT/tool-1.2.3-SNAPSHOT.jar", ok: false},
+		{name: "Cargo index", path: "/cargo/repository/config.json", ok: false},
+		{name: "unsupported format", path: "/nuget/repository/v3/flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg", ok: false},
 	}
 
 	for _, test := range tests {

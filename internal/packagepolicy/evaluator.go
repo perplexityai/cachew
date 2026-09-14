@@ -4,6 +4,7 @@ package packagepolicy
 import (
 	"context"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/alecthomas/errors"
@@ -11,7 +12,7 @@ import (
 
 // Config selects and configures one package policy provider.
 type Config struct {
-	ExcludePURLs []string      `hcl:"exclude-purls,optional" help:"npm and PyPI PURL glob patterns to exclude before provider evaluation."`
+	ExcludePURLs []string      `hcl:"exclude-purls,optional" help:"npm, PyPI, Maven, and Cargo PURL glob patterns to exclude before provider evaluation."`
 	Socket       *SocketConfig `hcl:"socket,block,optional" help:"Socket organization policy provider."`
 }
 
@@ -45,9 +46,11 @@ func New(config Config) (Evaluator, error) {
 	if config.Socket == nil {
 		return nil, errors.New("package policy: provider is required")
 	}
+	// The PURL types PackageURLForCodeArtifact can produce.
+	supportedTypes := []string{"pkg:npm/", "pkg:pypi/", "pkg:maven/", "pkg:cargo/"}
 	for _, pattern := range config.ExcludePURLs {
-		if !strings.HasPrefix(pattern, "pkg:npm/") && !strings.HasPrefix(pattern, "pkg:pypi/") {
-			return nil, errors.New("package policy: exclude-purls supports only npm and PyPI PURLs")
+		if !slices.ContainsFunc(supportedTypes, func(prefix string) bool { return strings.HasPrefix(pattern, prefix) }) {
+			return nil, errors.New("package policy: exclude-purls supports only npm, PyPI, Maven, and Cargo PURLs")
 		}
 		if _, err := path.Match(pattern, ""); err != nil {
 			return nil, errors.Wrap(err, "package policy: invalid exclude-purls pattern")
