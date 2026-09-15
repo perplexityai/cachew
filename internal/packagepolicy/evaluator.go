@@ -20,8 +20,11 @@ type Config struct {
 type Verdict string
 
 const (
-	VerdictAllow   Verdict = "allow"
-	VerdictDeny    Verdict = "deny"
+	// VerdictAllow permits the package.
+	VerdictAllow Verdict = "allow"
+	// VerdictDeny rejects the package.
+	VerdictDeny Verdict = "deny"
+	// VerdictPending indicates that the provider has not completed analysis.
 	VerdictPending Verdict = "pending"
 	// VerdictNotApplicable distinguishes privacy exclusions from provider-approved packages.
 	VerdictNotApplicable Verdict = "not_applicable"
@@ -46,7 +49,6 @@ func New(config Config) (Evaluator, error) {
 	if config.Socket == nil {
 		return nil, errors.New("package policy: provider is required")
 	}
-	// The PURL types PackageURLForCodeArtifact can produce.
 	supportedTypes := []string{"pkg:npm/", "pkg:pypi/", "pkg:maven/", "pkg:cargo/"}
 	for _, pattern := range config.ExcludePURLs {
 		if !slices.ContainsFunc(supportedTypes, func(prefix string) bool { return strings.HasPrefix(pattern, prefix) }) {

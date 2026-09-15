@@ -215,11 +215,21 @@ func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mode := classifyCodeArtifactRequest(r)
 	c.metric.recordRequest(r.Context(), mode)
-	if mode != codeArtifactCacheLookup {
-		c.serveOrigin(w, r, mode)
+	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return
 	}
-	if c.serveCached(w, r) {
+	decision, err := c.evaluatePackage(r)
+	if err != nil {
+		c.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
+	}
+	if !packagepolicy.AllowRequest(w, decision, err) {
+		return
+	}
+	if err != nil || decision.Verdict == packagepolicy.VerdictPending {
+		mode = codeArtifactCachePassthrough
+	}
+	if mode != codeArtifactCacheLookup {
+		c.serveOrigin(w, r, mode)
 		return
 	}
 
@@ -240,12 +250,10 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
-	if !c.allowPackage(w, r) {
-		return
-	}
 	rewriteMetadata := shouldRewriteCodeArtifactMetadata(c.originURL(r).Path)
-	token, authorized := c.authorizationToken(w, r)
-	if !authorized {
+	token, err := c.authorizationToken(r.Context())
+	if err != nil {
+		c.writeError(w, r, err)
 		return
 	}
 
@@ -327,35 +335,30 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	}
 }
 
-func (c *CodeArtifact) authorizationToken(w http.ResponseWriter, r *http.Request) (codeArtifactToken, bool) {
-	token, err := c.tokens.Token(r.Context(), 0)
+func (c *CodeArtifact) authorizationToken(ctx context.Context) (codeArtifactToken, error) {
+	token, err := c.tokens.Token(ctx, 0)
 	if err != nil {
-		c.metric.recordAuth(r.Context(), codeArtifactAuthFailure)
-		c.writeError(w, r, errors.Wrap(err, "obtain CodeArtifact authorization"))
-		return codeArtifactToken{}, false
+		c.metric.recordAuth(ctx, codeArtifactAuthFailure)
+		return codeArtifactToken{}, errors.Wrap(err, "obtain CodeArtifact authorization")
 	}
-	c.metric.recordAuth(r.Context(), token.event)
-	return token, true
+	c.metric.recordAuth(ctx, token.event)
+	return token, nil
 }
 
-func (c *CodeArtifact) allowPackage(w http.ResponseWriter, r *http.Request) bool {
+func (c *CodeArtifact) evaluatePackage(r *http.Request) (packagepolicy.Decision, error) {
 	if c.packagePolicy == nil || r.Method != http.MethodGet {
-		return true
-	}
-	if r.URL.RawQuery != "" {
-		c.packagePolicy.ObserveNotApplicable(r.Context())
-		return true
+		return packagepolicy.Decision{}, nil
 	}
 	purl, ok := packagepolicy.PackageURLForCodeArtifact(c.originURL(r).Path)
 	if !ok {
 		c.packagePolicy.ObserveNotApplicable(r.Context())
-		return true
+		return packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil
 	}
 	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {
-		c.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
+		return packagepolicy.Decision{}, errors.Wrap(err, "evaluate package policy")
 	}
-	return packagepolicy.AllowRequest(w, decision, err)
+	return decision, nil
 }
 
 func (c *CodeArtifact) rewriteOriginMetadata(

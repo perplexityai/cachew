@@ -15,6 +15,8 @@ type goproxyCacher struct {
 	cache cache.Cache
 }
 
+type skipCacheContextKey struct{}
+
 func (g *goproxyCacher) Exists(ctx context.Context, name string) (bool, error) {
 	_, err := g.cache.Stat(ctx, cache.NewKey(name))
 	if err == nil {
@@ -38,7 +40,7 @@ func (g *goproxyCacher) Get(ctx context.Context, name string) (io.ReadCloser, er
 }
 
 func (g *goproxyCacher) Put(ctx context.Context, name string, content io.ReadSeeker) error {
-	if strings.HasSuffix(name, "/@v/list") || strings.HasSuffix(name, "/@latest") {
+	if ctx.Value(skipCacheContextKey{}) != nil || strings.HasSuffix(name, "/@v/list") || strings.HasSuffix(name, "/@latest") {
 		return nil
 	}
 

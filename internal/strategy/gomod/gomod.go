@@ -138,6 +138,9 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
 	}
+	if err != nil || decision.Verdict == packagepolicy.VerdictPending {
+		r = r.WithContext(context.WithValue(r.Context(), skipCacheContextKey{}, struct{}{}))
+	}
 	if !packagepolicy.AllowRequest(w, decision, err) {
 		return
 	}

@@ -62,8 +62,6 @@ func pypiPackageURL(parts []string) (string, bool) {
 	return "pkg:pypi/" + escapePURLSegment(name) + "@" + escapePURLSegment(parts[4]), true
 }
 
-// mavenPackageURL maps <repo>/<group path>/<artifact>/<version>/<artifact>-<version>* files. Repository
-// metadata and mutable -SNAPSHOT versions are not package coordinates Socket can resolve, so they pass through.
 func mavenPackageURL(parts []string) (string, bool) {
 	if len(parts) < 6 {
 		return "", false
@@ -75,7 +73,6 @@ func mavenPackageURL(parts []string) (string, bool) {
 	return "pkg:maven/" + escapePURLSegment(strings.Join(group, ".")) + "/" + escapePURLSegment(artifact) + "@" + escapePURLSegment(version), true
 }
 
-// cargoPackageURL maps the CodeArtifact crate download path <repo>/crates/<name>/<version>.
 func cargoPackageURL(parts []string) (string, bool) {
 	if len(parts) != 5 || parts[2] != "crates" {
 		return "", false

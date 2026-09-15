@@ -27,9 +27,10 @@ type recordingPackagePolicy struct {
 
 type cacheProbe struct {
 	cache.Cache
-	statCalls int
-	openCalls int
-	statErr   error
+	statCalls   int
+	openCalls   int
+	createCalls int
+	statErr     error
 }
 
 func (c *cacheProbe) Stat(ctx context.Context, key cache.Key, opts ...cache.Option) (http.Header, error) {
@@ -43,6 +44,17 @@ func (c *cacheProbe) Stat(ctx context.Context, key cache.Key, opts ...cache.Opti
 func (c *cacheProbe) Open(ctx context.Context, key cache.Key, opts ...cache.Option) (io.ReadCloser, http.Header, error) {
 	c.openCalls++
 	return c.Cache.Open(ctx, key, opts...)
+}
+
+func (c *cacheProbe) Create(
+	ctx context.Context,
+	key cache.Key,
+	headers http.Header,
+	ttl time.Duration,
+	opts ...cache.Option,
+) (cache.Writer, error) {
+	c.createCalls++
+	return c.Cache.Create(ctx, key, headers, ttl, opts...)
 }
 
 func (r *recordingPackagePolicy) Evaluate(_ context.Context, purl string) (packagepolicy.Decision, error) {
@@ -62,12 +74,27 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 		statusCode     int
 		policy         string
 		originRequests int
+		cacheWrites    int
 	}{
 		{
 			name:       "denied package",
 			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}},
 			statusCode: http.StatusForbidden,
 			policy:     "deny",
+		},
+		{
+			name:           "allowed package",
+			decision:       packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow},
+			statusCode:     http.StatusOK,
+			originRequests: 1,
+			cacheWrites:    1,
+		},
+		{
+			name:           "not applicable package",
+			decision:       packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable},
+			statusCode:     http.StatusOK,
+			originRequests: 1,
+			cacheWrites:    1,
 		},
 		{
 			name:           "pending package",
@@ -88,11 +115,16 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 			var logs bytes.Buffer
 			var originRequests int
 			policy := &recordingPackagePolicy{decision: test.decision, err: test.err}
+			probe := &cacheProbe{Cache: cache.NoOpCache()}
+			cacher := &goproxyCacher{cache: probe}
+			cacheName := "github.com/pkg/errors/@v/v0.9.1.zip"
 			strategy := &Strategy{
 				packagePolicy: policy,
+				cacher:        cacher,
 				logger:        slog.New(slog.NewJSONHandler(&logs, nil)),
-				proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					originRequests++
+					assert.NoError(t, cacher.Put(r.Context(), cacheName, strings.NewReader("module")))
 					w.WriteHeader(http.StatusOK)
 				}),
 			}
@@ -105,6 +137,7 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 			assert.Equal(t, test.policy, w.Header().Get("X-Cachew-Package-Policy"))
 			assert.Equal(t, []string{"pkg:golang/github.com/pkg/errors@v0.9.1"}, policy.purls)
 			assert.Equal(t, test.originRequests, originRequests)
+			assert.Equal(t, test.cacheWrites, probe.createCalls)
 			if test.err != nil {
 				assert.Contains(t, logs.String(), test.err.Error())
 			}
@@ -162,7 +195,7 @@ func TestGoModulePrivatePackageBypassesPackagePolicy(t *testing.T) {
 		}),
 	}
 	w := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/gomod/github.com/myorg/private/@v/v1.0.0.zip", nil)
+	request := httptest.NewRequest(http.MethodGet, "/gomod/github.com/myorg/private/submodule/@v/v1.0.0.zip", nil)
 	strategy.serveHTTP(w, request)
 
 	assert.Equal(t, http.StatusOK, w.Code)

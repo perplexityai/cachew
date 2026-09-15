@@ -205,6 +205,15 @@ type recordingPackagePolicy struct {
 	notApplicable int
 }
 
+type blockingPackagePolicy struct {
+	mu        sync.Mutex
+	decision  packagepolicy.Decision
+	expected  int
+	callers   int
+	allJoined chan struct{}
+	release   chan struct{}
+}
+
 func (r *recordingPackagePolicy) Evaluate(_ context.Context, purl string) (packagepolicy.Decision, error) {
 	r.purls = append(r.purls, purl)
 	return r.decision, r.err
@@ -214,25 +223,61 @@ func (r *recordingPackagePolicy) ObserveNotApplicable(context.Context) {
 	r.notApplicable++
 }
 
-func TestCodeArtifactRecordsNotApplicablePolicyRequests(t *testing.T) {
-	for _, requestURL := range []string{
-		"/codeartifact.example.com/maven/repository/example.jar",
-		"/codeartifact.example.com/npm/repository/example/-/example-1.0.0.tgz?download=1",
-	} {
-		target, err := url.Parse("https://codeartifact.example.com")
-		assert.NoError(t, err)
-		policy := &recordingPackagePolicy{}
-		strategy := &CodeArtifact{
-			target:        target,
-			prefix:        "/codeartifact.example.com",
-			packagePolicy: policy,
-		}
-		request := httptest.NewRequest(http.MethodGet, requestURL, nil)
-
-		assert.True(t, strategy.allowPackage(httptest.NewRecorder(), request))
-		assert.Equal(t, 1, policy.notApplicable)
-		assert.Equal(t, []string(nil), policy.purls)
+func (b *blockingPackagePolicy) Evaluate(context.Context, string) (packagepolicy.Decision, error) {
+	b.mu.Lock()
+	b.callers++
+	if b.callers == b.expected {
+		close(b.allJoined)
 	}
+	b.mu.Unlock()
+
+	<-b.release
+	return b.decision, nil
+}
+
+func (b *blockingPackagePolicy) ObserveNotApplicable(context.Context) {}
+
+func (b *blockingPackagePolicy) calls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.callers
+}
+
+func TestCodeArtifactRecordsNotApplicablePolicyRequests(t *testing.T) {
+	target, err := url.Parse("https://codeartifact.example.com")
+	assert.NoError(t, err)
+	policy := &recordingPackagePolicy{}
+	strategy := &CodeArtifact{
+		target:        target,
+		prefix:        "/codeartifact.example.com",
+		packagePolicy: policy,
+	}
+	request := httptest.NewRequest(http.MethodGet, "/codeartifact.example.com/maven/repository/example.jar", nil)
+
+	decision, err := strategy.evaluatePackage(request)
+	assert.NoError(t, err)
+	assert.Equal(t, packagepolicy.VerdictNotApplicable, decision.Verdict)
+	assert.Equal(t, 1, policy.notApplicable)
+	assert.Equal(t, []string(nil), policy.purls)
+}
+
+func TestCodeArtifactEvaluatesQueryBearingPackageRequests(t *testing.T) {
+	var originRequests atomic.Int32
+	mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		originRequests.Add(1)
+	}))
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+	strategy.packagePolicy = policy
+	w := httptest.NewRecorder()
+	path := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz?download=1")
+
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, []string{"pkg:npm/package@1.2.3"}, policy.purls)
+	assert.Equal(t, 0, policy.notApplicable)
+	assert.Equal(t, 0, tokenServer.requestCount())
+	assert.Equal(t, int32(0), originRequests.Load())
 }
 
 func TestCodeArtifactHandlesPackagePolicyBeforeOriginAuthentication(t *testing.T) {
@@ -316,6 +361,82 @@ func TestCodeArtifactCachedPackageBypassesPackagePolicy(t *testing.T) {
 
 	assert.Equal(t, []string{"pkg:npm/lodash@4.17.21"}, policy.purls)
 	assert.Equal(t, int32(1), originRequests.Load())
+}
+
+func TestCodeArtifactDoesNotCachePolicyFailOpenResponses(t *testing.T) {
+	tests := []struct {
+		name     string
+		decision packagepolicy.Decision
+		err      error
+	}{
+		{name: "pending", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictPending}},
+		{name: "provider error", err: errors.New("Socket API unavailable")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var originRequests atomic.Int32
+			origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				originRequests.Add(1)
+				w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+				_, _ = w.Write([]byte(testCodeArtifactBody))
+			})
+			mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, origin)
+			policy := &recordingPackagePolicy{decision: test.decision, err: test.err}
+			strategy.packagePolicy = policy
+			path := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz")
+
+			for range 2 {
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+				assert.Equal(t, http.StatusOK, w.Code)
+				assert.Equal(t, testCodeArtifactBody, w.Body.String())
+			}
+
+			assert.Equal(t, int32(2), originRequests.Load())
+			assert.Equal(t, []string{"pkg:npm/package@1.2.3", "pkg:npm/package@1.2.3"}, policy.purls)
+		})
+	}
+}
+
+func TestCodeArtifactConcurrentDeniedRequestsReachPolicyTogether(t *testing.T) {
+	const callers = 8
+	var originRequests atomic.Int32
+	mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		originRequests.Add(1)
+	}))
+	policy := &blockingPackagePolicy{
+		decision:  packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny},
+		expected:  callers,
+		allJoined: make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	strategy.packagePolicy = policy
+	path := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz")
+	begin := make(chan struct{})
+	results := make(chan int, callers)
+	for range callers {
+		go func() {
+			<-begin
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+			results <- w.Code
+		}()
+	}
+	close(begin)
+	select {
+	case <-policy.allJoined:
+		close(policy.release)
+	case <-time.After(time.Second):
+		close(policy.release)
+		t.Fatal("concurrent requests did not share the in-flight policy evaluation")
+	}
+
+	for range callers {
+		assert.Equal(t, http.StatusForbidden, <-results)
+	}
+	assert.Equal(t, callers, policy.calls())
+	assert.Equal(t, 0, tokenServer.requestCount())
+	assert.Equal(t, int32(0), originRequests.Load())
 }
 
 func TestCodeArtifactSanitizesOriginTransportErrors(t *testing.T) {

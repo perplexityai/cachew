@@ -82,6 +82,9 @@ resulting canonical version's module files are evaluated before download. Cached
 module files bypass the check. The `socket` provider sends the PURL to Socket;
 modules matching `private-paths` are not sent.
 
+Pending analysis and provider failures remain fail open, but their downloaded
+module files are not cached. A later request therefore re-evaluates the package.
+
 The warm-path cache probe does not read or backfill the module body. It also
 disables origin fallback for that request. If the object is evicted between the
 probe and goproxy's body read, goproxy returns its temporary `404` rather than
@@ -178,11 +181,14 @@ the origin without sending their names or versions to the policy provider. Use i
 for private packages that share a CodeArtifact repository with public
 dependencies. Repository metadata, Maven `-SNAPSHOT` versions, and formats
 without a PURL mapping (NuGet, Ruby, Swift, generic) pass through unevaluated.
+Query strings make CodeArtifact responses uncacheable but do not bypass policy
+evaluation for recognized package asset paths.
 
 For the Socket provider, a policy action of `error`, or a package Socket cannot
 resolve, returns `403`. Pending analysis, provider failures, and malformed
 responses fail open: Cachew records the outcome and continues to the package
-origin. Cache hits do not recheck the policy because Cachew only admits complete,
+origin without caching the response. Cache hits do not recheck the policy because
+Cachew only admits explicitly allowed or intentionally excluded complete,
 origin-declared immutable bodies.
 
 A later policy change does not automatically invalidate an admitted object.
@@ -224,7 +230,7 @@ Policy outcomes and API latency are exported as
 bounded provider and outcome attributes (`allow`, `deny`, `pending`,
 `unavailable`, or `not_applicable`); package names and versions are not metric
 labels. The latency histogram covers actual provider evaluations. Unsupported
-ecosystems, non-package metadata or query paths, and excluded private Go modules
+ecosystems, non-package metadata, and excluded private Go modules
 record `not_applicable` so gaps in enforcement coverage remain visible. Metadata
 GETs can dominate that outcome, so dashboards should chart it separately and
 exclude it from allow/deny availability ratios. `HEAD` requests are not counted

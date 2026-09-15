@@ -21,11 +21,14 @@ import (
 const (
 	defaultAPIURL       = "https://api.socket.dev"
 	defaultTimeout      = 30 * time.Second
+	maxConcurrentCalls  = 16
 	maxResponseBytes    = 4 << 20
 	maxResponseLineSize = 1 << 20
 )
 
 var organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
 
 // SocketConfig configures Socket's organization-scoped PURL evaluator.
 type SocketConfig struct {
@@ -42,6 +45,7 @@ type socketEvaluator struct {
 	httpClient *http.Client
 	metrics    metricRecorder
 	inflight   singleflight.Group
+	callSlots  chan struct{}
 }
 
 var _ Evaluator = (*socketEvaluator)(nil)
@@ -88,29 +92,49 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 				return http.ErrUseLastResponse
 			},
 		},
-		metrics: newMetrics("socket"),
+		metrics:   newMetrics("socket"),
+		callSlots: make(chan struct{}, maxConcurrentCalls),
 	}, nil
 }
 
 // Evaluate returns the strictest policy result across every artifact Socket returns.
 func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
-	resultCh := c.inflight.DoChan(purl, func() (any, error) {
-		requestCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.httpClient.Timeout)
-		defer cancel()
-		return c.evaluateProvider(requestCtx, purl)
-	})
-	select {
-	case <-ctx.Done():
-		return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
-	case result := <-resultCh:
-		if result.Err != nil {
-			return Decision{}, result.Err
+	for {
+		resultCh := c.inflight.DoChan(purl, func() (any, error) {
+			select {
+			case c.callSlots <- struct{}{}:
+				defer func() { <-c.callSlots }()
+			case <-ctx.Done():
+				return Decision{}, errSharedEvaluationOwnerDone
+			}
+
+			requestCtx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+			defer cancel()
+			decision, err := c.evaluateProvider(requestCtx, purl)
+			if err != nil && context.Cause(ctx) != nil {
+				return Decision{}, errSharedEvaluationOwnerDone
+			}
+			return decision, err
+		})
+		select {
+		case <-ctx.Done():
+			return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
+		case result := <-resultCh:
+			if errors.Is(result.Err, errSharedEvaluationOwnerDone) {
+				if context.Cause(ctx) != nil {
+					return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
+				}
+				continue
+			}
+			if result.Err != nil {
+				return Decision{}, result.Err
+			}
+			sharedDecision, ok := result.Val.(Decision)
+			if !ok {
+				return Decision{}, errors.New("socket policy: invalid shared evaluation")
+			}
+			return sharedDecision, nil
 		}
-		sharedDecision, ok := result.Val.(Decision)
-		if !ok {
-			return Decision{}, errors.New("socket policy: invalid shared evaluation")
-		}
-		return sharedDecision, nil
 	}
 }
 
@@ -148,7 +172,7 @@ func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (de
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		if _, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10)); copyErr != nil {
-			return Decision{}, errors.New("socket policy: read error response")
+			return Decision{}, errors.Wrap(copyErr, "socket policy: read error response")
 		}
 		return Decision{}, errors.Errorf("socket policy: API returned %s", resp.Status)
 	}
@@ -208,8 +232,11 @@ func evaluateStream(r io.Reader, requestedPURL string) (Decision, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &decoded); err != nil {
 			return Decision{}, errors.Wrap(err, "socket policy: decode response")
 		}
-		if err := state.add(decoded, requestedPURL); err != nil {
+		if err := state.add(decoded, requestedPURL); err != nil && len(state.denied) == 0 {
 			return Decision{}, err
+		}
+		if len(state.denied) > 0 {
+			return state.decision()
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -228,6 +255,7 @@ func (s *evaluationState) add(artifact apiArtifact, requestedPURL string) error 
 	if artifact.Type != "" && artifact.Name != "" && artifact.Version != "" {
 		s.resolved = true
 	}
+	var evaluationErr error
 	for _, alert := range artifact.Alerts {
 		switch alert.Type {
 		case "pendingScan":
@@ -242,12 +270,16 @@ func (s *evaluationState) add(artifact apiArtifact, requestedPURL string) error 
 			s.denied[alert.Type] = struct{}{}
 		case "ignore", "monitor", "warn":
 		case "":
-			return errors.Errorf("socket policy: alert %q has no policy action", alert.Type)
+			if evaluationErr == nil {
+				evaluationErr = errors.Errorf("socket policy: alert %q has no policy action", alert.Type)
+			}
 		default:
-			return errors.Errorf("socket policy: unsupported policy action %q", alert.Action)
+			if evaluationErr == nil {
+				evaluationErr = errors.Errorf("socket policy: unsupported policy action %q", alert.Action)
+			}
 		}
 	}
-	return nil
+	return evaluationErr
 }
 
 func (s *evaluationState) decision() (Decision, error) {

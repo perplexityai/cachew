@@ -3,11 +3,15 @@ package packagepolicy //nolint:testpackage // White-box coverage is required for
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/alecthomas/assert/v2"
@@ -18,6 +22,32 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type blockingMetricRecorder struct {
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingMetricRecorder) record(context.Context, Decision, error, time.Duration) {
+	r.once.Do(func() {
+		close(r.started)
+		<-r.release
+	})
+}
+
+func (*blockingMetricRecorder) recordNotApplicable(context.Context) {}
+
+type doneObservedContext struct {
+	context.Context
+	once     sync.Once
+	observed chan struct{}
+}
+
+func (c *doneObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
 }
 
 const (
@@ -236,23 +266,181 @@ func TestClientCoalescesConcurrentEvaluations(t *testing.T) {
 	assert.Equal(t, int32(2), metrics.evaluations.Load())
 }
 
-func TestClientRecordsSharedEvaluationAfterCallerCancellation(t *testing.T) {
-	metrics := &recordingMetrics{recorded: make(chan struct{}, 1)}
-	harness := newBlockedSocketTestHarness(t, metrics)
-
+func TestClientCancelsProviderAfterOnlyCallerCancels(t *testing.T) {
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       "https://socket.example.com",
+		Organization: testOrganization,
+		Token:        testToken,
+	}, false)
+	assert.NoError(t, err)
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	client.httpClient.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		<-r.Context().Done()
+		close(stopped)
+		return nil, r.Context().Err()
+	})
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
-		_, err := harness.client.Evaluate(ctx, testPURL)
+		_, err := client.Evaluate(ctx, testPURL)
 		result <- err
 	}()
-	<-harness.started
+	<-started
 	cancel()
 	assert.True(t, errors.Is(<-result, context.Canceled))
-	assert.Equal(t, int32(0), metrics.evaluations.Load())
-	close(harness.release)
-	<-metrics.recorded
-	assert.Equal(t, int32(1), metrics.evaluations.Load())
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("provider request continued after its only caller canceled")
+	}
+}
+
+func TestClientRetriesWhenSharedEvaluationOwnerCancels(t *testing.T) {
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       "https://socket.example.com",
+		Organization: testOrganization,
+		Token:        testToken,
+	}, false)
+	assert.NoError(t, err)
+	firstStarted := make(chan struct{})
+	var requests atomic.Int32
+	client.httpClient.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if requests.Add(1) == 1 {
+			close(firstStarted)
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     http.StatusText(http.StatusOK),
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(testAllowResponse)),
+		}, nil
+	})
+
+	ownerCtx, cancelOwner := context.WithCancel(t.Context())
+	ownerResult := make(chan error, 1)
+	go func() {
+		_, err := client.Evaluate(ownerCtx, testPURL)
+		ownerResult <- err
+	}()
+	<-firstStarted
+
+	waiterResult := make(chan error, 1)
+	go func() {
+		decision, err := client.Evaluate(t.Context(), testPURL)
+		if err == nil && decision.Verdict != VerdictAllow {
+			err = errors.Errorf("unexpected verdict %q", decision.Verdict)
+		}
+		waiterResult <- err
+	}()
+	time.Sleep(25 * time.Millisecond)
+	cancelOwner()
+
+	assert.True(t, errors.Is(<-ownerResult, context.Canceled))
+	assert.NoError(t, <-waiterResult)
+	assert.Equal(t, int32(2), requests.Load())
+}
+
+func TestClientPreservesCompletedDecisionWhenOwnerCancels(t *testing.T) {
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       "https://socket.example.com",
+		Organization: testOrganization,
+		Token:        testToken,
+	}, false)
+	assert.NoError(t, err)
+	metrics := &blockingMetricRecorder{started: make(chan struct{}), release: make(chan struct{})}
+	client.metrics = metrics
+	var requests atomic.Int32
+	client.httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		if requests.Add(1) > 1 {
+			return nil, errors.New("unexpected policy retry")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     http.StatusText(http.StatusOK),
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"type":"npm","name":"example","version":"1.0.0","alerts":[{"type":"malware","action":"error"}]}`,
+			)),
+		}, nil
+	})
+
+	ownerCtx, cancelOwner := context.WithCancel(t.Context())
+	ownerResult := make(chan error, 1)
+	go func() {
+		_, err := client.Evaluate(ownerCtx, testPURL)
+		ownerResult <- err
+	}()
+	<-metrics.started
+
+	waiterJoined := make(chan struct{})
+	waiterCtx := &doneObservedContext{Context: t.Context(), observed: waiterJoined}
+	type result struct {
+		decision Decision
+		err      error
+	}
+	waiterResult := make(chan result, 1)
+	go func() {
+		decision, err := client.Evaluate(waiterCtx, testPURL)
+		waiterResult <- result{decision: decision, err: err}
+	}()
+	<-waiterJoined
+	cancelOwner()
+	assert.True(t, errors.Is(<-ownerResult, context.Canceled))
+	close(metrics.release)
+
+	evaluation := <-waiterResult
+	assert.NoError(t, evaluation.err)
+	assert.Equal(t, VerdictDeny, evaluation.decision.Verdict)
+	assert.Equal(t, []string{"malware"}, evaluation.decision.Reasons)
+	assert.Equal(t, int32(1), requests.Load())
+}
+
+func TestClientBoundsConcurrentProviderEvaluations(t *testing.T) {
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       "https://socket.example.com",
+		Organization: testOrganization,
+		Token:        testToken,
+	}, false)
+	assert.NoError(t, err)
+	const limit = 2
+	const callers = 8
+	client.callSlots = make(chan struct{}, limit)
+	started := make(chan struct{}, callers)
+	release := make(chan struct{})
+	var requests atomic.Int32
+	client.httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		requests.Add(1)
+		started <- struct{}{}
+		<-release
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     http.StatusText(http.StatusOK),
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(testAllowResponse)),
+		}, nil
+	})
+
+	results := make(chan error, callers)
+	for i := range callers {
+		go func() {
+			_, err := client.Evaluate(t.Context(), fmt.Sprintf("pkg:npm/example-%d@1.0.0", i))
+			results <- err
+		}()
+	}
+	for range limit {
+		<-started
+	}
+	time.Sleep(25 * time.Millisecond)
+	assert.Equal(t, int32(limit), requests.Load())
+	close(release)
+	for range callers {
+		assert.NoError(t, <-results)
+	}
+	assert.Equal(t, int32(callers), requests.Load())
 }
 
 func TestClientFailsClosedOnInvalidResponses(t *testing.T) {
@@ -298,6 +486,49 @@ func TestClientPreservesTransportFailureForCallerLogging(t *testing.T) {
 
 	_, err = client.Evaluate(context.Background(), testPURL)
 	assert.True(t, errors.Is(err, transportErr))
+}
+
+func TestClientPreservesErrorResponseReadFailure(t *testing.T) {
+	readErr := errors.New("read Socket error response")
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       "https://socket.example.com",
+		Organization: testOrganization,
+		Token:        testToken,
+	}, false)
+	assert.NoError(t, err)
+	client.httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Status:     http.StatusText(http.StatusTooManyRequests),
+			Header:     make(http.Header),
+			Body:       io.NopCloser(iotest.ErrReader(readErr)),
+		}, nil
+	})
+
+	_, err = client.Evaluate(context.Background(), testPURL)
+	assert.True(t, errors.Is(err, readErr))
+}
+
+func TestDenyDominatesLaterInvalidStreamData(t *testing.T) {
+	denied := `{"type":"npm","name":"example","version":"1.0.0","alerts":[{"type":"malware","action":"error"}]}`
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{name: "malformed record", response: denied + "\n" + `{"type":`},
+		{name: "unknown action record", response: denied + "\n" + `{"type":"npm","name":"example","version":"1.0.0","alerts":[{"type":"other","action":"future"}]}`},
+		{name: "unknown action in denied record", response: `{"type":"npm","name":"example","version":"1.0.0","alerts":[{"type":"malware","action":"error"},{"type":"other","action":"future"}]}`},
+		{name: "denial follows unknown action", response: `{"type":"npm","name":"example","version":"1.0.0","alerts":[{"type":"other","action":"future"},{"type":"malware","action":"error"}]}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decision, err := evaluateStream(strings.NewReader(test.response), testPURL)
+			assert.NoError(t, err)
+			assert.Equal(t, VerdictDeny, decision.Verdict)
+			assert.Equal(t, []string{"malware"}, decision.Reasons)
+		})
+	}
 }
 
 func TestClientDoesNotForwardTokenAcrossRedirects(t *testing.T) {

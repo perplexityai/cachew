@@ -3,12 +3,12 @@ package gomod
 import (
 	"context"
 	"io"
-	"path"
 	"strings"
 	"time"
 
 	"github.com/alecthomas/errors"
 	"github.com/goproxy/goproxy"
+	"golang.org/x/mod/module"
 )
 
 // CompositeFetcher routes module requests to either public or private fetchers based on module path patterns.
@@ -35,18 +35,7 @@ func (c *CompositeFetcher) IsPrivate(modulePath string) bool {
 }
 
 func isPrivateModule(patterns []string, modulePath string) bool {
-	for _, pattern := range patterns {
-		matched, err := path.Match(pattern, modulePath)
-		if err == nil && matched {
-			return true
-		}
-
-		if strings.HasPrefix(modulePath, pattern+"/") || modulePath == pattern {
-			return true
-		}
-	}
-
-	return false
+	return module.MatchPrefixPatterns(strings.Join(patterns, ","), modulePath)
 }
 
 func (c *CompositeFetcher) Query(ctx context.Context, path, query string) (version string, t time.Time, err error) {
