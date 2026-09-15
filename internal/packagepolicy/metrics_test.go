@@ -11,8 +11,13 @@ import (
 
 type recordingMetrics struct {
 	evaluations   atomic.Int32
+	outcomes      atomic.Int32
 	notApplicable atomic.Int32
 	recorded      chan struct{}
+}
+
+func (r *recordingMetrics) recordOutcome(context.Context, Decision, error) {
+	r.outcomes.Add(1)
 }
 
 func (r *recordingMetrics) record(context.Context, Decision, error, time.Duration) {

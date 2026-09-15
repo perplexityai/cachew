@@ -37,7 +37,7 @@ type CodeArtifactConfig struct {
 	OriginHeaderTimeout   time.Duration         `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
 	OriginReadIdleTimeout time.Duration         `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
 	CredentialTimeout     time.Duration         `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
-	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced before cold npm, PyPI, Maven, and Cargo artifact reads."`
+	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm, PyPI, Maven, and Cargo artifact reads, including cache hits."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
@@ -215,14 +215,16 @@ func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mode := classifyCodeArtifactRequest(r)
 	c.metric.recordRequest(r.Context(), mode)
-	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
-		return
-	}
+	// Policy runs before the cache lookup so a newly denied package stops being served
+	// within the verdict TTL even though its bytes remain cached.
 	decision, err := c.evaluatePackage(r)
 	if err != nil {
 		c.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
 	}
 	if !packagepolicy.AllowRequest(w, decision, err) {
+		return
+	}
+	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return
 	}
 	if err != nil || decision.Verdict == packagepolicy.VerdictPending {

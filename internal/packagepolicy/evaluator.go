@@ -6,6 +6,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/errors"
 )
@@ -13,6 +14,8 @@ import (
 // Config selects and configures one package policy provider.
 type Config struct {
 	ExcludePURLs []string      `hcl:"exclude-purls,optional" help:"npm, PyPI, Maven, and Cargo PURL glob patterns to exclude before provider evaluation."`
+	VerdictTTL   time.Duration `hcl:"verdict-ttl,optional" help:"How long allow and deny verdicts are reused before the provider is asked again. Zero disables the verdict cache." default:"10m"`
+	OnFailure    string        `hcl:"on-failure,optional" help:"allow continues to the origin when the provider is unavailable or analysis is pending; deny returns 403 instead." default:"allow"`
 	Socket       *SocketConfig `hcl:"socket,block,optional" help:"Socket organization policy provider."`
 }
 
@@ -58,11 +61,44 @@ func New(config Config) (Evaluator, error) {
 			return nil, errors.Wrap(err, "package policy: invalid exclude-purls pattern")
 		}
 	}
-	evaluator, err := newSocketEvaluator(*config.Socket, false)
-	if err != nil || len(config.ExcludePURLs) == 0 {
-		return evaluator, err
+	if config.OnFailure != "" && config.OnFailure != "allow" && config.OnFailure != "deny" {
+		return nil, errors.Errorf("package policy: on-failure must be allow or deny, got %q", config.OnFailure)
 	}
-	return &excludingEvaluator{Evaluator: evaluator, patterns: config.ExcludePURLs}, nil
+	if config.VerdictTTL < 0 {
+		return nil, errors.New("package policy: verdict-ttl must not be negative")
+	}
+	socket, err := newSocketEvaluator(*config.Socket, false)
+	if err != nil {
+		return nil, err
+	}
+	var evaluator Evaluator = socket
+	if config.VerdictTTL > 0 {
+		evaluator = newCachingEvaluator(evaluator, config.VerdictTTL, socket.metrics)
+	}
+	if config.OnFailure == "deny" {
+		evaluator = failClosedEvaluator{Evaluator: evaluator}
+	}
+	if len(config.ExcludePURLs) > 0 {
+		evaluator = &excludingEvaluator{Evaluator: evaluator, patterns: config.ExcludePURLs}
+	}
+	return evaluator, nil
+}
+
+// failClosedEvaluator turns provider failures and pending analysis into denials for on-failure = "deny".
+type failClosedEvaluator struct {
+	Evaluator
+}
+
+// Evaluate keeps the provider error so callers can still log the cause of a denial.
+func (e failClosedEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
+	decision, err := e.Evaluator.Evaluate(ctx, purl)
+	if err != nil {
+		return Decision{Verdict: VerdictDeny, Reasons: []string{"unavailable"}}, errors.Wrap(err, "package policy: fail closed")
+	}
+	if decision.Verdict == VerdictPending {
+		return Decision{Verdict: VerdictDeny, Reasons: decision.Reasons}, nil
+	}
+	return decision, nil
 }
 
 type excludingEvaluator struct {
@@ -84,7 +120,7 @@ func (e *excludingEvaluator) Evaluate(ctx context.Context, purl string) (Decisio
 	}
 	decision, err := e.Evaluator.Evaluate(ctx, purl)
 	if err != nil {
-		return Decision{}, errors.Wrap(err, "package policy: evaluate provider")
+		return decision, errors.Wrap(err, "package policy: evaluate provider")
 	}
 	return decision, nil
 }

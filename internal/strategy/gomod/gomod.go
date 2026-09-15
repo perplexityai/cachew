@@ -19,8 +19,6 @@ import (
 	"github.com/block/cachew/internal/strategy"
 )
 
-const disableModuleFetchHeader = "Disable-Module-Fetch"
-
 func Register(r *strategy.Registry, cloneManager gitclone.ManagerProvider) {
 	strategy.Register(r, "gomod", "Caches Go module proxy requests.", func(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux) (*Strategy, error) {
 		return New(ctx, config, cache, mux, cloneManager)
@@ -30,7 +28,7 @@ func Register(r *strategy.Registry, cloneManager gitclone.ManagerProvider) {
 type Config struct {
 	Proxy         string                `hcl:"proxy,optional" help:"Upstream Go module proxy URL (defaults to proxy.golang.org)" default:"https://proxy.golang.org"`
 	PrivatePaths  []string              `hcl:"private-paths,optional" help:"Module path patterns for private repositories"`
-	PackagePolicy *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced before cold public module downloads."`
+	PackagePolicy *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on public module downloads, including cached files."`
 }
 
 type Strategy struct {
@@ -39,7 +37,6 @@ type Strategy struct {
 	logger        *slog.Logger
 	proxy         *url.URL
 	goproxy       *goproxy.Goproxy
-	cacher        *goproxyCacher
 	packagePolicy packagepolicy.Evaluator
 	proxyHandler  http.Handler
 	cloneManager  *gitclone.Manager
@@ -95,11 +92,10 @@ func New(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux
 		s.logger.InfoContext(ctx, "Configured private module support", "private-paths", config.PrivatePaths)
 	}
 
-	s.cacher = &goproxyCacher{cache: cache}
 	s.goproxy = &goproxy.Goproxy{
 		Logger:  s.logger,
 		Fetcher: fetcher,
-		Cacher:  s.cacher,
+		Cacher:  &goproxyCacher{cache: cache},
 		ProxiedSumDBs: []string{
 			"sum.golang.org https://sum.golang.org",
 		},
@@ -125,15 +121,6 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.proxyHandler.ServeHTTP(w, r)
 		return
 	}
-	cached, err := s.cached(path, r)
-	if err != nil {
-		s.logger.ErrorContext(r.Context(), "Failed to inspect Go module cache", "error", err)
-	}
-	if cached {
-		r.Header.Set(disableModuleFetchHeader, "true")
-		s.proxyHandler.ServeHTTP(w, r)
-		return
-	}
 	decision, err := s.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
@@ -145,13 +132,6 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.proxyHandler.ServeHTTP(w, r)
-}
-
-func (s *Strategy) cached(path string, r *http.Request) (bool, error) {
-	if s.cacher == nil || r.URL.RawQuery != "" || r.Header.Get("Range") != "" {
-		return false, nil
-	}
-	return s.cacher.Exists(r.Context(), path)
 }
 
 func (s *Strategy) privateModulePath(requestPath string) bool {

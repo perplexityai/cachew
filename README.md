@@ -75,21 +75,16 @@ gomod {
 }
 ```
 
-When `package-policy` is configured, Cachew evaluates the PURL for each cold,
-canonical-version public module before it contacts the Go module origin. Branch
-and revision `.info` queries pass through so the Go proxy can resolve them; the
-resulting canonical version's module files are evaluated before download. Cached
-module files bypass the check. The `socket` provider sends the PURL to Socket;
-modules matching `private-paths` are not sent.
+When `package-policy` is configured, Cachew evaluates the PURL for each
+canonical-version public module request, including cached module files, before
+it serves or downloads them. Branch and revision `.info` queries pass through so
+the Go proxy can resolve them; the resulting canonical version's module files are
+evaluated before download. The `socket` provider sends the PURL to Socket;
+modules matching `private-paths` are not sent. Verdicts are reused for
+`verdict-ttl`, so a cached module costs a provider call at most once per TTL.
 
-Pending analysis and provider failures remain fail open, but their downloaded
+Pending analysis and provider failures fail open by default, but their downloaded
 module files are not cached. A later request therefore re-evaluates the package.
-
-The warm-path cache probe does not read or backfill the module body. It also
-disables origin fallback for that request. If the object is evicted between the
-probe and goproxy's body read, goproxy returns its temporary `404` rather than
-fetching an unevaluated body; a later client retry performs a normal miss and
-policy evaluation.
 
 ### Hermit
 
@@ -132,11 +127,14 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
 
   package-policy {
     exclude-purls = ["pkg:npm/%40myorg/*", "pkg:pypi/myorg-*@*"]
+    verdict-ttl   = "10m"   # default; 0 disables verdict reuse
+    on-failure    = "allow" # default; "deny" returns 403 when Socket is unavailable
 
     socket {
       api-url      = "https://api.socket.dev"
       organization = "my-socket-org"
       token        = "${SOCKET_SECURITY_API_TOKEN}"
+      timeout      = "10s"  # default
     }
   }
 }
@@ -169,9 +167,10 @@ timeout values are rejected.
 
 The optional `package-policy` block is a provider-independent package-admission
 interface based on standard Package URLs (PURLs). Its `socket` provider checks
-cold npm, PyPI, Maven, and Cargo artifact PURLs with the configured organization's [Socket
-package policy](https://docs.socket.dev/reference/batchpackagefetchbyorg) before
-Cachew mints a CodeArtifact token or contacts the repository. Another provider
+npm, PyPI, Maven, and Cargo artifact PURLs, including cache hits, with the
+configured organization's [Socket package
+policy](https://docs.socket.dev/reference/batchpackagefetchbyorg) before Cachew
+serves a cached body, mints a CodeArtifact token, or contacts the repository. Another provider
 can implement the same PURL-to-decision interface without changing the
 CodeArtifact or Go module strategies.
 
@@ -184,14 +183,24 @@ without a PURL mapping (NuGet, Ruby, Swift, generic) pass through unevaluated.
 Query strings make CodeArtifact responses uncacheable but do not bypass policy
 evaluation for recognized package asset paths.
 
-For the Socket provider, a policy action of `error`, or a package Socket cannot
-resolve, returns `403`. Pending analysis, provider failures, and malformed
-responses fail open: Cachew records the outcome and continues to the package
-origin without caching the response. Cache hits do not recheck the policy because
-Cachew only admits explicitly allowed or intentionally excluded complete,
-origin-declared immutable bodies.
+For the Socket provider, a policy action of `error` returns `403` with
+`X-Cachew-Package-Policy: deny`. A package Socket has not indexed (`notFound`) is
+treated like pending analysis. With the default `on-failure = "allow"`, pending
+analysis, provider failures, and malformed responses fail open: Cachew records
+the outcome, labels the response `X-Cachew-Package-Policy: pending` or
+`unavailable`, and continues to the package origin without caching the response.
+`on-failure = "deny"` returns `403` for those cases instead. After five
+consecutive provider failures Cachew skips Socket for 30 seconds and counts each
+skipped request as `unavailable`, so an outage fails fast rather than holding
+every request to the `timeout` (default `10s`; a version Socket has never scanned
+can wait up to that long before it is reported pending).
 
-A later policy change does not automatically invalidate an admitted object.
+Allow and deny verdicts are reused for `verdict-ttl` (default 10 minutes). Every
+`GET`, including a cache hit, is checked against that verdict cache, so a newly
+denied package stops being served within one TTL even though its bytes remain
+stored until they expire or are deleted.
+
+A later policy change does not remove an admitted object's bytes from the cache.
 Cachew's generic `delete` operation accepts one exact cache key, but CodeArtifact
 can store multiple representations of one URL. The unhashed key material is the
 origin URL followed by these optional lines, in this order:
@@ -229,16 +238,17 @@ Policy outcomes and API latency are exported as
 `cachew.package_policy.evaluation_duration_seconds`. The evaluation counter has
 bounded provider and outcome attributes (`allow`, `deny`, `pending`,
 `unavailable`, or `not_applicable`); package names and versions are not metric
-labels. The latency histogram covers actual provider evaluations. Unsupported
+labels. The latency histogram covers actual provider evaluations; verdict-cache
+hits and circuit-breaker skips increment the counter without a latency sample. Unsupported
 ecosystems, non-package metadata, and excluded private Go modules
 record `not_applicable` so gaps in enforcement coverage remain visible. Metadata
 GETs can dominate that outcome, so dashboards should chart it separately and
 exclude it from allow/deny availability ratios. `HEAD` requests are not counted
 because they cannot admit a package body.
 
-Concurrent requests for the same PURL share one in-flight provider call. Cachew
-discards the decision after that call completes: a later cold request performs a
-fresh evaluation, so coalescing does not delay a changed Socket verdict.
+Concurrent requests for the same PURL share one in-flight provider call, and at
+most 16 provider calls run at once. The resulting allow or deny verdict is reused
+for `verdict-ttl`; pending results and failures are never cached.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,

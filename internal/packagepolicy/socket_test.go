@@ -39,6 +39,8 @@ func (r *blockingMetricRecorder) record(context.Context, Decision, error, time.D
 
 func (*blockingMetricRecorder) recordNotApplicable(context.Context) {}
 
+func (*blockingMetricRecorder) recordOutcome(context.Context, Decision, error) {}
+
 type doneObservedContext struct {
 	context.Context
 	once     sync.Once
@@ -169,9 +171,9 @@ func TestClientEvaluatesOrganizationPolicy(t *testing.T) {
 			reasons:  []string{"pendingScan"},
 		},
 		{
-			name:     "denies unscanned package",
+			name:     "treats unscanned package as pending",
 			response: `{"type":"npm","name":"unknown-package","version":"1.0.0","alerts":[{"type":"notFound","action":"ignore"}]}`,
-			verdict:  VerdictDeny,
+			verdict:  VerdictPending,
 			reasons:  []string{"notFound"},
 		},
 		{
@@ -548,4 +550,35 @@ func TestClientDoesNotForwardTokenAcrossRedirects(t *testing.T) {
 	_, err = client.Evaluate(context.Background(), testPURL)
 	assert.Error(t, err)
 	assert.Equal(t, 0, redirectRequests)
+}
+
+func TestClientSkipsProviderWhileCircuitIsOpen(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	client, err := newSocketEvaluator(SocketConfig{APIURL: server.URL, Organization: testOrganization, Token: testToken}, true)
+	assert.NoError(t, err)
+	metrics := &recordingMetrics{}
+	client.metrics = metrics
+	now := time.Now()
+	client.breaker.now = func() time.Time { return now }
+
+	for range breakerFailureThreshold {
+		_, err := client.Evaluate(t.Context(), testPURL)
+		assert.Error(t, err)
+	}
+	assert.Equal(t, int32(breakerFailureThreshold), requests.Load())
+
+	_, err = client.Evaluate(t.Context(), testPURL)
+	assert.IsError(t, err, errProviderCircuitOpen)
+	assert.Equal(t, int32(breakerFailureThreshold), requests.Load())
+	assert.Equal(t, int32(1), metrics.outcomes.Load())
+
+	now = now.Add(breakerCooldown)
+	_, err = client.Evaluate(t.Context(), testPURL)
+	assert.Error(t, err)
+	assert.Equal(t, int32(breakerFailureThreshold+1), requests.Load())
 }

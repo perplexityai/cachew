@@ -14,7 +14,6 @@ import (
 	"github.com/alecthomas/assert/v2"
 
 	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/logging"
 	"github.com/block/cachew/internal/packagepolicy"
 )
 
@@ -27,23 +26,7 @@ type recordingPackagePolicy struct {
 
 type cacheProbe struct {
 	cache.Cache
-	statCalls   int
-	openCalls   int
 	createCalls int
-	statErr     error
-}
-
-func (c *cacheProbe) Stat(ctx context.Context, key cache.Key, opts ...cache.Option) (http.Header, error) {
-	c.statCalls++
-	if c.statErr != nil {
-		return nil, c.statErr
-	}
-	return c.Cache.Stat(ctx, key, opts...)
-}
-
-func (c *cacheProbe) Open(ctx context.Context, key cache.Key, opts ...cache.Option) (io.ReadCloser, http.Header, error) {
-	c.openCalls++
-	return c.Cache.Open(ctx, key, opts...)
 }
 
 func (c *cacheProbe) Create(
@@ -100,12 +83,14 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 			name:           "pending package",
 			decision:       packagepolicy.Decision{Verdict: packagepolicy.VerdictPending},
 			statusCode:     http.StatusOK,
+			policy:         "pending",
 			originRequests: 1,
 		},
 		{
 			name:           "policy unavailable",
 			err:            io.ErrUnexpectedEOF,
 			statusCode:     http.StatusOK,
+			policy:         "unavailable",
 			originRequests: 1,
 		},
 	}
@@ -120,7 +105,6 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 			cacheName := "github.com/pkg/errors/@v/v0.9.1.zip"
 			strategy := &Strategy{
 				packagePolicy: policy,
-				cacher:        cacher,
 				logger:        slog.New(slog.NewJSONHandler(&logs, nil)),
 				proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					originRequests++
@@ -145,44 +129,21 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 	}
 }
 
-func TestGoModuleCachedPackageBypassesPackagePolicy(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
-	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
-	assert.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, memory.Close()) })
-	probe := &cacheProbe{Cache: memory}
-	cacher := &goproxyCacher{cache: probe}
-	cacheName := "github.com/pkg/errors/@v/v0.9.1.zip"
-	assert.NoError(t, cacher.Put(ctx, cacheName, strings.NewReader("cached module")))
-
-	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+func TestGoModuleCachedPackageIsStillEvaluated(t *testing.T) {
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}}}
 	strategy := &Strategy{
 		packagePolicy: policy,
-		cacher:        cacher,
-		proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			assert.Equal(t, "true", r.Header.Get("Disable-Module-Fetch"))
-			_, _ = io.WriteString(w, "cached module")
+		proxyHandler: http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			t.Fatal("denied module must not reach the proxy even when cached")
 		}),
 	}
 	w := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/gomod/"+cacheName, nil)
+	request := httptest.NewRequest(http.MethodGet, "/gomod/github.com/pkg/errors/@v/v0.9.1.zip", nil)
 	strategy.serveHTTP(w, request)
 
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, "cached module", w.Body.String())
-	assert.Equal(t, []string(nil), policy.purls)
-	assert.Equal(t, 1, probe.statCalls)
-	assert.Equal(t, 0, probe.openCalls)
-}
-
-func TestGoModuleCacheExistsReturnsStatFailure(t *testing.T) {
-	probe := &cacheProbe{Cache: cache.NoOpCache(), statErr: io.ErrUnexpectedEOF}
-	cacher := &goproxyCacher{cache: probe}
-
-	exists, err := cacher.Exists(t.Context(), "github.com/pkg/errors/@v/v0.9.1.zip")
-
-	assert.False(t, exists)
-	assert.IsError(t, err, io.ErrUnexpectedEOF)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, "deny", w.Header().Get("X-Cachew-Package-Policy"))
+	assert.Equal(t, []string{"pkg:golang/github.com/pkg/errors@v0.9.1"}, policy.purls)
 }
 
 func TestGoModulePrivatePackageBypassesPackagePolicy(t *testing.T) {

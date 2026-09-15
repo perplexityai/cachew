@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alecthomas/errors"
@@ -19,23 +20,66 @@ import (
 )
 
 const (
-	defaultAPIURL       = "https://api.socket.dev"
-	defaultTimeout      = 30 * time.Second
-	maxConcurrentCalls  = 16
-	maxResponseBytes    = 4 << 20
-	maxResponseLineSize = 1 << 20
+	defaultAPIURL      = "https://api.socket.dev"
+	defaultTimeout     = 10 * time.Second
+	maxConcurrentCalls = 16
+	// ponytail: fixed breaker thresholds; expose them in SocketConfig if a deployment needs tuning.
+	breakerFailureThreshold = 5
+	breakerCooldown         = 30 * time.Second
+	maxResponseBytes        = 4 << 20
+	maxResponseLineSize     = 1 << 20
 )
 
 var organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
-var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
+var (
+	errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
+	errProviderCircuitOpen       = errors.New("socket policy: provider skipped after repeated failures")
+)
+
+// circuitBreaker skips the provider for breakerCooldown after breakerFailureThreshold
+// consecutive failures so an outage fails open quickly instead of holding every request to its timeout.
+type circuitBreaker struct {
+	now func() time.Time
+
+	mu        sync.Mutex
+	failures  int
+	openUntil time.Time
+}
+
+func (b *circuitBreaker) clock() time.Time {
+	if b.now == nil {
+		return time.Now()
+	}
+	return b.now()
+}
+
+func (b *circuitBreaker) allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !b.clock().Before(b.openUntil)
+}
+
+func (b *circuitBreaker) observe(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err == nil {
+		b.failures = 0
+		return
+	}
+	b.failures++
+	if b.failures >= breakerFailureThreshold {
+		b.openUntil = b.clock().Add(breakerCooldown)
+		b.failures = 0
+	}
+}
 
 // SocketConfig configures Socket's organization-scoped PURL evaluator.
 type SocketConfig struct {
 	APIURL       string        `hcl:"api-url,optional" help:"Socket API origin." default:"https://api.socket.dev"`
 	Organization string        `hcl:"organization" help:"Socket organization slug whose security policy is evaluated."`
 	Token        string        `hcl:"token" help:"Socket API token with packages:list scope. Use an environment variable placeholder rather than a literal secret."`
-	Timeout      time.Duration `hcl:"timeout,optional" help:"Maximum time Socket may spend resolving and scanning a package." default:"30s"`
+	Timeout      time.Duration `hcl:"timeout,optional" help:"Maximum time Socket may spend resolving and scanning a package before Cachew treats it as pending." default:"10s"`
 }
 
 type socketEvaluator struct {
@@ -46,6 +90,7 @@ type socketEvaluator struct {
 	metrics    metricRecorder
 	inflight   singleflight.Group
 	callSlots  chan struct{}
+	breaker    circuitBreaker
 }
 
 var _ Evaluator = (*socketEvaluator)(nil)
@@ -99,6 +144,10 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 
 // Evaluate returns the strictest policy result across every artifact Socket returns.
 func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
+	if !c.breaker.allow() {
+		c.metrics.recordOutcome(ctx, Decision{}, errProviderCircuitOpen)
+		return Decision{}, errProviderCircuitOpen
+	}
 	for {
 		resultCh := c.inflight.DoChan(purl, func() (any, error) {
 			select {
@@ -114,6 +163,7 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, 
 			if err != nil && context.Cause(ctx) != nil {
 				return Decision{}, errSharedEvaluationOwnerDone
 			}
+			c.breaker.observe(err)
 			return decision, err
 		})
 		select {
@@ -297,8 +347,11 @@ func (s *evaluationState) decision() (Decision, error) {
 	if s.pending {
 		return Decision{Verdict: VerdictPending, Reasons: []string{"pendingScan"}}, nil
 	}
-	if s.unscanned || !s.resolved {
-		return Decision{Verdict: VerdictDeny, Reasons: []string{"notFound"}}, nil
+	if s.unscanned {
+		return Decision{Verdict: VerdictPending, Reasons: []string{"notFound"}}, nil
+	}
+	if !s.resolved {
+		return Decision{}, errors.New("socket policy: response did not resolve the package")
 	}
 	return Decision{Verdict: VerdictAllow}, nil
 }

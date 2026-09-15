@@ -12,15 +12,19 @@ import (
 )
 
 type metricRecorder interface {
+	// record observes a completed provider call, including its latency.
 	record(context.Context, Decision, error, time.Duration)
+	// recordOutcome counts a decision that did not call the provider, such as a cached verdict or a breaker skip.
+	recordOutcome(context.Context, Decision, error)
 	recordNotApplicable(context.Context)
 }
 
 func (m *clientMetrics) recordNotApplicable(ctx context.Context) {
-	m.evaluations.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("provider", m.provider),
-		attribute.String("outcome", "not_applicable"),
-	))
+	m.recordOutcome(ctx, Decision{Verdict: VerdictNotApplicable}, nil)
+}
+
+func (m *clientMetrics) recordOutcome(ctx context.Context, decision Decision, err error) {
+	m.evaluations.Add(ctx, 1, m.attributes(decision, err))
 }
 
 type clientMetrics struct {
@@ -50,14 +54,18 @@ func newMetrics(provider string) *clientMetrics {
 }
 
 func (m *clientMetrics) record(ctx context.Context, decision Decision, err error, duration time.Duration) {
+	attrs := m.attributes(decision, err)
+	m.evaluations.Add(ctx, 1, attrs)
+	m.duration.Record(ctx, duration.Seconds(), attrs)
+}
+
+func (m *clientMetrics) attributes(decision Decision, err error) metric.MeasurementOption {
 	outcome := string(decision.Verdict)
 	if err != nil || outcome == "" {
 		outcome = "unavailable"
 	}
-	attrs := metric.WithAttributes(
+	return metric.WithAttributes(
 		attribute.String("provider", m.provider),
 		attribute.String("outcome", outcome),
 	)
-	m.evaluations.Add(ctx, 1, attrs)
-	m.duration.Record(ctx, duration.Seconds(), attrs)
 }
