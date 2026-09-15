@@ -174,14 +174,14 @@ func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (de
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Decision{}, errors.Wrap(err, "socket policy: request failed")
+		return Decision{}, markUnavailable(errors.Wrap(err, "socket policy: request failed"))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		if _, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10)); copyErr != nil {
-			return Decision{}, errors.Wrap(copyErr, "socket policy: read error response")
+			return Decision{}, markUnavailable(errors.Wrap(copyErr, "socket policy: read error response"))
 		}
-		return Decision{}, errors.Errorf("socket policy: API returned %s", resp.Status)
+		return Decision{}, markUnavailable(errors.Errorf("socket policy: API returned %s", resp.Status))
 	}
 
 	limited := &io.LimitedReader{R: resp.Body, N: maxResponseBytes + 1}
@@ -256,7 +256,7 @@ func (s *evaluationState) add(artifact apiArtifact, requestedPURL string) error 
 	if artifact.StreamType != "" {
 		return errors.Errorf("socket policy: unexpected stream record %q", artifact.StreamType)
 	}
-	if artifact.InputPURL != "" && artifact.InputPURL != requestedPURL {
+	if artifact.InputPURL != "" && !samePURL(artifact.InputPURL, requestedPURL) {
 		return errors.New("socket policy: response PURL does not match request")
 	}
 	if artifact.Type != "" && artifact.Name != "" && artifact.Version != "" {
@@ -287,6 +287,18 @@ func (s *evaluationState) add(artifact apiArtifact, requestedPURL string) error 
 		}
 	}
 	return evaluationErr
+}
+
+// samePURL tolerates percent-encoding differences, such as Socket echoing "@scope" for a "%40scope" request.
+func samePURL(a, b string) bool {
+	return a == b || unescapePURL(a) == unescapePURL(b)
+}
+
+func unescapePURL(purl string) string {
+	if decoded, err := url.PathUnescape(purl); err == nil {
+		return decoded
+	}
+	return purl
 }
 
 func (s *evaluationState) decision() (Decision, error) {

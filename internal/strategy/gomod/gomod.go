@@ -110,7 +110,7 @@ func New(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux
 }
 
 func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.packagePolicy == nil {
+	if s.packagePolicy == nil || r.Method != http.MethodGet {
 		s.proxyHandler.ServeHTTP(w, r)
 		return
 	}

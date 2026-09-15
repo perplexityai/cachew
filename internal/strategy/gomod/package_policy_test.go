@@ -190,3 +190,17 @@ func TestGoModuleBranchQueryBypassesPackagePolicy(t *testing.T) {
 	assert.Equal(t, []string(nil), policy.purls)
 	assert.Equal(t, 1, policy.notApplicable)
 }
+
+func TestGoModuleHeadRequestBypassesPackagePolicy(t *testing.T) {
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+	strategy := &Strategy{
+		packagePolicy: policy,
+		proxyHandler:  http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
+	}
+	w := httptest.NewRecorder()
+	strategy.serveHTTP(w, httptest.NewRequest(http.MethodHead, "/gomod/github.com/pkg/errors/@v/v0.9.1.zip", nil))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, []string(nil), policy.purls)
+	assert.Equal(t, 0, policy.notApplicable)
+}

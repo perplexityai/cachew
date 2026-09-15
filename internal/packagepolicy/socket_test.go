@@ -582,3 +582,34 @@ func TestClientSkipsProviderWhileCircuitIsOpen(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, int32(breakerFailureThreshold+1), requests.Load())
 }
+
+func TestClientBreakerIgnoresMalformedPackageResponses(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = io.WriteString(w, `{"type":`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := newSocketEvaluator(SocketConfig{APIURL: server.URL, Organization: testOrganization, Token: testToken}, true)
+	assert.NoError(t, err)
+
+	for range breakerFailureThreshold + 1 {
+		_, err := client.Evaluate(t.Context(), testPURL)
+		assert.Error(t, err)
+		assert.False(t, isProviderUnavailable(err))
+	}
+	assert.Equal(t, int32(breakerFailureThreshold+1), requests.Load())
+}
+
+func TestClientAcceptsPercentDecodedInputPURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"inputPurl":"pkg:npm/@ctrl/tinycolor@4.1.1","type":"npm","name":"@ctrl/tinycolor","version":"4.1.1","alerts":[]}`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := newSocketEvaluator(SocketConfig{APIURL: server.URL, Organization: testOrganization, Token: testToken}, true)
+	assert.NoError(t, err)
+
+	decision, err := client.Evaluate(t.Context(), "pkg:npm/%40ctrl/tinycolor@4.1.1")
+	assert.NoError(t, err)
+	assert.Equal(t, VerdictAllow, decision.Verdict)
+}

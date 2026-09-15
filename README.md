@@ -188,12 +188,15 @@ For the Socket provider, a policy action of `error` returns `403` with
 treated like pending analysis. With the default `on-failure = "allow"`, pending
 analysis, provider failures, and malformed responses fail open: Cachew records
 the outcome, labels the response `X-Cachew-Package-Policy: pending` or
-`unavailable`, and continues to the package origin without caching the response.
-`on-failure = "deny"` returns `403` for those cases instead. After five
-consecutive provider failures Cachew skips Socket for 30 seconds and counts each
-skipped request as `unavailable`, so an outage fails fast rather than holding
-every request to the `timeout` (default `10s`; a version Socket has never scanned
-can wait up to that long before it is reported pending).
+`unavailable`, and serves an already-cached body or continues to the package
+origin without admitting the response to the cache. `on-failure = "deny"`
+returns `403` for those cases instead. After five consecutive transport or HTTP
+failures Cachew skips Socket for 30 seconds and counts each skipped request as
+`unavailable`, so an outage fails fast rather than holding every request to the
+`timeout` (default `10s`, accepted range 1s to 20m; a version Socket has never
+scanned can wait up to that long before it is reported pending). A malformed
+response for one package fails open without tripping the breaker. `HEAD`
+requests are never evaluated.
 
 Allow and deny verdicts are reused for `verdict-ttl` (default 10 minutes). Every
 `GET`, including a cache hit, is checked against that verdict cache, so a newly

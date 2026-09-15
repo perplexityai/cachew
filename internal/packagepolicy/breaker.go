@@ -15,6 +15,23 @@ const (
 
 var errProviderCircuitOpen = errors.New("socket policy: provider skipped after repeated failures")
 
+// providerUnavailableError marks transport and HTTP-status failures, the only errors the breaker
+// counts. A malformed response for one package fails open without switching Socket off for everyone.
+type providerUnavailableError struct {
+	err error
+}
+
+func (e providerUnavailableError) Error() string { return e.err.Error() }
+
+func (e providerUnavailableError) Unwrap() error { return e.err }
+
+func markUnavailable(err error) error { return providerUnavailableError{err: err} }
+
+func isProviderUnavailable(err error) bool {
+	var target providerUnavailableError
+	return errors.As(err, &target)
+}
+
 // circuitBreaker skips the provider for breakerCooldown after breakerFailureThreshold
 // consecutive failures so an outage fails open quickly instead of holding every request to its timeout.
 type circuitBreaker struct {
@@ -36,6 +53,9 @@ func (b *circuitBreaker) observe(err error) {
 	defer b.mu.Unlock()
 	if err == nil {
 		b.failures = 0
+		return
+	}
+	if !isProviderUnavailable(err) {
 		return
 	}
 	b.failures++
