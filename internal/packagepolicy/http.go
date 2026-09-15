@@ -37,10 +37,11 @@ func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
 	return false
 }
 
-// LogLevel keeps the per-request log for a skipped provider below error level: during an outage the
-// breaker repeats it on every request, and the outage itself is already reported by the metric.
+// LogLevel keeps per-request logs below error level when they do not indicate a Cachew or provider
+// fault: a skipped provider repeats on every request during an outage that the metric already
+// reports, and an encoded separator is a malformed client request.
 func LogLevel(err error) slog.Level {
-	if errors.Is(err, ErrCircuitOpen) {
+	if errors.Is(err, ErrCircuitOpen) || errors.Is(err, ErrEncodedSeparator) {
 		return slog.LevelWarn
 	}
 	return slog.LevelError

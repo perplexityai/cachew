@@ -261,6 +261,45 @@ func TestCodeArtifactRecordsNotApplicablePolicyRequests(t *testing.T) {
 	assert.Equal(t, []string(nil), policy.purls)
 }
 
+func TestCodeArtifactEvaluatesEncodedScopeSeparatorAsScopedPackage(t *testing.T) {
+	target, err := url.Parse("https://codeartifact.example.com")
+	assert.NoError(t, err)
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow}}
+	strategy := &CodeArtifact{
+		target:        target,
+		prefix:        "/codeartifact.example.com",
+		packagePolicy: policy,
+	}
+	request := httptest.NewRequest(http.MethodGet, "/codeartifact.example.com/npm/repository/@ctrl%2Ftinycolor/-/tinycolor-4.1.1.tgz", nil)
+
+	decision, err := strategy.evaluatePackage(request)
+	assert.NoError(t, err)
+	assert.Equal(t, packagepolicy.VerdictAllow, decision.Verdict)
+	assert.Equal(t, []string{"pkg:npm/%40ctrl/tinycolor@4.1.1"}, policy.purls)
+	assert.Equal(t, 0, policy.notApplicable)
+}
+
+func TestCodeArtifactDeniesEncodedSeparatorsBeforeOrigin(t *testing.T) {
+	var originRequests atomic.Int32
+	mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		originRequests.Add(1)
+	}))
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow}}
+	strategy.packagePolicy = policy
+	w := httptest.NewRecorder()
+	path := codeArtifactPath(originServer, "/npm/repository/safe%2F..%2F..%2Fevil/-/evil-1.0.0.tgz")
+
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, "deny", w.Header().Get("X-Cachew-Package-Policy"))
+	assert.Contains(t, w.Body.String(), "encoded_separator")
+	assert.Equal(t, []string(nil), policy.purls)
+	assert.Equal(t, 0, policy.notApplicable)
+	assert.Equal(t, 0, tokenServer.requestCount())
+	assert.Equal(t, int32(0), originRequests.Load())
+}
+
 func TestCodeArtifactEvaluatesQueryBearingPackageRequests(t *testing.T) {
 	var originRequests atomic.Int32
 	mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {

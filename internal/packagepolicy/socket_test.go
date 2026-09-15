@@ -615,7 +615,7 @@ func TestClientAcceptsPercentDecodedInputPURL(t *testing.T) {
 	assert.Equal(t, VerdictAllow, decision.Verdict)
 }
 
-func TestClientFailsOpenWhenProviderSlotsAreExhausted(t *testing.T) {
+func TestClientQueuesForProviderSlot(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
@@ -624,21 +624,36 @@ func TestClientFailsOpenWhenProviderSlotsAreExhausted(t *testing.T) {
 	t.Cleanup(server.Close)
 	client, err := newSocketEvaluator(SocketConfig{APIURL: server.URL, Organization: testOrganization, Token: testToken}, true)
 	assert.NoError(t, err)
-	metrics := &recordingMetrics{}
-	client.metrics = metrics
-	client.slotWait = 10 * time.Millisecond
 	client.callSlots = make(chan struct{}, 1)
 	client.callSlots <- struct{}{}
 
-	_, err = client.Evaluate(t.Context(), testPURL)
-	assert.IsError(t, err, errProviderBusy)
-	assert.True(t, isProviderUnavailable(err))
+	type result struct {
+		decision Decision
+		err      error
+	}
+	results := make(chan result, 1)
+	go func() {
+		decision, err := client.Evaluate(t.Context(), testPURL)
+		results <- result{decision: decision, err: err}
+	}()
+	select {
+	case got := <-results:
+		t.Fatalf("evaluation finished while every provider slot was held: %+v", got)
+	case <-time.After(25 * time.Millisecond):
+	}
 	assert.Equal(t, int32(0), requests.Load())
-	assert.Equal(t, int32(1), metrics.outcomes.Load())
 
 	<-client.callSlots
-	decision, err := client.Evaluate(t.Context(), testPURL)
-	assert.NoError(t, err)
-	assert.Equal(t, VerdictAllow, decision.Verdict)
+	got := <-results
+	assert.NoError(t, got.err)
+	assert.Equal(t, VerdictAllow, got.decision.Verdict)
+	assert.Equal(t, int32(1), requests.Load())
+
+	// A queued caller that gives up leaves without a provider call.
+	client.callSlots <- struct{}{}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = client.Evaluate(ctx, testPURL)
+	assert.True(t, errors.Is(err, context.Canceled))
 	assert.Equal(t, int32(1), requests.Load())
 }

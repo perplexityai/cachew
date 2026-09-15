@@ -349,10 +349,16 @@ func (c *CodeArtifact) evaluatePackage(r *http.Request) (packagepolicy.Decision,
 	if c.packagePolicy == nil || r.Method != http.MethodGet {
 		return packagepolicy.Decision{}, nil
 	}
-	purl, ok := packagepolicy.PackageURLForCodeArtifact(c.originURL(r).Path)
-	if !ok {
+	origin := c.originURL(r)
+	purl, err := packagepolicy.PackageURLForCodeArtifact(origin.EscapedPath())
+	switch {
+	case errors.Is(err, packagepolicy.ErrNotApplicable):
 		c.packagePolicy.ObserveNotApplicable(r.Context())
 		return packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil
+	case err != nil:
+		// The origin receives the raw bytes, so a path with an encoded separator may name a package
+		// Cachew did not evaluate. Deny it and return the cause so the request log shows why.
+		return packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"encoded_separator"}}, errors.Wrap(err, "evaluate package policy")
 	}
 	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {

@@ -27,7 +27,7 @@ func Register(r *strategy.Registry, cloneManager gitclone.ManagerProvider) {
 
 type Config struct {
 	Proxy         string                `hcl:"proxy,optional" help:"Upstream Go module proxy URL (defaults to proxy.golang.org)" default:"https://proxy.golang.org"`
-	PrivatePaths  []string              `hcl:"private-paths,optional" help:"Module path patterns for private repositories"`
+	PrivatePaths  []string              `hcl:"private-paths,optional" help:"GOPRIVATE-style module prefix globs for private repositories; a pattern also matches nested modules."`
 	PackagePolicy *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on public module downloads, including cached files."`
 }
 

@@ -6,29 +6,77 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/alecthomas/errors"
 	"golang.org/x/mod/module"
 )
 
 var pypiNormalizationPattern = regexp.MustCompile(`[-_.]+`)
 
-// PackageURLForCodeArtifact derives a PURL from an immutable npm, PyPI, Maven, or Cargo CodeArtifact asset path.
-func PackageURLForCodeArtifact(path string) (string, bool) {
-	parts, ok := decodedPathParts(path)
-	if !ok || len(parts) < 5 {
-		return "", false
+// npmFormat is the only CodeArtifact format whose clients percent-encode a slash inside a segment.
+const npmFormat = "npm"
+
+var (
+	// ErrNotApplicable reports a path that is not an evaluated immutable package asset, such as
+	// repository metadata or a format without a PURL mapping.
+	ErrNotApplicable = errors.New("package policy: path is not an evaluated package asset")
+	// ErrEncodedSeparator reports a percent-encoded slash inside a segment of an evaluated format.
+	// Package clients never send one for an asset except npm's "@scope%2Fname" spelling, and the
+	// origin may decode it into a different path than Cachew evaluated, so callers deny the request.
+	ErrEncodedSeparator = errors.New("package policy: encoded path separator")
+)
+
+// PackageURLForCodeArtifact derives a PURL from the escaped path of an immutable npm, PyPI, Maven,
+// or Cargo CodeArtifact asset. Segments are decoded individually so an encoded slash cannot change
+// how the path is split.
+func PackageURLForCodeArtifact(escapedPath string) (string, error) {
+	parts, ok := decodedPathParts(escapedPath)
+	if !ok {
+		return "", ErrNotApplicable
 	}
-	switch strings.ToLower(parts[0]) {
-	case "npm":
-		return npmPackageURL(parts)
+	format := strings.ToLower(parts[0])
+	packageURL, evaluated := codeArtifactPackageURL(format)
+	if !evaluated {
+		return "", ErrNotApplicable
+	}
+	for _, part := range parts {
+		if strings.Contains(part, "/") && (format != npmFormat || !npmScopedName(part)) {
+			return "", ErrEncodedSeparator
+		}
+	}
+	if format == npmFormat && len(parts) > 2 && npmScopedName(parts[2]) {
+		parts = slices.Concat(parts[:2], strings.SplitN(parts[2], "/", 2), parts[3:])
+	}
+	if len(parts) < 5 {
+		return "", ErrNotApplicable
+	}
+	purl, ok := packageURL(parts)
+	if !ok {
+		return "", ErrNotApplicable
+	}
+	return purl, nil
+}
+
+func codeArtifactPackageURL(format string) (func([]string) (string, bool), bool) {
+	switch format {
+	case npmFormat:
+		return npmPackageURL, true
 	case "pypi":
-		return pypiPackageURL(parts)
+		return pypiPackageURL, true
 	case "maven":
-		return mavenPackageURL(parts)
+		return mavenPackageURL, true
 	case "cargo":
-		return cargoPackageURL(parts)
+		return cargoPackageURL, true
 	default:
-		return "", false
+		return nil, false
 	}
+}
+
+// npmScopedName reports whether a decoded segment is the "@scope/name" that npm clients send as
+// "@scope%2Fname" for package metadata and, from some clients, tarballs.
+func npmScopedName(segment string) bool {
+	scope, name, ok := strings.Cut(segment, "/")
+	return ok && len(scope) > 1 && strings.HasPrefix(scope, "@") &&
+		name != "" && name != "." && name != ".." && !strings.Contains(name, "/")
 }
 
 func npmPackageURL(parts []string) (string, bool) {
@@ -111,10 +159,15 @@ func PackageURLForGoModule(path string) (string, bool) {
 	return "pkg:golang/" + escapePURLPath(name) + "@" + escapePURLSegment(version), true
 }
 
-func decodedPathParts(path string) ([]string, bool) {
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if slices.Contains(parts, "") {
-		return nil, false
+// decodedPathParts splits the escaped path before decoding each segment so "%2F" stays inside its segment.
+func decodedPathParts(escapedPath string) ([]string, bool) {
+	parts := strings.Split(strings.Trim(escapedPath, "/"), "/")
+	for i, part := range parts {
+		decoded, err := url.PathUnescape(part)
+		if err != nil || decoded == "" {
+			return nil, false
+		}
+		parts[i] = decoded
 	}
 	return parts, true
 }

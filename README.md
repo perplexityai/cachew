@@ -82,6 +82,9 @@ the Go proxy can resolve them; the resulting canonical version's module files ar
 evaluated before download. The `socket` provider sends the PURL to Socket;
 modules matching `private-paths` are not sent. Verdicts are reused for
 `verdict-ttl`, so a cached module costs a provider call at most once per TTL.
+`private-paths` uses the same module-prefix globs as `GOPRIVATE`: a pattern matches
+the module itself and every module nested beneath it, so `github.com/myorg/*` also
+covers `github.com/myorg/repo/sub`.
 
 Pending analysis and provider failures fail open by default, but their downloaded
 module files are not cached. A later request therefore re-evaluates the package.
@@ -182,7 +185,11 @@ for private packages that share a CodeArtifact repository with public
 dependencies. Repository metadata, Maven `-SNAPSHOT` versions, and formats
 without a PURL mapping (NuGet, Ruby, Swift, generic) pass through unevaluated.
 Query strings make CodeArtifact responses uncacheable but do not bypass policy
-evaluation for recognized package asset paths.
+evaluation for recognized package asset paths. The PURL is derived from the
+escaped request path, so a percent-encoded slash cannot change which package is
+evaluated: `@scope%2Fname` is evaluated as the scoped npm package, and any other
+encoded separator under an evaluated format is denied with `403` because the
+origin would receive a path Cachew did not evaluate.
 
 For the Socket provider, a policy action of `error` returns `403` with
 `X-Cachew-Package-Policy: deny`. A package Socket has not indexed (`notFound`) is
@@ -196,17 +203,17 @@ failures Cachew skips Socket for 30 seconds and counts each skipped request as
 `unavailable`, so an outage fails fast rather than holding every request to the
 `timeout` (default `10s`, accepted range 1s to 20m; a version Socket has never
 scanned can wait up to that long before it is reported pending). At most 16
-provider calls run at once and a request waits at most 2 seconds for a slot;
-beyond that it is treated as `unavailable`, so slow evaluations cannot stall
-cache hits. A malformed response for one package fails open without tripping
-the breaker. `HEAD` requests are never evaluated and never admit a body to the
-cache.
+provider calls run at once; further requests queue for a slot until their own
+request ends. Waiting for a slot is local backpressure, never a provider failure,
+so it does not count toward the breaker and is never served unchecked. Lower
+`timeout` if bursts of never-scanned packages make queued requests wait too long.
+A malformed response for one package fails open without tripping the breaker.
+`HEAD` requests are never evaluated and never admit a body to the cache.
 
-`on-failure = "allow"` is an availability-first mode: anything that can make
-Socket fail or rate-limit five times in a row, including a burst of requests for
-never-scanned packages, opens a 30-second window in which packages are served
-unchecked. Treat that mode as monitoring and use `on-failure = "deny"` where the
-policy must be enforced.
+`on-failure = "allow"` is an availability-first mode: anything that makes Socket
+fail or rate-limit five times in a row opens a 30-second window in which packages
+are served unchecked. Treat that mode as monitoring and use `on-failure = "deny"`
+where the policy must be enforced.
 
 Allow and deny verdicts are reused for `verdict-ttl` (default 10 minutes). Every
 `GET`, including a cache hit, is checked against that verdict cache, so a newly
