@@ -22,6 +22,7 @@ func TestLogLevelKeepsNonProviderFaultsBelowError(t *testing.T) {
 		{name: "breaker skip", err: packagepolicy.ErrCircuitOpen, level: slog.LevelWarn},
 		{name: "local overload", err: packagepolicy.ErrOverloaded, level: slog.LevelWarn},
 		{name: "encoded separator", err: errors.Wrap(packagepolicy.ErrEncodedSeparator, "evaluate package policy"), level: slog.LevelWarn},
+		{name: "unmappable package", err: errors.Wrap(packagepolicy.ErrUnmappablePackage, "evaluate package policy"), level: slog.LevelWarn},
 		{name: "caller cancelled", err: errors.Wrap(context.Canceled, "socket policy: wait for shared evaluation"), level: slog.LevelDebug},
 		{name: "provider failure", err: errors.New("socket policy: API returned 500"), level: slog.LevelError},
 	}
@@ -31,6 +32,25 @@ func TestLogLevelKeepsNonProviderFaultsBelowError(t *testing.T) {
 			assert.Equal(t, test.level, packagepolicy.LogLevel(test.err))
 		})
 	}
+}
+
+func TestOverloadResponseAsksClientToRetry(t *testing.T) {
+	w := httptest.NewRecorder()
+
+	assert.False(t, packagepolicy.AllowRequest(w, packagepolicy.Decision{}, packagepolicy.ErrOverloaded))
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+	assert.Equal(t, "overloaded", w.Header().Get("X-Cachew-Package-Policy"))
+	assert.Equal(t, "1", w.Header().Get("Retry-After"))
+	assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+}
+
+func TestAuditLeavesExcludedPackagesUnlabelled(t *testing.T) {
+	w := httptest.NewRecorder()
+	decision := packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable, Audit: true}
+
+	assert.True(t, packagepolicy.AllowRequest(w, decision, nil))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "", w.Header().Get("X-Cachew-Package-Policy"))
 }
 
 func TestAuditAndEnforcementResponses(t *testing.T) {

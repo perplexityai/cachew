@@ -17,7 +17,7 @@ const policyHeader = "X-Cachew-Package-Policy"
 // AllowRequest enforces denials and local overload, or reports a non-blocking audit outcome.
 // Provider failures and pending analysis fail open unless already converted into a denial.
 func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
-	if decision.Audit {
+	if decision.Audit && decision.Verdict != VerdictNotApplicable {
 		outcome := "audit-would_allow"
 		if decision.Verdict == VerdictDeny || errors.Is(err, ErrOverloaded) {
 			outcome = "audit-would_deny"
@@ -28,6 +28,7 @@ func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
 	if errors.Is(err, ErrOverloaded) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set(policyHeader, "overloaded")
+		w.Header().Set("Retry-After", "1")
 		http.Error(w, "Package policy capacity unavailable", http.StatusServiceUnavailable)
 		return false
 	}
@@ -58,7 +59,8 @@ func LogLevel(err error) slog.Level {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return slog.LevelDebug
-	case errors.Is(err, ErrCircuitOpen), errors.Is(err, ErrOverloaded), errors.Is(err, ErrEncodedSeparator):
+	case errors.Is(err, ErrCircuitOpen), errors.Is(err, ErrOverloaded), errors.Is(err, ErrEncodedSeparator),
+		errors.Is(err, ErrUnmappablePackage):
 		return slog.LevelWarn
 	default:
 		return slog.LevelError

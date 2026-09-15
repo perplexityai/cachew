@@ -234,3 +234,16 @@ func TestClientPreservesDenialAtResponseLimit(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, VerdictDeny, decision.Verdict)
 }
+
+func TestSocketRejectsNonSlugLabel(t *testing.T) {
+	config := SocketConfig{APIURL: "https://socket.example.com", Organization: testOrganization, Token: testToken}
+	config.Label = "cachew_rollout.v2"
+	_, err := newSocketEvaluator(config, false)
+	assert.NoError(t, err)
+
+	for _, label := range []string{"cachew,other", "cachew rollout", "-cachew"} {
+		config.Label = label
+		_, err := newSocketEvaluator(config, false)
+		assert.Error(t, err)
+	}
+}

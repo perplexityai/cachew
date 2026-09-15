@@ -24,7 +24,7 @@
 #       token        = "${SOCKET_SECURITY_API_TOKEN}"
 #       label        = "cachew" # optional existing Socket policy label
 #       timeout      = "10s"
-#       queue-timeout = "100ms"
+#       queue-timeout = "5s"
 #     }
 #   }
 # }
@@ -94,6 +94,7 @@ strategy github-releases {
 strategy gomod {
   proxy = "https://proxy.golang.org"
   # package-policy {
+  #   mode = "audit" # no enforcement; omitted mode defaults to enforce
   #   socket {
   #     api-url      = "https://api.socket.dev"
   #     organization = "my-socket-org"

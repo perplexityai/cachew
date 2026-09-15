@@ -277,6 +277,7 @@ func TestClientQueuesForProviderSlot(t *testing.T) {
 	t.Cleanup(server.Close)
 	client, err := newSocketEvaluator(SocketConfig{APIURL: server.URL, Organization: testOrganization, Token: testToken}, true)
 	assert.NoError(t, err)
+	client.queueTimeout = time.Minute
 	client.callSlots = make(chan struct{}, 1)
 	client.callSlots <- struct{}{}
 

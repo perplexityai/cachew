@@ -20,7 +20,7 @@ import (
 
 const (
 	defaultTimeout      = 10 * time.Second
-	defaultQueueTimeout = 100 * time.Millisecond
+	defaultQueueTimeout = 5 * time.Second
 	maxConcurrentCalls  = 16
 	maxResponseBytes    = 4 << 20
 	maxResponseLineSize = 1 << 20
@@ -28,7 +28,9 @@ const (
 
 var (
 	organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	providerCallSlots   = make(chan struct{}, maxConcurrentCalls) //nolint:gochecknoglobals // Every strategy must share the process-wide provider limit.
+	// Socket's labels parameter is comma-separated, so a single slug keeps exactly one label selected.
+	labelPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+	providerCallSlots = make(chan struct{}, maxConcurrentCalls) //nolint:gochecknoglobals // Every strategy must share the process-wide provider limit.
 )
 
 var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
@@ -42,7 +44,7 @@ type SocketConfig struct {
 	Organization string        `hcl:"organization" help:"Socket organization slug whose security policy is evaluated."`
 	Token        string        `hcl:"token" help:"Socket API token with packages:list scope. Use an environment variable placeholder rather than a literal secret."`
 	Timeout      time.Duration `hcl:"timeout,optional" help:"Maximum time Socket may spend resolving and scanning a package before Cachew treats it as pending." default:"10s"`
-	QueueTimeout time.Duration `hcl:"queue-timeout,optional" help:"Maximum local wait for provider capacity; saturation rejects requests independently of on-failure." default:"100ms"`
+	QueueTimeout time.Duration `hcl:"queue-timeout,optional" help:"Maximum local wait for provider capacity; saturation rejects requests independently of on-failure." default:"5s"`
 	Label        string        `hcl:"label,optional" help:"Optional Socket policy label used for evaluation."`
 }
 
@@ -83,6 +85,9 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 	}
 	if config.Token == "" {
 		return nil, errors.New("socket policy: token is required")
+	}
+	if config.Label != "" && !labelPattern.MatchString(config.Label) {
+		return nil, errors.New("socket policy: label must be a single slug")
 	}
 	if config.Timeout < time.Second || config.Timeout > 20*time.Minute {
 		return nil, errors.New("socket policy: timeout must be between 1s and 20m")
