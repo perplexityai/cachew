@@ -1,0 +1,343 @@
+package packagepolicy
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/alecthomas/errors"
+	"golang.org/x/sync/singleflight"
+)
+
+const (
+	defaultTimeout = 10 * time.Second
+	// Requests queue for a slot until their own context ends. Waiting is local backpressure, not a
+	// provider failure, so it never trips the breaker; the Socket timeout bounds how long a
+	// never-scanned package can hold a slot.
+	maxConcurrentCalls  = 16
+	maxResponseBytes    = 4 << 20
+	maxResponseLineSize = 1 << 20
+)
+
+var (
+	organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	providerCallSlots   = make(chan struct{}, maxConcurrentCalls) //nolint:gochecknoglobals // Every strategy must share the process-wide provider limit.
+)
+
+var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
+
+// SocketConfig configures Socket's organization-scoped PURL evaluator.
+type SocketConfig struct {
+	APIURL       string        `hcl:"api-url,optional" help:"Socket API origin." default:"https://api.socket.dev"`
+	Organization string        `hcl:"organization" help:"Socket organization slug whose security policy is evaluated."`
+	Token        string        `hcl:"token" help:"Socket API token with packages:list scope. Use an environment variable placeholder rather than a literal secret."`
+	Timeout      time.Duration `hcl:"timeout,optional" help:"Maximum time Socket may spend resolving and scanning a package before Cachew treats it as pending." default:"10s"`
+}
+
+type socketEvaluator struct {
+	endpoint   *url.URL
+	token      string
+	timeoutSec int
+	httpClient *http.Client
+	metrics    metricRecorder
+	inflight   singleflight.Group
+	callSlots  chan struct{}
+	breaker    circuitBreaker
+}
+
+var _ Evaluator = (*socketEvaluator)(nil)
+
+// ObserveNotApplicable records a request that Cachew could not map to a PURL.
+func (c *socketEvaluator) ObserveNotApplicable(ctx context.Context) {
+	if context.Cause(ctx) == nil {
+		c.metrics.recordOutcome(context.WithoutCancel(ctx), Decision{Verdict: VerdictNotApplicable}, nil)
+	}
+}
+
+func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, error) {
+	if config.Timeout == 0 {
+		config.Timeout = defaultTimeout
+	}
+	if !organizationPattern.MatchString(config.Organization) {
+		return nil, errors.New("socket policy: organization must be a non-empty slug")
+	}
+	if config.Token == "" {
+		return nil, errors.New("socket policy: token is required")
+	}
+	if config.Timeout < time.Second || config.Timeout > 20*time.Minute {
+		return nil, errors.New("socket policy: timeout must be between 1s and 20m")
+	}
+
+	base, err := url.Parse(config.APIURL)
+	if err != nil {
+		return nil, errors.Wrap(err, "socket policy: parse API URL")
+	}
+	validScheme := base.Scheme == "https" || (allowHTTP && base.Scheme == "http")
+	if !validScheme || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || (base.Path != "" && base.Path != "/") {
+		return nil, errors.New("socket policy: API URL must be an HTTPS origin")
+	}
+	endpoint := base.JoinPath("v0", "orgs", config.Organization, "purl")
+
+	return &socketEvaluator{
+		endpoint:   endpoint,
+		token:      config.Token,
+		timeoutSec: int(config.Timeout / time.Second),
+		httpClient: &http.Client{
+			Timeout: config.Timeout + 5*time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		metrics:   newMetrics("socket"),
+		callSlots: providerCallSlots,
+		breaker:   circuitBreaker{now: time.Now},
+	}, nil
+}
+
+// Evaluate returns the strictest policy result across every artifact Socket returns.
+func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision Decision, err error) {
+	defer func() {
+		if cause := context.Cause(ctx); cause != nil {
+			decision = Decision{Verdict: VerdictDeny, Reasons: []string{"requestCanceled"}}
+			err = errors.Wrap(cause, "socket policy: request ended before evaluation completed")
+		}
+	}()
+	for {
+		if cause := context.Cause(ctx); cause != nil {
+			return Decision{}, errors.Wrap(cause, "socket policy: request ended before evaluation completed")
+		}
+		if !c.breaker.allow() {
+			return Decision{}, ErrCircuitOpen
+		}
+		resultCh := c.inflight.DoChan(purl, func() (any, error) {
+			select {
+			case c.callSlots <- struct{}{}:
+				defer func() { <-c.callSlots }()
+			case <-ctx.Done():
+				return Decision{}, errSharedEvaluationOwnerDone
+			}
+			if context.Cause(ctx) != nil {
+				return Decision{}, errSharedEvaluationOwnerDone
+			}
+			if !c.breaker.allow() {
+				return Decision{}, ErrCircuitOpen
+			}
+
+			requestCtx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+			defer cancel()
+			started := time.Now()
+			providerDecision, providerErr := c.evaluateProvider(requestCtx, purl)
+			if providerErr != nil && context.Cause(ctx) != nil {
+				return Decision{}, errSharedEvaluationOwnerDone
+			}
+			c.breaker.observe(providerErr)
+			c.metrics.recordDuration(context.WithoutCancel(ctx), providerDecision, providerErr, time.Since(started))
+			return providerDecision, providerErr
+		})
+		select {
+		case <-ctx.Done():
+			return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
+		case result := <-resultCh:
+			if errors.Is(result.Err, errSharedEvaluationOwnerDone) {
+				if context.Cause(ctx) != nil {
+					return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
+				}
+				continue
+			}
+			if result.Err != nil {
+				return Decision{}, result.Err
+			}
+			sharedDecision, ok := result.Val.(Decision)
+			if !ok {
+				return Decision{}, errors.New("socket policy: invalid shared evaluation")
+			}
+			return sharedDecision, nil
+		}
+	}
+}
+
+func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (Decision, error) {
+	body, err := json.Marshal(purlRequest{Components: []purlComponent{{PURL: purl}}})
+	if err != nil {
+		return Decision{}, errors.Wrap(err, "socket policy: encode request")
+	}
+
+	endpoint := *c.endpoint
+	query := endpoint.Query()
+	query.Set("alerts", "true")
+	query.Set("compact", "true")
+	query.Set("poll", "true")
+	query.Set("purlErrors", "false")
+	query.Set("timeoutSec", strconv.Itoa(c.timeoutSec))
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return Decision{}, errors.Wrap(err, "socket policy: build request")
+	}
+	req.Header.Set("Accept", "application/x-ndjson")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "cachew")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return Decision{}, markUnavailable(errors.Wrap(err, "socket policy: request failed"))
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		if _, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10)); copyErr != nil {
+			return Decision{}, markUnavailable(errors.Wrap(copyErr, "socket policy: read error response"))
+		}
+		return Decision{}, markUnavailable(errors.Errorf("socket policy: API returned %s", resp.Status))
+	}
+
+	limited := &io.LimitedReader{R: resp.Body, N: maxResponseBytes + 1}
+	decision, err := evaluateStream(limited, purl)
+	if err != nil {
+		return Decision{}, err
+	}
+	if limited.N == 0 {
+		return Decision{}, errors.New("socket policy: response exceeds size limit")
+	}
+	return decision, nil
+}
+
+type purlRequest struct {
+	Components []purlComponent `json:"components"`
+}
+
+type purlComponent struct {
+	PURL string `json:"purl"`
+}
+
+type apiArtifact struct {
+	StreamType string  `json:"_type"`
+	InputPURL  string  `json:"inputPurl"`
+	Type       string  `json:"type"`
+	Name       string  `json:"name"`
+	Version    string  `json:"version"`
+	Alerts     []alert `json:"alerts"`
+}
+
+type alert struct {
+	Type   string `json:"type"`
+	Action string `json:"action"`
+}
+
+type evaluationState struct {
+	resolved  bool
+	pending   bool
+	unscanned bool
+	denied    map[string]struct{}
+	records   int
+}
+
+func evaluateStream(r io.Reader, requestedPURL string) (Decision, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64<<10), maxResponseLineSize)
+	state := evaluationState{denied: make(map[string]struct{})}
+
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) == "" {
+			continue
+		}
+		state.records++
+		var decoded apiArtifact
+		if err := json.Unmarshal(scanner.Bytes(), &decoded); err != nil {
+			return Decision{}, errors.Wrap(err, "socket policy: decode response")
+		}
+		if err := state.add(decoded, requestedPURL); err != nil && len(state.denied) == 0 {
+			return Decision{}, err
+		}
+		if len(state.denied) > 0 {
+			return state.decision()
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return Decision{}, errors.Wrap(err, "socket policy: read response")
+	}
+	return state.decision()
+}
+
+func (s *evaluationState) add(artifact apiArtifact, requestedPURL string) error {
+	if artifact.StreamType != "" {
+		return errors.Errorf("socket policy: unexpected stream record %q", artifact.StreamType)
+	}
+	if artifact.InputPURL != "" && !samePURL(artifact.InputPURL, requestedPURL) {
+		return errors.New("socket policy: response PURL does not match request")
+	}
+	if artifact.Type != "" && artifact.Name != "" && artifact.Version != "" {
+		s.resolved = true
+	}
+	var evaluationErr error
+	for _, alert := range artifact.Alerts {
+		switch alert.Type {
+		case "pendingScan":
+			s.pending = true
+			continue
+		case "notFound":
+			s.unscanned = true
+			continue
+		}
+		switch alert.Action {
+		case "error":
+			s.denied[alert.Type] = struct{}{}
+		case "ignore", "monitor", "warn":
+		case "":
+			if evaluationErr == nil {
+				evaluationErr = errors.Errorf("socket policy: alert %q has no policy action", alert.Type)
+			}
+		default:
+			if evaluationErr == nil {
+				evaluationErr = errors.Errorf("socket policy: unsupported policy action %q", alert.Action)
+			}
+		}
+	}
+	return evaluationErr
+}
+
+// samePURL tolerates percent-encoding differences, such as Socket echoing "@scope" for a "%40scope" request.
+func samePURL(a, b string) bool {
+	return a == b || unescapePURL(a) == unescapePURL(b)
+}
+
+func unescapePURL(purl string) string {
+	if decoded, err := url.PathUnescape(purl); err == nil {
+		return decoded
+	}
+	return purl
+}
+
+func (s *evaluationState) decision() (Decision, error) {
+	if s.records == 0 {
+		return Decision{}, errors.New("socket policy: empty response")
+	}
+	if len(s.denied) > 0 {
+		reasons := make([]string, 0, len(s.denied))
+		for reason := range s.denied {
+			reasons = append(reasons, reason)
+		}
+		slices.Sort(reasons)
+		return Decision{Verdict: VerdictDeny, Reasons: reasons}, nil
+	}
+	if s.pending {
+		return Decision{Verdict: VerdictPending, Reasons: []string{"pendingScan"}}, nil
+	}
+	if s.unscanned {
+		return Decision{Verdict: VerdictPending, Reasons: []string{"notFound"}}, nil
+	}
+	if !s.resolved {
+		return Decision{}, errors.New("socket policy: response did not resolve the package")
+	}
+	return Decision{Verdict: VerdictAllow}, nil
+}
