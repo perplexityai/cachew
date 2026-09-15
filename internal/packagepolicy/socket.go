@@ -19,16 +19,22 @@ import (
 )
 
 const (
-	defaultAPIURL       = "https://api.socket.dev"
-	defaultTimeout      = 10 * time.Second
-	maxConcurrentCalls  = 16
+	defaultAPIURL      = "https://api.socket.dev"
+	defaultTimeout     = 10 * time.Second
+	maxConcurrentCalls = 16
+	// A request waits this long for a provider slot before it is treated as unavailable, so a slow
+	// Socket cannot stall cache hits behind never-scanned packages that hold slots to the timeout.
+	defaultSlotWait     = 2 * time.Second
 	maxResponseBytes    = 4 << 20
 	maxResponseLineSize = 1 << 20
 )
 
 var organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
-var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
+var (
+	errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
+	errProviderBusy              = errors.New("socket policy: provider call slots exhausted")
+)
 
 // SocketConfig configures Socket's organization-scoped PURL evaluator.
 type SocketConfig struct {
@@ -46,6 +52,7 @@ type socketEvaluator struct {
 	metrics    metricRecorder
 	inflight   singleflight.Group
 	callSlots  chan struct{}
+	slotWait   time.Duration
 	breaker    circuitBreaker
 }
 
@@ -95,6 +102,7 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 		},
 		metrics:   newMetrics("socket"),
 		callSlots: make(chan struct{}, maxConcurrentCalls),
+		slotWait:  defaultSlotWait,
 		breaker:   circuitBreaker{now: time.Now},
 	}, nil
 }
@@ -102,14 +110,21 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 // Evaluate returns the strictest policy result across every artifact Socket returns.
 func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
 	if !c.breaker.allow() {
-		c.metrics.recordOutcome(ctx, Decision{}, errProviderCircuitOpen)
-		return Decision{}, errProviderCircuitOpen
+		c.metrics.recordOutcome(ctx, Decision{}, ErrCircuitOpen)
+		return Decision{}, ErrCircuitOpen
 	}
 	for {
 		resultCh := c.inflight.DoChan(purl, func() (any, error) {
+			slotTimer := time.NewTimer(c.slotWait)
+			defer slotTimer.Stop()
 			select {
 			case c.callSlots <- struct{}{}:
 				defer func() { <-c.callSlots }()
+			case <-slotTimer.C:
+				err := markUnavailable(errProviderBusy)
+				c.breaker.observe(err)
+				c.metrics.recordOutcome(ctx, Decision{}, err)
+				return Decision{}, err
 			case <-ctx.Done():
 				return Decision{}, errSharedEvaluationOwnerDone
 			}

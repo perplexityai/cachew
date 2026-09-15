@@ -110,8 +110,13 @@ func New(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux
 }
 
 func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.packagePolicy == nil || r.Method != http.MethodGet {
+	if s.packagePolicy == nil {
 		s.proxyHandler.ServeHTTP(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		// goproxy fetches and stores module files for HEAD too; an unevaluated body must not be admitted.
+		s.proxyHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), skipCacheContextKey{}, struct{}{})))
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/gomod/")
@@ -123,7 +128,7 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	decision, err := s.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {
-		s.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
+		s.logger.Log(r.Context(), packagepolicy.LogLevel(err), "Package policy evaluation failed", "error", err)
 	}
 	if !packagepolicy.Cacheable(decision, err) {
 		r = r.WithContext(context.WithValue(r.Context(), skipCacheContextKey{}, struct{}{}))

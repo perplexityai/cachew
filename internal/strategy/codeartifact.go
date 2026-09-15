@@ -217,7 +217,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.metric.recordRequest(r.Context(), mode)
 	decision, err := c.evaluatePackage(r)
 	if err != nil {
-		c.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
+		c.logger.Log(r.Context(), packagepolicy.LogLevel(err), "Package policy evaluation failed", "error", err)
 	}
 	if !packagepolicy.AllowRequest(w, decision, err) {
 		return

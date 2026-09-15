@@ -1,9 +1,12 @@
 package packagepolicy
 
 import (
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/alecthomas/errors"
 )
 
 var safeReasonPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -32,6 +35,15 @@ func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
 	}
 	http.Error(w, message, http.StatusForbidden)
 	return false
+}
+
+// LogLevel keeps the per-request log for a skipped provider below error level: during an outage the
+// breaker repeats it on every request, and the outage itself is already reported by the metric.
+func LogLevel(err error) slog.Level {
+	if errors.Is(err, ErrCircuitOpen) {
+		return slog.LevelWarn
+	}
+	return slog.LevelError
 }
 
 // Cacheable reports whether a response served under this decision may be admitted to the cache.

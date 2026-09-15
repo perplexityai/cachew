@@ -17,7 +17,7 @@ func PackageURLForCodeArtifact(path string) (string, bool) {
 	if !ok || len(parts) < 5 {
 		return "", false
 	}
-	switch parts[0] {
+	switch strings.ToLower(parts[0]) {
 	case "npm":
 		return npmPackageURL(parts)
 	case "pypi":

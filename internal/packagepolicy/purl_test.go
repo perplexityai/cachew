@@ -63,6 +63,12 @@ func TestPackageURLForCodeArtifact(t *testing.T) {
 			purl: "pkg:cargo/serde@1.0.210",
 			ok:   true,
 		},
+		{
+			name: "format segment is case-insensitive",
+			path: "/NPM/repository/chromatitle-js/-/chromatitle-js-1.0.0.tgz",
+			purl: "pkg:npm/chromatitle-js@1.0.0",
+			ok:   true,
+		},
 		{name: "npm metadata", path: "/npm/repository/chromatitle-js", ok: false},
 		{name: "PyPI metadata", path: "/pypi/repository/simple/requests/", ok: false},
 		{name: "Maven metadata", path: "/maven/repository/com/perplexity/tool/maven-metadata.xml", ok: false},

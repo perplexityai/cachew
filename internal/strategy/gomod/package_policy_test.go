@@ -136,7 +136,7 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 	}
 }
 
-func TestGoModuleCachedPackageIsStillEvaluated(t *testing.T) {
+func TestGoModuleDeniedModuleNeverReachesProxy(t *testing.T) {
 	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}}}
 	strategy := &Strategy{
 		packagePolicy: policy,
@@ -191,16 +191,23 @@ func TestGoModuleBranchQueryBypassesPackagePolicy(t *testing.T) {
 	assert.Equal(t, 1, policy.notApplicable)
 }
 
-func TestGoModuleHeadRequestBypassesPackagePolicy(t *testing.T) {
+func TestGoModuleHeadRequestBypassesPackagePolicyWithoutCaching(t *testing.T) {
 	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+	probe := &cacheProbe{Cache: cache.NoOpCache()}
+	cacher := &goproxyCacher{cache: probe}
+	cacheName := "github.com/pkg/errors/@v/v0.9.1.zip"
 	strategy := &Strategy{
 		packagePolicy: policy,
-		proxyHandler:  http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
+		proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.NoError(t, cacher.Put(r.Context(), cacheName, strings.NewReader("module")))
+			w.WriteHeader(http.StatusOK)
+		}),
 	}
 	w := httptest.NewRecorder()
-	strategy.serveHTTP(w, httptest.NewRequest(http.MethodHead, "/gomod/github.com/pkg/errors/@v/v0.9.1.zip", nil))
+	strategy.serveHTTP(w, httptest.NewRequest(http.MethodHead, "/gomod/"+cacheName, nil))
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, []string(nil), policy.purls)
 	assert.Equal(t, 0, policy.notApplicable)
+	assert.Equal(t, 0, probe.createCalls)
 }

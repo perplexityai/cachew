@@ -103,7 +103,7 @@ func TestNewSelectsSocketProvider(t *testing.T) {
 func TestNewExcludesPURLsBeforeProviderEvaluation(t *testing.T) {
 	var requests atomic.Int32
 	evaluator, err := New(Config{
-		ExcludePURLs: []string{"pkg:npm/%40pplx-internal/*", "pkg:pypi/pplx-*@*"},
+		ExcludePURLs: []string{"pkg:npm/%40pplx-internal/*", "pkg:npm/@pplx-private/*", "pkg:pypi/pplx-*@*"},
 		Socket: &SocketConfig{
 			APIURL:       "https://socket.example.com",
 			Organization: testOrganization,
@@ -122,6 +122,7 @@ func TestNewExcludesPURLsBeforeProviderEvaluation(t *testing.T) {
 
 	for _, purl := range []string{
 		"pkg:npm/%40pplx-internal/agents@1.2.3",
+		"pkg:npm/%40pplx-private/tools@2.0.0",
 		"pkg:pypi/pplx-sdk@0.4.0",
 	} {
 		decision, err := evaluator.Evaluate(t.Context(), purl)
@@ -129,7 +130,7 @@ func TestNewExcludesPURLsBeforeProviderEvaluation(t *testing.T) {
 		assert.Equal(t, VerdictNotApplicable, decision.Verdict)
 	}
 	assert.Equal(t, int32(0), requests.Load())
-	assert.Equal(t, int32(2), metrics.notApplicable.Load())
+	assert.Equal(t, int32(3), metrics.notApplicable.Load())
 
 	_, err = evaluator.Evaluate(t.Context(), testPURL)
 	assert.Error(t, err)
@@ -445,7 +446,7 @@ func TestClientBoundsConcurrentProviderEvaluations(t *testing.T) {
 	assert.Equal(t, int32(callers), requests.Load())
 }
 
-func TestClientFailsClosedOnInvalidResponses(t *testing.T) {
+func TestClientReportsInvalidResponsesAsErrors(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
@@ -573,7 +574,7 @@ func TestClientSkipsProviderWhileCircuitIsOpen(t *testing.T) {
 	assert.Equal(t, int32(breakerFailureThreshold), requests.Load())
 
 	_, err = client.Evaluate(t.Context(), testPURL)
-	assert.IsError(t, err, errProviderCircuitOpen)
+	assert.IsError(t, err, ErrCircuitOpen)
 	assert.Equal(t, int32(breakerFailureThreshold), requests.Load())
 	assert.Equal(t, int32(1), metrics.outcomes.Load())
 
@@ -612,4 +613,32 @@ func TestClientAcceptsPercentDecodedInputPURL(t *testing.T) {
 	decision, err := client.Evaluate(t.Context(), "pkg:npm/%40ctrl/tinycolor@4.1.1")
 	assert.NoError(t, err)
 	assert.Equal(t, VerdictAllow, decision.Verdict)
+}
+
+func TestClientFailsOpenWhenProviderSlotsAreExhausted(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = io.WriteString(w, testAllowResponse)
+	}))
+	t.Cleanup(server.Close)
+	client, err := newSocketEvaluator(SocketConfig{APIURL: server.URL, Organization: testOrganization, Token: testToken}, true)
+	assert.NoError(t, err)
+	metrics := &recordingMetrics{}
+	client.metrics = metrics
+	client.slotWait = 10 * time.Millisecond
+	client.callSlots = make(chan struct{}, 1)
+	client.callSlots <- struct{}{}
+
+	_, err = client.Evaluate(t.Context(), testPURL)
+	assert.IsError(t, err, errProviderBusy)
+	assert.True(t, isProviderUnavailable(err))
+	assert.Equal(t, int32(0), requests.Load())
+	assert.Equal(t, int32(1), metrics.outcomes.Load())
+
+	<-client.callSlots
+	decision, err := client.Evaluate(t.Context(), testPURL)
+	assert.NoError(t, err)
+	assert.Equal(t, VerdictAllow, decision.Verdict)
+	assert.Equal(t, int32(1), requests.Load())
 }

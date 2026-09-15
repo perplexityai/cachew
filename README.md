@@ -175,7 +175,8 @@ can implement the same PURL-to-decision interface without changing the
 CodeArtifact or Go module strategies.
 
 `exclude-purls` accepts Go-style path glob patterns for npm, PyPI, Maven, and
-Cargo PURLs. Matching packages are recorded as `not_applicable` and continue to
+Cargo PURLs; npm scopes may be written as `@scope` or `%40scope`. Matching
+packages are recorded as `not_applicable` and continue to
 the origin without sending their names or versions to the policy provider. Use it
 for private packages that share a CodeArtifact repository with public
 dependencies. Repository metadata, Maven `-SNAPSHOT` versions, and formats
@@ -194,9 +195,18 @@ returns `403` for those cases instead. After five consecutive transport or HTTP
 failures Cachew skips Socket for 30 seconds and counts each skipped request as
 `unavailable`, so an outage fails fast rather than holding every request to the
 `timeout` (default `10s`, accepted range 1s to 20m; a version Socket has never
-scanned can wait up to that long before it is reported pending). A malformed
-response for one package fails open without tripping the breaker. `HEAD`
-requests are never evaluated.
+scanned can wait up to that long before it is reported pending). At most 16
+provider calls run at once and a request waits at most 2 seconds for a slot;
+beyond that it is treated as `unavailable`, so slow evaluations cannot stall
+cache hits. A malformed response for one package fails open without tripping
+the breaker. `HEAD` requests are never evaluated and never admit a body to the
+cache.
+
+`on-failure = "allow"` is an availability-first mode: anything that can make
+Socket fail or rate-limit five times in a row, including a burst of requests for
+never-scanned packages, opens a 30-second window in which packages are served
+unchecked. Treat that mode as monitoring and use `on-failure = "deny"` where the
+policy must be enforced.
 
 Allow and deny verdicts are reused for `verdict-ttl` (default 10 minutes). Every
 `GET`, including a cache hit, is checked against that verdict cache, so a newly
@@ -249,9 +259,9 @@ GETs can dominate that outcome, so dashboards should chart it separately and
 exclude it from allow/deny availability ratios. `HEAD` requests are not counted
 because they cannot admit a package body.
 
-Concurrent requests for the same PURL share one in-flight provider call, and at
-most 16 provider calls run at once. The resulting allow or deny verdict is reused
-for `verdict-ttl`; pending results and failures are never cached.
+Concurrent requests for the same PURL share one in-flight provider call. The
+resulting allow or deny verdict is reused for `verdict-ttl`; pending results and
+failures are never cached.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,

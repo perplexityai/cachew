@@ -13,7 +13,9 @@ const (
 	breakerCooldown         = 30 * time.Second
 )
 
-var errProviderCircuitOpen = errors.New("socket policy: provider skipped after repeated failures")
+// ErrCircuitOpen is returned while the provider is being skipped after repeated failures.
+// Strategies log it below error level because every request repeats it during an outage.
+var ErrCircuitOpen = errors.New("socket policy: provider skipped after repeated failures")
 
 // providerUnavailableError marks transport and HTTP-status failures, the only errors the breaker
 // counts. A malformed response for one package fails open without switching Socket off for everyone.

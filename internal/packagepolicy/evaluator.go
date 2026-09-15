@@ -53,13 +53,18 @@ func New(config Config) (Evaluator, error) {
 		return nil, errors.New("package policy: provider is required")
 	}
 	supportedTypes := []string{"pkg:npm/", "pkg:pypi/", "pkg:maven/", "pkg:cargo/"}
+	patterns := make([]string, 0, len(config.ExcludePURLs))
 	for _, pattern := range config.ExcludePURLs {
 		if !slices.ContainsFunc(supportedTypes, func(prefix string) bool { return strings.HasPrefix(pattern, prefix) }) {
 			return nil, errors.New("package policy: exclude-purls supports only npm, PyPI, Maven, and Cargo PURLs")
 		}
+		// Cachew emits npm scopes as %40; accept the natural @scope spelling so a private scope is not
+		// silently sent to the provider because of an encoding mismatch.
+		pattern = strings.Replace(pattern, "pkg:npm/@", "pkg:npm/%40", 1)
 		if _, err := path.Match(pattern, ""); err != nil {
 			return nil, errors.Wrap(err, "package policy: invalid exclude-purls pattern")
 		}
+		patterns = append(patterns, pattern)
 	}
 	if config.OnFailure != "" && config.OnFailure != "allow" && config.OnFailure != "deny" {
 		return nil, errors.Errorf("package policy: on-failure must be allow or deny, got %q", config.OnFailure)
@@ -78,8 +83,8 @@ func New(config Config) (Evaluator, error) {
 	if config.OnFailure == "deny" {
 		evaluator = failClosedEvaluator{Evaluator: evaluator}
 	}
-	if len(config.ExcludePURLs) > 0 {
-		evaluator = &excludingEvaluator{Evaluator: evaluator, patterns: config.ExcludePURLs}
+	if len(patterns) > 0 {
+		evaluator = &excludingEvaluator{Evaluator: evaluator, patterns: patterns}
 	}
 	return evaluator, nil
 }
