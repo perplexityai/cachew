@@ -76,18 +76,20 @@ gomod {
 ```
 
 When `package-policy` is configured, Cachew evaluates the PURL for each
-canonical-version public module request, including cached module files, before
+canonical-version public module `GET`, including cached module files, before
 it serves or downloads them. Branch and revision `.info` queries pass through so
 the Go proxy can resolve them; the resulting canonical version's module files are
 evaluated before download. The `socket` provider sends the PURL to Socket;
 modules matching `private-paths` are not sent. Verdicts are reused for
-`verdict-ttl`, so a cached module costs a provider call at most once per TTL.
+up to `verdict-ttl`, subject to the verdict cache capacity described below.
 `private-paths` uses the same module-prefix globs as `GOPRIVATE` for both fetch
 routing and policy exclusion: a pattern matches the module itself and every module
 nested beneath it, so `github.com/myorg/*` also covers `github.com/myorg/repo/sub`.
 
 Pending analysis and provider failures fail open by default, but their downloaded
 module files are not cached. A later request therefore re-evaluates the package.
+Go module `HEAD` requests return `405 Method Not Allowed`, whether or not package
+policy is enabled, so bodyless requests cannot trigger uncached module downloads.
 
 ### Hermit
 
@@ -129,7 +131,7 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
   origin-read-idle-timeout = "30s"
 
   package-policy {
-    exclude-purls = ["pkg:npm/%40myorg/*", "pkg:pypi/myorg-*@*"]
+    exclude-purls = ["pkg:npm/%40myorg/*"]
     verdict-ttl   = "10m"   # default; 0 disables verdict reuse
     on-failure    = "allow" # default; "deny" returns 403 when Socket is unavailable
 
@@ -170,27 +172,33 @@ timeout values are rejected.
 
 The optional `package-policy` block is a provider-independent package-admission
 interface based on standard Package URLs (PURLs). Its `socket` provider checks
-npm, PyPI, Maven, and Cargo artifact PURLs, including cache hits, with the
+npm artifact PURLs, including cache hits, with the
 configured organization's [Socket package
 policy](https://docs.socket.dev/reference/batchpackagefetchbyorg) before Cachew
 serves a cached body, mints a CodeArtifact token, or contacts the repository. Another provider
 can implement the same PURL-to-decision interface without changing the
 CodeArtifact or Go module strategies.
+Package-policy evaluation currently supports only npm through CodeArtifact and
+Go modules through `/gomod/`. PyPI, Maven, Cargo, and other CodeArtifact formats
+retain their existing proxy/cache behavior but are not evaluated by Socket.
 
-`exclude-purls` accepts Go-style path glob patterns for npm, PyPI, Maven, and
-Cargo PURLs; npm scopes may be written as `@scope` or `%40scope`, and PyPI names
-are normalized the way PURLs are (lower case, with runs of `-`, `_`, and `.`
-collapsed to `-`). Matching packages are recorded as `not_applicable` and continue to
+`exclude-purls` accepts Go-style path glob patterns for npm PURLs only; npm scopes
+may be written as `@scope` or `%40scope`. Matching packages are recorded as
+`not_applicable` and continue to
 the origin without sending their names or versions to the policy provider. Use it
 for private packages that share a CodeArtifact repository with public
-dependencies. Repository metadata, Maven `-SNAPSHOT` versions, and formats
-without a PURL mapping (NuGet, Ruby, Swift, generic) pass through unevaluated.
+dependencies. Use `private-paths` for Go module exclusions. Repository metadata
+and all non-npm CodeArtifact formats pass through unevaluated.
 Query strings make CodeArtifact responses uncacheable but do not bypass policy
 evaluation for recognized package asset paths. The PURL is derived from the
 escaped request path, so a percent-encoded slash cannot change which package is
 evaluated: `@scope%2Fname` in the package-name position is evaluated as the
-scoped npm package, and any other encoded separator under an evaluated format is
+scoped npm package, and any other encoded separator under the npm format is
 denied with `403` because the origin would receive a path Cachew did not evaluate.
+For CodeArtifact VPC endpoint origins (`vpce.amazonaws.com`), Cachew normalizes
+`/npm/d/domain-owner/repository/` to `/npm/repository/` before deriving the PURL.
+Recognized npm package bodies that cannot be mapped are denied with `403`, independent
+of `on-failure`; repository metadata and unsupported formats remain unevaluated.
 
 For the Socket provider, a policy action of `error` returns `403` with
 `X-Cachew-Package-Policy: deny`. A package Socket has not indexed (`notFound`) is
@@ -208,24 +216,34 @@ ends the breaker closes again and the next five consecutive failures reopen it, 
 requests in flight at that moment can wait for the `timeout`. A request whose
 client disconnects before Socket answers is neither a provider failure nor an
 `unavailable` outcome. At most 16
-provider calls run at once; further requests queue for a slot until their own
-request ends. Waiting for a slot is local backpressure, never a provider failure,
-so it does not count toward the breaker and is never served unchecked. Lower
+provider calls run at once across all strategies in a process; further requests
+queue for a slot until their own request ends. Waiting for a slot is local
+backpressure, never a provider failure,
+so it does not count toward the breaker and is never served unchecked. Cancelled
+queued requests are rejected regardless of `on-failure`. Lower
 `timeout` if bursts of never-scanned packages make queued requests wait too long.
 A malformed response for one package fails open without tripping the breaker.
-`HEAD` requests are never evaluated and never admit a body to the cache.
+CodeArtifact `HEAD` requests are never evaluated and never admit a body to the cache.
 
 `on-failure = "allow"` is an availability-first mode: anything that makes Socket
 fail or rate-limit five times in a row opens a 30-second window in which packages
 are served unchecked. Treat that mode as monitoring and use `on-failure = "deny"`
 where the policy must be enforced.
 
-Allow and deny verdicts are reused for `verdict-ttl` (default 10 minutes). Every
-`GET`, including a cache hit, is checked against that verdict cache, so a newly
-denied package stops being served within one TTL even though its bytes remain
+Allow and deny verdicts are reused for up to `verdict-ttl` (default 10 minutes).
+Each configured strategy retains at most 100,000 verdicts and evicts the least
+recently used entry when full; an evicted verdict is evaluated again on the next
+request. Every `GET`, including a cache hit, is checked against that verdict cache,
+so a newly denied package stops being served within one TTL even though its bytes remain
 stored until they expire or are deleted.
 
 A later policy change does not remove an admitted object's bytes from the cache.
+Keep the generic `/api/v1/object/{namespace}/{key}` API restricted to trusted
+operators and cache peers. It bypasses package-policy evaluation and can read or
+replace entries in the `codeartifact` and `gomod` namespaces. Do not grant package
+consumers generic object reads or writes to these namespaces; the default OPA
+policy's remote `/api` restriction must be preserved in any shared policy.
+
 Cachew's generic `delete` operation accepts one exact cache key, but CodeArtifact
 can store multiple representations of one URL. The unhashed key material is the
 origin URL followed by these optional lines, in this order:
@@ -257,6 +275,8 @@ file by using an environment placeholder as shown above and inject
 secret manager. For example, Kubernetes can source the environment variable
 from a `Secret` with `env[].valueFrom.secretKeyRef`; the secret does not need to
 be exposed to package-manager clients.
+Omitted `on-failure` and `socket.api-url` attributes use their HCL defaults;
+explicit empty values, including unset environment placeholders, fail startup.
 
 Policy outcomes and API latency are exported as
 `cachew.package_policy.evaluations_total` and
@@ -265,20 +285,20 @@ bounded provider and outcome attributes (`allow`, `deny`, `pending`,
 `unavailable`, or `not_applicable`); package names and versions are not metric
 labels. The latency histogram covers actual provider evaluations; verdict-cache
 hits and circuit-breaker skips increment the counter without a latency sample.
-Requests that join an in-flight evaluation for the same PURL are not counted
-separately, and requests abandoned by the client before Socket answers are not
-counted at all. Outcomes describe the provider result: with `on-failure = "deny"`,
-`pending` and `unavailable` are served as `403`. Encoded-separator denials are
-logged at warn level rather than counted. Unsupported
-ecosystems, non-package metadata, and excluded private Go modules
+Each request that joins an in-flight evaluation is counted separately, but requests
+abandoned by the client before evaluation completes are not counted. Counter outcomes
+describe the final policy decision: with `on-failure = "deny"`, pending analysis
+and provider failures count as `deny`. Histogram outcomes retain the provider
+result. Encoded-separator and unmappable-body denials are logged rather than
+counted. Unsupported ecosystems, non-package metadata, and excluded private Go modules
 record `not_applicable` so gaps in enforcement coverage remain visible. Metadata
 GETs can dominate that outcome, so dashboards should chart it separately and
 exclude it from allow/deny availability ratios. `HEAD` requests are not counted
 because they cannot admit a package body.
 
-Concurrent requests for the same PURL share one in-flight provider call. The
-resulting allow or deny verdict is reused for `verdict-ttl`; pending results and
-failures are never cached.
+Within a configured strategy, concurrent requests for the same PURL share one
+in-flight provider call. The resulting allow or deny verdict is reused until its
+TTL expires or it is evicted; pending results and failures are never cached.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,

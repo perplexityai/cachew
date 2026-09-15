@@ -2,6 +2,7 @@ package packagepolicy //nolint:testpackage // White-box coverage is required for
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -33,23 +34,26 @@ func TestCachingEvaluatorReusesDefinitiveVerdictsUntilTTL(t *testing.T) {
 		{Verdict: VerdictAllow},
 	}}
 	metrics := &recordingMetrics{}
-	cache := newCachingEvaluator(inner, 10*time.Minute, metrics)
+	cache := newCachingEvaluator(inner, 10*time.Minute)
+	evaluator := &metricsEvaluator{Evaluator: cache, metrics: metrics}
 	now := time.Now()
 	cache.now = func() time.Time { return now }
 
 	for range 3 {
-		decision, err := cache.Evaluate(t.Context(), testPURL)
+		decision, err := evaluator.Evaluate(t.Context(), testPURL)
 		assert.NoError(t, err)
 		assert.Equal(t, Decision{Verdict: VerdictDeny, Reasons: []string{"malware"}}, decision)
 	}
 	assert.Equal(t, 1, inner.calls)
-	assert.Equal(t, int32(2), metrics.outcomes.Load())
+	assert.Equal(t, int32(3), metrics.outcomes.Load())
+	assert.Equal(t, int32(0), metrics.evaluations.Load())
 
 	now = now.Add(10 * time.Minute)
-	decision, err := cache.Evaluate(t.Context(), testPURL)
+	decision, err := evaluator.Evaluate(t.Context(), testPURL)
 	assert.NoError(t, err)
 	assert.Equal(t, VerdictAllow, decision.Verdict)
 	assert.Equal(t, 2, inner.calls)
+	assert.Equal(t, int32(4), metrics.outcomes.Load())
 }
 
 func TestCachingEvaluatorDoesNotCachePendingOrFailures(t *testing.T) {
@@ -57,7 +61,7 @@ func TestCachingEvaluatorDoesNotCachePendingOrFailures(t *testing.T) {
 		decisions: []Decision{{Verdict: VerdictPending}, {}, {Verdict: VerdictAllow}},
 		errs:      []error{nil, errors.New("socket down"), nil},
 	}
-	cache := newCachingEvaluator(inner, time.Hour, &recordingMetrics{})
+	cache := newCachingEvaluator(inner, time.Hour)
 
 	decision, err := cache.Evaluate(t.Context(), testPURL)
 	assert.NoError(t, err)
@@ -90,16 +94,44 @@ func TestFailClosedEvaluatorDeniesFailuresAndPending(t *testing.T) {
 }
 
 func TestNewValidatesAndLayersPolicyOptions(t *testing.T) {
-	socket := &SocketConfig{Organization: testOrganization, Token: testToken}
+	socket := &SocketConfig{APIURL: "https://api.socket.dev", Organization: testOrganization, Token: testToken}
 	_, err := New(Config{Socket: socket, OnFailure: "maybe"})
 	assert.Error(t, err)
-	_, err = New(Config{Socket: socket, VerdictTTL: -time.Second})
+	_, err = New(Config{Socket: socket, OnFailure: "allow", VerdictTTL: -time.Second})
 	assert.Error(t, err)
 
 	evaluator, err := New(Config{Socket: socket, VerdictTTL: time.Minute, OnFailure: "deny", ExcludePURLs: []string{"pkg:npm/%40myorg/*"}})
 	assert.NoError(t, err)
-	excluding := evaluator.(*excludingEvaluator)
+	excluding := evaluator.(*metricsEvaluator).Evaluator.(*excludingEvaluator)
 	failClosed := excluding.Evaluator.(failClosedEvaluator)
 	caching := failClosed.Evaluator.(*cachingEvaluator)
 	_ = caching.Evaluator.(*socketEvaluator)
+}
+
+func TestCachingEvaluatorEvictsLeastRecentlyUsedAtCapacity(t *testing.T) {
+	inner := &scriptedEvaluator{decisions: []Decision{{Verdict: VerdictAllow}}}
+	cache := newCachingEvaluator(inner, time.Minute)
+	now := time.Now()
+	cache.now = func() time.Time { return now }
+	for i := range maxCachedVerdicts {
+		_, err := cache.Evaluate(t.Context(), testPURL+strconv.Itoa(i))
+		assert.NoError(t, err)
+	}
+	_, err := cache.Evaluate(t.Context(), testPURL+"0")
+	assert.NoError(t, err)
+	_, err = cache.Evaluate(t.Context(), testPURL)
+	assert.NoError(t, err)
+	_, err = cache.Evaluate(t.Context(), testPURL+"0")
+	assert.NoError(t, err)
+	assert.Equal(t, maxCachedVerdicts+1, inner.calls)
+	_, err = cache.Evaluate(t.Context(), testPURL+"1")
+	assert.NoError(t, err)
+	assert.Equal(t, maxCachedVerdicts+2, inner.calls)
+	assert.Equal(t, maxCachedVerdicts, len(cache.verdicts))
+
+	now = now.Add(time.Minute)
+	_, err = cache.Evaluate(t.Context(), testPURL+"0")
+	assert.NoError(t, err)
+	assert.Equal(t, maxCachedVerdicts+3, inner.calls)
+	assert.Equal(t, maxCachedVerdicts, len(cache.verdicts))
 }

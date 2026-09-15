@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	defaultAPIURL  = "https://api.socket.dev"
 	defaultTimeout = 10 * time.Second
 	// Requests queue for a slot until their own context ends. Waiting is local backpressure, not a
 	// provider failure, so it never trips the breaker; the Socket timeout bounds how long a
@@ -29,7 +28,10 @@ const (
 	maxResponseLineSize = 1 << 20
 )
 
-var organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var (
+	organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	providerCallSlots   = make(chan struct{}, maxConcurrentCalls) //nolint:gochecknoglobals // Every strategy must share the process-wide provider limit.
+)
 
 var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
 
@@ -56,13 +58,12 @@ var _ Evaluator = (*socketEvaluator)(nil)
 
 // ObserveNotApplicable records a request that Cachew could not map to a PURL.
 func (c *socketEvaluator) ObserveNotApplicable(ctx context.Context) {
-	c.metrics.recordNotApplicable(ctx)
+	if context.Cause(ctx) == nil {
+		c.metrics.recordOutcome(context.WithoutCancel(ctx), Decision{Verdict: VerdictNotApplicable}, nil)
+	}
 }
 
 func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, error) {
-	if config.APIURL == "" {
-		config.APIURL = defaultAPIURL
-	}
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
 	}
@@ -97,16 +98,24 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 			},
 		},
 		metrics:   newMetrics("socket"),
-		callSlots: make(chan struct{}, maxConcurrentCalls),
+		callSlots: providerCallSlots,
 		breaker:   circuitBreaker{now: time.Now},
 	}, nil
 }
 
 // Evaluate returns the strictest policy result across every artifact Socket returns.
-func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
+func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision Decision, err error) {
+	defer func() {
+		if cause := context.Cause(ctx); cause != nil {
+			decision = Decision{Verdict: VerdictDeny, Reasons: []string{"requestCanceled"}}
+			err = errors.Wrap(cause, "socket policy: request ended before evaluation completed")
+		}
+	}()
 	for {
+		if cause := context.Cause(ctx); cause != nil {
+			return Decision{}, errors.Wrap(cause, "socket policy: request ended before evaluation completed")
+		}
 		if !c.breaker.allow() {
-			c.metrics.recordOutcome(ctx, Decision{}, ErrCircuitOpen)
 			return Decision{}, ErrCircuitOpen
 		}
 		resultCh := c.inflight.DoChan(purl, func() (any, error) {
@@ -116,17 +125,23 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, 
 			case <-ctx.Done():
 				return Decision{}, errSharedEvaluationOwnerDone
 			}
+			if context.Cause(ctx) != nil {
+				return Decision{}, errSharedEvaluationOwnerDone
+			}
+			if !c.breaker.allow() {
+				return Decision{}, ErrCircuitOpen
+			}
 
 			requestCtx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
 			defer cancel()
 			started := time.Now()
-			decision, err := c.evaluateProvider(requestCtx, purl)
-			if err != nil && context.Cause(ctx) != nil {
+			providerDecision, providerErr := c.evaluateProvider(requestCtx, purl)
+			if providerErr != nil && context.Cause(ctx) != nil {
 				return Decision{}, errSharedEvaluationOwnerDone
 			}
-			c.breaker.observe(err)
-			c.metrics.record(context.WithoutCancel(ctx), decision, err, time.Since(started))
-			return decision, err
+			c.breaker.observe(providerErr)
+			c.metrics.recordDuration(context.WithoutCancel(ctx), providerDecision, providerErr, time.Since(started))
+			return providerDecision, providerErr
 		})
 		select {
 		case <-ctx.Done():

@@ -8,12 +8,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alecthomas/assert/v2"
 
 	"github.com/block/cachew/internal/cache"
+	"github.com/block/cachew/internal/gitclone"
+	"github.com/block/cachew/internal/logging"
 	"github.com/block/cachew/internal/packagepolicy"
 )
 
@@ -191,23 +194,37 @@ func TestGoModuleBranchQueryBypassesPackagePolicy(t *testing.T) {
 	assert.Equal(t, 1, policy.notApplicable)
 }
 
-func TestGoModuleHeadRequestBypassesPackagePolicyWithoutCaching(t *testing.T) {
-	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
-	probe := &cacheProbe{Cache: cache.NoOpCache()}
-	cacher := &goproxyCacher{cache: probe}
-	cacheName := "github.com/pkg/errors/@v/v0.9.1.zip"
-	strategy := &Strategy{
-		packagePolicy: policy,
-		proxyHandler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			assert.NoError(t, cacher.Put(r.Context(), cacheName, strings.NewReader("module")))
-			w.WriteHeader(http.StatusOK)
-		}),
-	}
-	w := httptest.NewRecorder()
-	strategy.serveHTTP(w, httptest.NewRequest(http.MethodHead, "/gomod/"+cacheName, nil))
+func TestGoModuleHeadRequestDoesNotFetchOrCache(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "policy disabled", true: "policy enabled"}[enabled], func(t *testing.T) {
+			var originRequests atomic.Int64
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				originRequests.Add(1)
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			t.Cleanup(origin.Close)
+			ctx := logging.ContextWithLogger(t.Context(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+			probe := &cacheProbe{Cache: cache.NoOpCache()}
+			mux := http.NewServeMux()
+			manager := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: t.TempDir()}, nil)
+			strategy, err := New(ctx, Config{Proxy: origin.URL}, probe, mux, manager)
+			assert.NoError(t, err)
+			policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+			if enabled {
+				strategy.packagePolicy = policy
+			}
 
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, []string(nil), policy.purls)
-	assert.Equal(t, 0, policy.notApplicable)
-	assert.Equal(t, 0, probe.createCalls)
+			for _, extension := range []string{"info", "mod", "zip"} {
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, httptest.NewRequest(http.MethodHead, "/gomod/github.com/pkg/errors/@v/v0.9.1."+extension, nil))
+				assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+				assert.Equal(t, http.MethodGet, w.Header().Get("Allow"))
+			}
+
+			assert.Equal(t, int64(0), originRequests.Load())
+			assert.Equal(t, 0, probe.createCalls)
+			assert.Equal(t, []string(nil), policy.purls)
+			assert.Equal(t, 0, policy.notApplicable)
+		})
+	}
 }

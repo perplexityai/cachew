@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/alecthomas/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -12,16 +13,28 @@ import (
 )
 
 type metricRecorder interface {
-	record(context.Context, Decision, error, time.Duration)
+	recordDuration(context.Context, Decision, error, time.Duration)
 	recordOutcome(context.Context, Decision, error)
-	recordNotApplicable(context.Context)
 }
 
-func (m *clientMetrics) recordNotApplicable(ctx context.Context) {
-	m.recordOutcome(ctx, Decision{Verdict: VerdictNotApplicable}, nil)
+type metricsEvaluator struct {
+	Evaluator
+	metrics metricRecorder
+}
+
+func (e *metricsEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
+	decision, err := e.Evaluator.Evaluate(ctx, purl)
+	if cause := context.Cause(ctx); cause != nil {
+		return Decision{Verdict: VerdictDeny, Reasons: []string{"requestCanceled"}}, errors.Wrap(cause, "package policy: request ended before evaluation completed")
+	}
+	e.metrics.recordOutcome(context.WithoutCancel(ctx), decision, err)
+	return decision, err //nolint:wrapcheck // Metrics must not add another provider error prefix.
 }
 
 func (m *clientMetrics) recordOutcome(ctx context.Context, decision Decision, err error) {
+	if decision.Verdict == VerdictDeny {
+		err = nil
+	}
 	m.evaluations.Add(ctx, 1, m.attributes(decision, err))
 }
 
@@ -39,22 +52,20 @@ func newMetrics(provider string) *clientMetrics {
 			meter,
 			"cachew.package_policy.evaluations_total",
 			"{evaluations}",
-			"Package policy evaluations by provider and outcome",
+			"Package requests by provider and final policy outcome",
 		),
 		duration: cachewmetrics.NewHistogram(
 			meter,
 			"cachew.package_policy.evaluation_duration_seconds",
 			"s",
-			"Package policy evaluation duration by provider and outcome",
+			"Package policy API duration by provider and provider outcome",
 			cachewmetrics.LatencyBuckets(),
 		),
 	}
 }
 
-func (m *clientMetrics) record(ctx context.Context, decision Decision, err error, duration time.Duration) {
-	attrs := m.attributes(decision, err)
-	m.evaluations.Add(ctx, 1, attrs)
-	m.duration.Record(ctx, duration.Seconds(), attrs)
+func (m *clientMetrics) recordDuration(ctx context.Context, decision Decision, err error, duration time.Duration) {
+	m.duration.Record(ctx, duration.Seconds(), m.attributes(decision, err))
 }
 
 func (m *clientMetrics) attributes(decision Decision, err error) metric.MeasurementOption {

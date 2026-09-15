@@ -2,18 +2,12 @@ package packagepolicy
 
 import (
 	"net/url"
-	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/alecthomas/errors"
 	"golang.org/x/mod/module"
 )
-
-var pypiNormalizationPattern = regexp.MustCompile(`[-_.]+`)
-
-// npmFormat is the only CodeArtifact format whose clients percent-encode a slash inside a segment.
-const npmFormat = "npm"
 
 var (
 	// ErrNotApplicable reports a path that is not an evaluated immutable package asset, such as
@@ -23,52 +17,46 @@ var (
 	// Package clients never send one for an asset except npm's "@scope%2Fname" spelling, and the
 	// origin may decode it into a different path than Cachew evaluated, so callers deny the request.
 	ErrEncodedSeparator = errors.New("package policy: encoded path separator")
+	// ErrUnmappablePackage reports a recognized package body whose coordinate cannot be evaluated safely.
+	ErrUnmappablePackage = errors.New("package policy: package body cannot be mapped to a PURL")
 )
 
-// PackageURLForCodeArtifact derives a PURL from the escaped path of an immutable npm, PyPI, Maven,
-// or Cargo CodeArtifact asset. Segments are decoded individually so an encoded slash cannot change
-// how the path is split.
-func PackageURLForCodeArtifact(escapedPath string) (string, error) {
-	parts, ok := decodedPathParts(escapedPath)
-	if !ok {
+// PackageURLForCodeArtifact derives a PURL from an immutable npm asset URL.
+// The origin distinguishes PrivateLink routing prefixes from ordinary repositories named "d".
+// Segments are decoded individually so an encoded slash cannot change how the path is split.
+func PackageURLForCodeArtifact(origin *url.URL) (string, error) {
+	parts, ok := decodedPathParts(origin.EscapedPath())
+	if !strings.EqualFold(parts[0], "npm") {
 		return "", ErrNotApplicable
 	}
-	format := strings.ToLower(parts[0])
-	packageURL, evaluated := codeArtifactPackageURL(format)
-	if !evaluated {
-		return "", ErrNotApplicable
+	if !ok {
+		return "", ErrUnmappablePackage
+	}
+	host := strings.ToLower(origin.Hostname())
+	if strings.HasSuffix(host, ".vpce.amazonaws.com") || strings.HasSuffix(host, ".vpce.amazonaws.com.cn") {
+		if len(parts) < 4 || parts[1] != "d" {
+			return "", ErrUnmappablePackage
+		}
+		if strings.Contains(parts[2], "/") {
+			return "", ErrEncodedSeparator
+		}
+		parts = slices.Concat(parts[:1], parts[3:])
 	}
 	for i, part := range parts {
-		if strings.Contains(part, "/") && (format != npmFormat || i != 2 || !npmScopedName(part)) {
+		if strings.Contains(part, "/") && (i != 2 || !npmScopedName(part)) {
 			return "", ErrEncodedSeparator
 		}
 	}
-	if format == npmFormat && len(parts) > 2 && npmScopedName(parts[2]) {
+	if len(parts) > 2 && npmScopedName(parts[2]) {
 		parts = slices.Concat(parts[:2], strings.SplitN(parts[2], "/", 2), parts[3:])
 	}
-	if len(parts) < 5 {
-		return "", ErrNotApplicable
+	if purl, ok := npmPackageURL(parts); ok {
+		return purl, nil
 	}
-	purl, ok := packageURL(parts)
-	if !ok {
-		return "", ErrNotApplicable
+	if len(parts) > 2 && slices.Contains(parts[2:], "-") && strings.HasSuffix(parts[len(parts)-1], ".tgz") {
+		return "", ErrUnmappablePackage
 	}
-	return purl, nil
-}
-
-func codeArtifactPackageURL(format string) (func([]string) (string, bool), bool) {
-	switch format {
-	case npmFormat:
-		return npmPackageURL, true
-	case "pypi":
-		return pypiPackageURL, true
-	case "maven":
-		return mavenPackageURL, true
-	case "cargo":
-		return cargoPackageURL, true
-	default:
-		return nil, false
-	}
+	return "", ErrNotApplicable
 }
 
 // npmScopedName reports whether a decoded package-name segment is the "@scope/name" that npm
@@ -100,32 +88,6 @@ func npmPackageURL(parts []string) (string, bool) {
 		return "pkg:npm/" + escapePURLSegment(namespace) + "/" + escapePURLSegment(name) + "@" + escapePURLSegment(version), true
 	}
 	return "pkg:npm/" + escapePURLSegment(name) + "@" + escapePURLSegment(version), true
-}
-
-func pypiPackageURL(parts []string) (string, bool) {
-	if len(parts) != 6 || parts[2] != "simple" || parts[3] == "" || parts[4] == "" || parts[5] == "" {
-		return "", false
-	}
-	name := pypiNormalizationPattern.ReplaceAllString(strings.ToLower(parts[3]), "-")
-	return "pkg:pypi/" + escapePURLSegment(name) + "@" + escapePURLSegment(parts[4]), true
-}
-
-func mavenPackageURL(parts []string) (string, bool) {
-	if len(parts) < 6 {
-		return "", false
-	}
-	group, artifact, version, filename := parts[2:len(parts)-3], parts[len(parts)-3], parts[len(parts)-2], parts[len(parts)-1]
-	if strings.HasSuffix(version, "-SNAPSHOT") || !strings.HasPrefix(filename, artifact+"-"+version) {
-		return "", false
-	}
-	return "pkg:maven/" + escapePURLSegment(strings.Join(group, ".")) + "/" + escapePURLSegment(artifact) + "@" + escapePURLSegment(version), true
-}
-
-func cargoPackageURL(parts []string) (string, bool) {
-	if len(parts) != 5 || parts[2] != "crates" {
-		return "", false
-	}
-	return "pkg:cargo/" + escapePURLSegment(parts[3]) + "@" + escapePURLSegment(parts[4]), true
 }
 
 // PackageURLForGoModule derives a PURL from a versioned Go module proxy path.
@@ -165,7 +127,7 @@ func decodedPathParts(escapedPath string) ([]string, bool) {
 	for i, part := range parts {
 		decoded, err := url.PathUnescape(part)
 		if err != nil || decoded == "" {
-			return nil, false
+			return parts, false
 		}
 		parts[i] = decoded
 	}
@@ -181,6 +143,6 @@ func escapePURLPath(path string) string {
 }
 
 func escapePURLSegment(value string) string {
-	escaped := url.PathEscape(value)
-	return strings.ReplaceAll(escaped, "@", "%40")
+	escaped := strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
+	return strings.ReplaceAll(escaped, "%3A", ":")
 }

@@ -37,7 +37,7 @@ type CodeArtifactConfig struct {
 	OriginHeaderTimeout   time.Duration         `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
 	OriginReadIdleTimeout time.Duration         `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
 	CredentialTimeout     time.Duration         `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
-	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm, PyPI, Maven, and Cargo artifact reads, including cache hits."`
+	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm artifact reads, including cache hits. Other formats remain unevaluated."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
@@ -350,15 +350,17 @@ func (c *CodeArtifact) evaluatePackage(r *http.Request) (packagepolicy.Decision,
 		return packagepolicy.Decision{}, nil
 	}
 	origin := c.originURL(r)
-	purl, err := packagepolicy.PackageURLForCodeArtifact(origin.EscapedPath())
+	purl, err := packagepolicy.PackageURLForCodeArtifact(&origin)
 	switch {
 	case errors.Is(err, packagepolicy.ErrNotApplicable):
 		c.packagePolicy.ObserveNotApplicable(r.Context())
 		return packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil
 	case err != nil:
-		// The origin receives the raw bytes, so a path with an encoded separator may name a package
-		// Cachew did not evaluate. Deny it and return the cause so the request log shows why.
-		return packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"encoded_separator"}}, errors.Wrap(err, "evaluate package policy")
+		reason := "unmappable_package"
+		if errors.Is(err, packagepolicy.ErrEncodedSeparator) {
+			reason = "encoded_separator"
+		}
+		return packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{reason}}, errors.Wrap(err, "evaluate package policy")
 	}
 	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {

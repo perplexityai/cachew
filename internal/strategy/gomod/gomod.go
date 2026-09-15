@@ -110,13 +110,13 @@ func New(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux
 }
 
 func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.packagePolicy == nil {
-		s.proxyHandler.ServeHTTP(w, r)
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if r.Method != http.MethodGet {
-		// goproxy fetches and stores module files for HEAD too; an unevaluated body must not be admitted.
-		s.proxyHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), skipCacheContextKey{}, struct{}{})))
+	if s.packagePolicy == nil {
+		s.proxyHandler.ServeHTTP(w, r)
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/gomod/")

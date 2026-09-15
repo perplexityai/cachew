@@ -4,7 +4,6 @@ package packagepolicy
 import (
 	"context"
 	"path"
-	"slices"
 	"strings"
 	"time"
 
@@ -13,8 +12,8 @@ import (
 
 // Config selects and configures one package policy provider.
 type Config struct {
-	ExcludePURLs []string      `hcl:"exclude-purls,optional" help:"npm, PyPI, Maven, and Cargo PURL glob patterns to exclude before provider evaluation."`
-	VerdictTTL   time.Duration `hcl:"verdict-ttl,optional" help:"How long allow and deny verdicts are reused before the provider is asked again. Zero disables the verdict cache." default:"10m"`
+	ExcludePURLs []string      `hcl:"exclude-purls,optional" help:"npm PURL glob patterns to exclude before provider evaluation."`
+	VerdictTTL   time.Duration `hcl:"verdict-ttl,optional" help:"Maximum age of reused allow and deny verdicts; capacity eviction may remove them earlier. Zero disables the verdict cache." default:"10m"`
 	OnFailure    string        `hcl:"on-failure,optional" help:"allow continues to the origin when the provider is unavailable or analysis is pending; deny returns 403 instead." default:"allow"`
 	Socket       *SocketConfig `hcl:"socket,block,optional" help:"Socket organization policy provider."`
 }
@@ -52,21 +51,20 @@ func New(config Config) (Evaluator, error) {
 	if config.Socket == nil {
 		return nil, errors.New("package policy: provider is required")
 	}
-	supportedTypes := []string{"pkg:npm/", "pkg:pypi/", "pkg:maven/", "pkg:cargo/"}
 	patterns := make([]string, 0, len(config.ExcludePURLs))
 	for _, pattern := range config.ExcludePURLs {
-		if !slices.ContainsFunc(supportedTypes, func(prefix string) bool { return strings.HasPrefix(pattern, prefix) }) {
-			return nil, errors.New("package policy: exclude-purls supports only npm, PyPI, Maven, and Cargo PURLs")
+		if !strings.HasPrefix(pattern, "pkg:npm/") {
+			return nil, errors.New("package policy: exclude-purls supports only npm PURLs")
 		}
 		// Cachew emits npm scopes as %40; accept the natural @scope spelling so a private scope is not
 		// silently sent to the provider because of an encoding mismatch.
-		pattern = normalizePyPIPattern(strings.Replace(pattern, "pkg:npm/@", "pkg:npm/%40", 1))
+		pattern = strings.Replace(pattern, "pkg:npm/@", "pkg:npm/%40", 1)
 		if _, err := path.Match(pattern, ""); err != nil {
 			return nil, errors.Wrap(err, "package policy: invalid exclude-purls pattern")
 		}
 		patterns = append(patterns, pattern)
 	}
-	if config.OnFailure != "" && config.OnFailure != "allow" && config.OnFailure != "deny" {
+	if config.OnFailure != "allow" && config.OnFailure != "deny" {
 		return nil, errors.Errorf("package policy: on-failure must be allow or deny, got %q", config.OnFailure)
 	}
 	if config.VerdictTTL < 0 {
@@ -78,7 +76,7 @@ func New(config Config) (Evaluator, error) {
 	}
 	var evaluator Evaluator = socket
 	if config.VerdictTTL > 0 {
-		evaluator = newCachingEvaluator(evaluator, config.VerdictTTL, socket.metrics)
+		evaluator = newCachingEvaluator(evaluator, config.VerdictTTL)
 	}
 	if config.OnFailure == "deny" {
 		evaluator = failClosedEvaluator{Evaluator: evaluator}
@@ -86,23 +84,7 @@ func New(config Config) (Evaluator, error) {
 	if len(patterns) > 0 {
 		evaluator = &excludingEvaluator{Evaluator: evaluator, patterns: patterns}
 	}
-	return evaluator, nil
-}
-
-// normalizePyPIPattern applies the PURL name normalization to a PyPI pattern so a private project
-// written with its published spelling is not sent to the provider because of a case or separator
-// mismatch.
-func normalizePyPIPattern(pattern string) string {
-	rest, ok := strings.CutPrefix(pattern, "pkg:pypi/")
-	if !ok {
-		return pattern
-	}
-	name, version, hasVersion := strings.Cut(rest, "@")
-	name = pypiNormalizationPattern.ReplaceAllString(strings.ToLower(name), "-")
-	if hasVersion {
-		return "pkg:pypi/" + name + "@" + version
-	}
-	return "pkg:pypi/" + name
+	return &metricsEvaluator{Evaluator: evaluator, metrics: socket.metrics}, nil
 }
 
 // failClosedEvaluator turns provider failures and pending analysis into denials for on-failure = "deny".
@@ -133,7 +115,6 @@ func (e *excludingEvaluator) Evaluate(ctx context.Context, purl string) (Decisio
 			return Decision{}, errors.Wrap(err, "package policy: match exclude-purls pattern")
 		}
 		if matched {
-			e.ObserveNotApplicable(ctx)
 			return Decision{Verdict: VerdictNotApplicable}, nil
 		}
 	}

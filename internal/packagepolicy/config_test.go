@@ -17,7 +17,9 @@ type policyConfigEnvelope struct {
 func TestPackagePolicyConfigRoundTripsThroughHCL(t *testing.T) {
 	input := []byte(`
 package-policy {
-  exclude-purls = ["pkg:npm/%40pplx-internal/*", "pkg:pypi/pplx-*@*"]
+  exclude-purls = ["pkg:npm/%40pplx-internal/*", "pkg:npm/@pplx-private/*"]
+  on-failure = "deny"
+  verdict-ttl = "5m"
 
   socket {
     api-url      = "https://socket.example.com"
@@ -30,7 +32,9 @@ package-policy {
 	var config policyConfigEnvelope
 	assert.NoError(t, hcl.Unmarshal(input, &config))
 	assert.NotZero(t, config.PackagePolicy)
-	assert.Equal(t, []string{"pkg:npm/%40pplx-internal/*", "pkg:pypi/pplx-*@*"}, config.PackagePolicy.ExcludePURLs)
+	assert.Equal(t, "deny", config.PackagePolicy.OnFailure)
+	assert.Equal(t, 5*time.Minute, config.PackagePolicy.VerdictTTL)
+	assert.Equal(t, []string{"pkg:npm/%40pplx-internal/*", "pkg:npm/@pplx-private/*"}, config.PackagePolicy.ExcludePURLs)
 	assert.Equal(t, &packagepolicy.SocketConfig{
 		APIURL:       "https://socket.example.com",
 		Organization: "example-org",
