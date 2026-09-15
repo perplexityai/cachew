@@ -34,6 +34,12 @@ func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
 	return false
 }
 
+// Cacheable reports whether a response served under this decision may be admitted to the cache.
+// Fail-open responses are not, so a later request re-evaluates the package.
+func Cacheable(decision Decision, err error) bool {
+	return err == nil && decision.Verdict != VerdictPending
+}
+
 func safeReasons(reasons []string) []string {
 	safe := make([]string, 0, len(reasons))
 	for _, reason := range reasons {

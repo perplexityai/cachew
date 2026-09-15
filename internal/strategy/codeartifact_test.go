@@ -312,6 +312,13 @@ func TestCodeArtifactHandlesPackagePolicyBeforeOriginAuthentication(t *testing.T
 			tokenRequests:  1,
 			originRequests: 1,
 		},
+		{
+			name:       "fail-closed denial keeps the cause",
+			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"unavailable"}},
+			err:        errors.New("Socket API unavailable"),
+			statusCode: http.StatusForbidden,
+			policy:     "deny",
+		},
 	}
 
 	for _, test := range tests {
@@ -362,7 +369,6 @@ func TestCodeArtifactCachedPackageIsStillEvaluated(t *testing.T) {
 	}
 	assert.Equal(t, int32(1), originRequests.Load())
 
-	// A verdict change denies the package even though its bytes are still cached.
 	policy.decision = packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}}
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))

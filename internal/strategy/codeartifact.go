@@ -215,8 +215,6 @@ func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mode := classifyCodeArtifactRequest(r)
 	c.metric.recordRequest(r.Context(), mode)
-	// Policy runs before the cache lookup so a newly denied package stops being served
-	// within the verdict TTL even though its bytes remain cached.
 	decision, err := c.evaluatePackage(r)
 	if err != nil {
 		c.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
@@ -227,7 +225,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return
 	}
-	if err != nil || decision.Verdict == packagepolicy.VerdictPending {
+	if !packagepolicy.Cacheable(decision, err) {
 		mode = codeArtifactCachePassthrough
 	}
 	if mode != codeArtifactCacheLookup {
@@ -358,7 +356,7 @@ func (c *CodeArtifact) evaluatePackage(r *http.Request) (packagepolicy.Decision,
 	}
 	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {
-		return packagepolicy.Decision{}, errors.Wrap(err, "evaluate package policy")
+		return decision, errors.Wrap(err, "evaluate package policy")
 	}
 	return decision, nil
 }

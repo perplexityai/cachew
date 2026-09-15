@@ -110,12 +110,12 @@ func New(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux
 }
 
 func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/gomod/")
-	purl, ok := packagepolicy.PackageURLForGoModule("/" + path)
 	if s.packagePolicy == nil {
 		s.proxyHandler.ServeHTTP(w, r)
 		return
 	}
+	path := strings.TrimPrefix(r.URL.Path, "/gomod/")
+	purl, ok := packagepolicy.PackageURLForGoModule(path)
 	if !ok || s.privateModulePath(path) {
 		s.packagePolicy.ObserveNotApplicable(r.Context())
 		s.proxyHandler.ServeHTTP(w, r)
@@ -125,7 +125,7 @@ func (s *Strategy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.ErrorContext(r.Context(), "Package policy evaluation failed", "error", err)
 	}
-	if err != nil || decision.Verdict == packagepolicy.VerdictPending {
+	if !packagepolicy.Cacheable(decision, err) {
 		r = r.WithContext(context.WithValue(r.Context(), skipCacheContextKey{}, struct{}{}))
 	}
 	if !packagepolicy.AllowRequest(w, decision, err) {

@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/alecthomas/errors"
@@ -20,59 +19,16 @@ import (
 )
 
 const (
-	defaultAPIURL      = "https://api.socket.dev"
-	defaultTimeout     = 10 * time.Second
-	maxConcurrentCalls = 16
-	// ponytail: fixed breaker thresholds; expose them in SocketConfig if a deployment needs tuning.
-	breakerFailureThreshold = 5
-	breakerCooldown         = 30 * time.Second
-	maxResponseBytes        = 4 << 20
-	maxResponseLineSize     = 1 << 20
+	defaultAPIURL       = "https://api.socket.dev"
+	defaultTimeout      = 10 * time.Second
+	maxConcurrentCalls  = 16
+	maxResponseBytes    = 4 << 20
+	maxResponseLineSize = 1 << 20
 )
 
 var organizationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
-var (
-	errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
-	errProviderCircuitOpen       = errors.New("socket policy: provider skipped after repeated failures")
-)
-
-// circuitBreaker skips the provider for breakerCooldown after breakerFailureThreshold
-// consecutive failures so an outage fails open quickly instead of holding every request to its timeout.
-type circuitBreaker struct {
-	now func() time.Time
-
-	mu        sync.Mutex
-	failures  int
-	openUntil time.Time
-}
-
-func (b *circuitBreaker) clock() time.Time {
-	if b.now == nil {
-		return time.Now()
-	}
-	return b.now()
-}
-
-func (b *circuitBreaker) allow() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return !b.clock().Before(b.openUntil)
-}
-
-func (b *circuitBreaker) observe(err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if err == nil {
-		b.failures = 0
-		return
-	}
-	b.failures++
-	if b.failures >= breakerFailureThreshold {
-		b.openUntil = b.clock().Add(breakerCooldown)
-		b.failures = 0
-	}
-}
+var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
 
 // SocketConfig configures Socket's organization-scoped PURL evaluator.
 type SocketConfig struct {
@@ -139,6 +95,7 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 		},
 		metrics:   newMetrics("socket"),
 		callSlots: make(chan struct{}, maxConcurrentCalls),
+		breaker:   circuitBreaker{now: time.Now},
 	}, nil
 }
 

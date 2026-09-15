@@ -89,7 +89,6 @@ type failClosedEvaluator struct {
 	Evaluator
 }
 
-// Evaluate keeps the provider error so callers can still log the cause of a denial.
 func (e failClosedEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
 	decision, err := e.Evaluator.Evaluate(ctx, purl)
 	if err != nil {
@@ -106,7 +105,6 @@ type excludingEvaluator struct {
 	patterns []string
 }
 
-// Evaluate keeps excluded package coordinates out of the provider request.
 func (e *excludingEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
 	for _, pattern := range e.patterns {
 		matched, err := path.Match(pattern, purl)

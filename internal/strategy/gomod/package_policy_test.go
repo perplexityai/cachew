@@ -93,6 +93,13 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 			policy:         "unavailable",
 			originRequests: 1,
 		},
+		{
+			name:       "fail-closed denial keeps the cause",
+			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"unavailable"}},
+			err:        io.ErrUnexpectedEOF,
+			statusCode: http.StatusForbidden,
+			policy:     "deny",
+		},
 	}
 
 	for _, test := range tests {

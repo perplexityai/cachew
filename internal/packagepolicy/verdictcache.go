@@ -8,7 +8,7 @@ import (
 	"github.com/alecthomas/errors"
 )
 
-// ponytail: flat cap with arbitrary eviction; switch to an LRU if unique PURL churn ever approaches it.
+// Flat cap with arbitrary eviction keeps memory bounded without an LRU; unique PURL churn stays far below it.
 const maxCachedVerdicts = 100_000
 
 type cachedVerdict struct {
@@ -38,7 +38,6 @@ func newCachingEvaluator(inner Evaluator, ttl time.Duration, metrics metricRecor
 	}
 }
 
-// Evaluate serves allow and deny verdicts from the cache; pending results and provider failures are never cached.
 func (c *cachingEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
 	if decision, ok := c.lookup(purl); ok {
 		c.metrics.recordOutcome(ctx, decision, nil)

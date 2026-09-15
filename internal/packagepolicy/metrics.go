@@ -12,9 +12,7 @@ import (
 )
 
 type metricRecorder interface {
-	// record observes a completed provider call, including its latency.
 	record(context.Context, Decision, error, time.Duration)
-	// recordOutcome counts a decision that did not call the provider, such as a cached verdict or a breaker skip.
 	recordOutcome(context.Context, Decision, error)
 	recordNotApplicable(context.Context)
 }
