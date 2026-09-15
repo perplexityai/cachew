@@ -103,7 +103,7 @@ func TestNewSelectsSocketProvider(t *testing.T) {
 func TestNewExcludesPURLsBeforeProviderEvaluation(t *testing.T) {
 	var requests atomic.Int32
 	evaluator, err := New(Config{
-		ExcludePURLs: []string{"pkg:npm/%40pplx-internal/*", "pkg:npm/@pplx-private/*", "pkg:pypi/pplx-*@*"},
+		ExcludePURLs: []string{"pkg:npm/%40pplx-internal/*", "pkg:npm/@pplx-private/*", "pkg:pypi/pplx-*@*", "pkg:pypi/My_Org.SDK-*@*"},
 		Socket: &SocketConfig{
 			APIURL:       "https://socket.example.com",
 			Organization: testOrganization,
@@ -124,13 +124,14 @@ func TestNewExcludesPURLsBeforeProviderEvaluation(t *testing.T) {
 		"pkg:npm/%40pplx-internal/agents@1.2.3",
 		"pkg:npm/%40pplx-private/tools@2.0.0",
 		"pkg:pypi/pplx-sdk@0.4.0",
+		"pkg:pypi/my-org-sdk-core@1.0.0",
 	} {
 		decision, err := evaluator.Evaluate(t.Context(), purl)
 		assert.NoError(t, err)
 		assert.Equal(t, VerdictNotApplicable, decision.Verdict)
 	}
 	assert.Equal(t, int32(0), requests.Load())
-	assert.Equal(t, int32(3), metrics.notApplicable.Load())
+	assert.Equal(t, int32(4), metrics.notApplicable.Load())
 
 	_, err = evaluator.Evaluate(t.Context(), testPURL)
 	assert.Error(t, err)
@@ -145,6 +146,23 @@ func TestNewRejectsInvalidExclusionPatterns(t *testing.T) {
 		})
 		assert.Error(t, err)
 	}
+}
+
+func TestNewDoesNotStackDecoratorErrorPrefixes(t *testing.T) {
+	evaluator, err := New(Config{
+		ExcludePURLs: []string{"pkg:npm/@pplx-private/*"},
+		VerdictTTL:   time.Minute,
+		Socket:       &SocketConfig{APIURL: "https://socket.example.com", Organization: testOrganization, Token: testToken},
+	})
+	assert.NoError(t, err)
+	socket := evaluator.(*excludingEvaluator).Evaluator.(*cachingEvaluator).Evaluator.(*socketEvaluator)
+	socket.httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial Socket API")
+	})
+
+	_, err = evaluator.Evaluate(t.Context(), testPURL)
+	assert.Error(t, err)
+	assert.Equal(t, 1, strings.Count(err.Error(), "package policy: evaluate provider"))
 }
 
 func TestClientEvaluatesOrganizationPolicy(t *testing.T) {
@@ -323,6 +341,9 @@ func TestClientRetriesWhenSharedEvaluationOwnerCancels(t *testing.T) {
 		}, nil
 	})
 
+	metrics := &recordingMetrics{}
+	client.metrics = metrics
+
 	ownerCtx, cancelOwner := context.WithCancel(t.Context())
 	ownerResult := make(chan error, 1)
 	go func() {
@@ -331,20 +352,75 @@ func TestClientRetriesWhenSharedEvaluationOwnerCancels(t *testing.T) {
 	}()
 	<-firstStarted
 
+	waiterJoined := make(chan struct{})
+	waiterCtx := &doneObservedContext{Context: t.Context(), observed: waiterJoined}
 	waiterResult := make(chan error, 1)
 	go func() {
-		decision, err := client.Evaluate(t.Context(), testPURL)
+		decision, err := client.Evaluate(waiterCtx, testPURL)
 		if err == nil && decision.Verdict != VerdictAllow {
 			err = errors.Errorf("unexpected verdict %q", decision.Verdict)
 		}
 		waiterResult <- err
 	}()
-	time.Sleep(25 * time.Millisecond)
+	<-waiterJoined
 	cancelOwner()
 
 	assert.True(t, errors.Is(<-ownerResult, context.Canceled))
 	assert.NoError(t, <-waiterResult)
 	assert.Equal(t, int32(2), requests.Load())
+	assert.Equal(t, int32(1), metrics.evaluations.Load())
+	assert.Equal(t, int32(0), metrics.outcomes.Load())
+}
+
+func TestClientRechecksBreakerBeforeRetrying(t *testing.T) {
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL:       "https://socket.example.com",
+		Organization: testOrganization,
+		Token:        testToken,
+	}, false)
+	assert.NoError(t, err)
+	firstStarted := make(chan struct{})
+	var requests atomic.Int32
+	client.httpClient.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if requests.Add(1) == 1 {
+			close(firstStarted)
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     http.StatusText(http.StatusOK),
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(testAllowResponse)),
+		}, nil
+	})
+	now := time.Now()
+	client.breaker.now = func() time.Time { return now }
+
+	ownerCtx, cancelOwner := context.WithCancel(t.Context())
+	ownerResult := make(chan error, 1)
+	go func() {
+		_, err := client.Evaluate(ownerCtx, testPURL)
+		ownerResult <- err
+	}()
+	<-firstStarted
+
+	waiterJoined := make(chan struct{})
+	waiterCtx := &doneObservedContext{Context: t.Context(), observed: waiterJoined}
+	waiterResult := make(chan error, 1)
+	go func() {
+		_, err := client.Evaluate(waiterCtx, testPURL)
+		waiterResult <- err
+	}()
+	<-waiterJoined
+	client.breaker.mu.Lock()
+	client.breaker.openUntil = now.Add(breakerCooldown)
+	client.breaker.mu.Unlock()
+	cancelOwner()
+
+	assert.True(t, errors.Is(<-ownerResult, context.Canceled))
+	assert.IsError(t, <-waiterResult, ErrCircuitOpen)
+	assert.Equal(t, int32(1), requests.Load())
 }
 
 func TestClientPreservesCompletedDecisionWhenOwnerCancels(t *testing.T) {
@@ -553,6 +629,23 @@ func TestClientDoesNotForwardTokenAcrossRedirects(t *testing.T) {
 	assert.Equal(t, 0, redirectRequests)
 }
 
+func TestBreakerResetsFailureCountOnSuccess(t *testing.T) {
+	now := time.Now()
+	breaker := circuitBreaker{now: func() time.Time { return now }}
+	down := markUnavailable(errors.New("dial Socket API"))
+	for range breakerFailureThreshold - 1 {
+		breaker.observe(down)
+	}
+	breaker.observe(nil)
+	for range breakerFailureThreshold - 1 {
+		breaker.observe(down)
+	}
+	assert.True(t, breaker.allow())
+
+	breaker.observe(down)
+	assert.False(t, breaker.allow())
+}
+
 func TestClientSkipsProviderWhileCircuitIsOpen(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -649,7 +742,6 @@ func TestClientQueuesForProviderSlot(t *testing.T) {
 	assert.Equal(t, VerdictAllow, got.decision.Verdict)
 	assert.Equal(t, int32(1), requests.Load())
 
-	// A queued caller that gives up leaves without a provider call.
 	client.callSlots <- struct{}{}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

@@ -77,6 +77,8 @@ func TestPackageURLForCodeArtifact(t *testing.T) {
 		{name: "encoded separator in an unscoped npm name is denied", path: "/npm/repository/package%2Fname/-/package%2Fname-1.0.0.tgz", err: packagepolicy.ErrEncodedSeparator},
 		{name: "encoded traversal is denied", path: "/pypi/repository/simple/requests%2F..%2F..%2Fevil/1.0.0/evil-1.0.0.whl", err: packagepolicy.ErrEncodedSeparator},
 		{name: "encoded separator in a Maven group is denied", path: "/maven/repository/com%2Fperplexity/tool/1.2.3/tool-1.2.3.jar", err: packagepolicy.ErrEncodedSeparator},
+		{name: "encoded scope separator outside the package-name position is denied", path: "/npm/@scope%2Frepo/tinycolor/-/tinycolor-4.1.1.tgz", err: packagepolicy.ErrEncodedSeparator},
+		{name: "encoded scope separator in the filename is denied", path: "/npm/repository/tinycolor/-/@x%2Ftinycolor-4.1.1.tgz", err: packagepolicy.ErrEncodedSeparator},
 	}
 
 	for _, test := range tests {

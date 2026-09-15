@@ -38,8 +38,8 @@ func PackageURLForCodeArtifact(escapedPath string) (string, error) {
 	if !evaluated {
 		return "", ErrNotApplicable
 	}
-	for _, part := range parts {
-		if strings.Contains(part, "/") && (format != npmFormat || !npmScopedName(part)) {
+	for i, part := range parts {
+		if strings.Contains(part, "/") && (format != npmFormat || i != 2 || !npmScopedName(part)) {
 			return "", ErrEncodedSeparator
 		}
 	}
@@ -71,8 +71,8 @@ func codeArtifactPackageURL(format string) (func([]string) (string, bool), bool)
 	}
 }
 
-// npmScopedName reports whether a decoded segment is the "@scope/name" that npm clients send as
-// "@scope%2Fname" for package metadata and, from some clients, tarballs.
+// npmScopedName reports whether a decoded package-name segment is the "@scope/name" that npm
+// clients send as "@scope%2Fname" for package metadata and, from some clients, tarballs.
 func npmScopedName(segment string) bool {
 	scope, name, ok := strings.Cut(segment, "/")
 	return ok && len(scope) > 1 && strings.HasPrefix(scope, "@") &&

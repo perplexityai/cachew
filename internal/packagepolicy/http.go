@@ -1,6 +1,7 @@
 package packagepolicy
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -39,12 +40,17 @@ func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
 
 // LogLevel keeps per-request logs below error level when they do not indicate a Cachew or provider
 // fault: a skipped provider repeats on every request during an outage that the metric already
-// reports, and an encoded separator is a malformed client request.
+// reports, an encoded separator is a malformed client request, and a cancelled context means the
+// client left before the provider answered.
 func LogLevel(err error) slog.Level {
-	if errors.Is(err, ErrCircuitOpen) || errors.Is(err, ErrEncodedSeparator) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return slog.LevelDebug
+	case errors.Is(err, ErrCircuitOpen), errors.Is(err, ErrEncodedSeparator):
 		return slog.LevelWarn
+	default:
+		return slog.LevelError
 	}
-	return slog.LevelError
 }
 
 // Cacheable reports whether a response served under this decision may be admitted to the cache.

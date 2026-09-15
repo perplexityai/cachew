@@ -60,7 +60,7 @@ func New(config Config) (Evaluator, error) {
 		}
 		// Cachew emits npm scopes as %40; accept the natural @scope spelling so a private scope is not
 		// silently sent to the provider because of an encoding mismatch.
-		pattern = strings.Replace(pattern, "pkg:npm/@", "pkg:npm/%40", 1)
+		pattern = normalizePyPIPattern(strings.Replace(pattern, "pkg:npm/@", "pkg:npm/%40", 1))
 		if _, err := path.Match(pattern, ""); err != nil {
 			return nil, errors.Wrap(err, "package policy: invalid exclude-purls pattern")
 		}
@@ -87,6 +87,22 @@ func New(config Config) (Evaluator, error) {
 		evaluator = &excludingEvaluator{Evaluator: evaluator, patterns: patterns}
 	}
 	return evaluator, nil
+}
+
+// normalizePyPIPattern applies the PURL name normalization to a PyPI pattern so a private project
+// written with its published spelling is not sent to the provider because of a case or separator
+// mismatch.
+func normalizePyPIPattern(pattern string) string {
+	rest, ok := strings.CutPrefix(pattern, "pkg:pypi/")
+	if !ok {
+		return pattern
+	}
+	name, version, hasVersion := strings.Cut(rest, "@")
+	name = pypiNormalizationPattern.ReplaceAllString(strings.ToLower(name), "-")
+	if hasVersion {
+		return "pkg:pypi/" + name + "@" + version
+	}
+	return "pkg:pypi/" + name
 }
 
 // failClosedEvaluator turns provider failures and pending analysis into denials for on-failure = "deny".
@@ -121,9 +137,5 @@ func (e *excludingEvaluator) Evaluate(ctx context.Context, purl string) (Decisio
 			return Decision{Verdict: VerdictNotApplicable}, nil
 		}
 	}
-	decision, err := e.Evaluator.Evaluate(ctx, purl)
-	if err != nil {
-		return decision, errors.Wrap(err, "package policy: evaluate provider")
-	}
-	return decision, nil
+	return e.Evaluator.Evaluate(ctx, purl) //nolint:wrapcheck // The inner decorators already prefix the error.
 }

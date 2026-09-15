@@ -82,9 +82,9 @@ the Go proxy can resolve them; the resulting canonical version's module files ar
 evaluated before download. The `socket` provider sends the PURL to Socket;
 modules matching `private-paths` are not sent. Verdicts are reused for
 `verdict-ttl`, so a cached module costs a provider call at most once per TTL.
-`private-paths` uses the same module-prefix globs as `GOPRIVATE`: a pattern matches
-the module itself and every module nested beneath it, so `github.com/myorg/*` also
-covers `github.com/myorg/repo/sub`.
+`private-paths` uses the same module-prefix globs as `GOPRIVATE` for both fetch
+routing and policy exclusion: a pattern matches the module itself and every module
+nested beneath it, so `github.com/myorg/*` also covers `github.com/myorg/repo/sub`.
 
 Pending analysis and provider failures fail open by default, but their downloaded
 module files are not cached. A later request therefore re-evaluates the package.
@@ -178,8 +178,9 @@ can implement the same PURL-to-decision interface without changing the
 CodeArtifact or Go module strategies.
 
 `exclude-purls` accepts Go-style path glob patterns for npm, PyPI, Maven, and
-Cargo PURLs; npm scopes may be written as `@scope` or `%40scope`. Matching
-packages are recorded as `not_applicable` and continue to
+Cargo PURLs; npm scopes may be written as `@scope` or `%40scope`, and PyPI names
+are normalized the way PURLs are (lower case, with runs of `-`, `_`, and `.`
+collapsed to `-`). Matching packages are recorded as `not_applicable` and continue to
 the origin without sending their names or versions to the policy provider. Use it
 for private packages that share a CodeArtifact repository with public
 dependencies. Repository metadata, Maven `-SNAPSHOT` versions, and formats
@@ -187,9 +188,9 @@ without a PURL mapping (NuGet, Ruby, Swift, generic) pass through unevaluated.
 Query strings make CodeArtifact responses uncacheable but do not bypass policy
 evaluation for recognized package asset paths. The PURL is derived from the
 escaped request path, so a percent-encoded slash cannot change which package is
-evaluated: `@scope%2Fname` is evaluated as the scoped npm package, and any other
-encoded separator under an evaluated format is denied with `403` because the
-origin would receive a path Cachew did not evaluate.
+evaluated: `@scope%2Fname` in the package-name position is evaluated as the
+scoped npm package, and any other encoded separator under an evaluated format is
+denied with `403` because the origin would receive a path Cachew did not evaluate.
 
 For the Socket provider, a policy action of `error` returns `403` with
 `X-Cachew-Package-Policy: deny`. A package Socket has not indexed (`notFound`) is
@@ -202,7 +203,11 @@ returns `403` for those cases instead. After five consecutive transport or HTTP
 failures Cachew skips Socket for 30 seconds and counts each skipped request as
 `unavailable`, so an outage fails fast rather than holding every request to the
 `timeout` (default `10s`, accepted range 1s to 20m; a version Socket has never
-scanned can wait up to that long before it is reported pending). At most 16
+scanned can wait up to that long before it is reported pending). When the cooldown
+ends the breaker closes again and the next five consecutive failures reopen it, so
+requests in flight at that moment can wait for the `timeout`. A request whose
+client disconnects before Socket answers is neither a provider failure nor an
+`unavailable` outcome. At most 16
 provider calls run at once; further requests queue for a slot until their own
 request ends. Waiting for a slot is local backpressure, never a provider failure,
 so it does not count toward the breaker and is never served unchecked. Lower
@@ -259,7 +264,12 @@ Policy outcomes and API latency are exported as
 bounded provider and outcome attributes (`allow`, `deny`, `pending`,
 `unavailable`, or `not_applicable`); package names and versions are not metric
 labels. The latency histogram covers actual provider evaluations; verdict-cache
-hits and circuit-breaker skips increment the counter without a latency sample. Unsupported
+hits and circuit-breaker skips increment the counter without a latency sample.
+Requests that join an in-flight evaluation for the same PURL are not counted
+separately, and requests abandoned by the client before Socket answers are not
+counted at all. Outcomes describe the provider result: with `on-failure = "deny"`,
+`pending` and `unavailable` are served as `403`. Encoded-separator denials are
+logged at warn level rather than counted. Unsupported
 ecosystems, non-package metadata, and excluded private Go modules
 record `not_applicable` so gaps in enforcement coverage remain visible. Metadata
 GETs can dominate that outcome, so dashboards should chart it separately and

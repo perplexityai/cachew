@@ -104,11 +104,11 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 
 // Evaluate returns the strictest policy result across every artifact Socket returns.
 func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
-	if !c.breaker.allow() {
-		c.metrics.recordOutcome(ctx, Decision{}, ErrCircuitOpen)
-		return Decision{}, ErrCircuitOpen
-	}
 	for {
+		if !c.breaker.allow() {
+			c.metrics.recordOutcome(ctx, Decision{}, ErrCircuitOpen)
+			return Decision{}, ErrCircuitOpen
+		}
 		resultCh := c.inflight.DoChan(purl, func() (any, error) {
 			select {
 			case c.callSlots <- struct{}{}:
@@ -119,11 +119,13 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, 
 
 			requestCtx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
 			defer cancel()
+			started := time.Now()
 			decision, err := c.evaluateProvider(requestCtx, purl)
 			if err != nil && context.Cause(ctx) != nil {
 				return Decision{}, errSharedEvaluationOwnerDone
 			}
 			c.breaker.observe(err)
+			c.metrics.record(context.WithoutCancel(ctx), decision, err, time.Since(started))
 			return decision, err
 		})
 		select {
@@ -148,10 +150,7 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (Decision, 
 	}
 }
 
-func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (decision Decision, err error) {
-	started := time.Now()
-	defer func() { c.metrics.record(context.WithoutCancel(ctx), decision, err, time.Since(started)) }()
-
+func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (Decision, error) {
 	body, err := json.Marshal(purlRequest{Components: []purlComponent{{PURL: purl}}})
 	if err != nil {
 		return Decision{}, errors.Wrap(err, "socket policy: encode request")
@@ -188,7 +187,7 @@ func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (de
 	}
 
 	limited := &io.LimitedReader{R: resp.Body, N: maxResponseBytes + 1}
-	decision, err = evaluateStream(limited, purl)
+	decision, err := evaluateStream(limited, purl)
 	if err != nil {
 		return Decision{}, err
 	}
