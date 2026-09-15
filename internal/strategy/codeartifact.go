@@ -52,6 +52,7 @@ type CodeArtifact struct {
 	logger                *slog.Logger
 	metric                codeArtifactMetricRecorder
 	packagePolicy         packagepolicy.Evaluator
+	policyAudit           bool
 	fills                 singleflight.Group
 	originReadIdleTimeout time.Duration
 }
@@ -87,6 +88,7 @@ func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredC
 		if err != nil {
 			return nil, errors.Wrap(err, "create package policy")
 		}
+		strategy.policyAudit = config.PackagePolicy.Mode == packagepolicy.ModeAudit
 	}
 	return strategy, nil
 }
@@ -360,7 +362,7 @@ func (c *CodeArtifact) evaluatePackage(r *http.Request) (packagepolicy.Decision,
 		if errors.Is(err, packagepolicy.ErrEncodedSeparator) {
 			reason = "encoded_separator"
 		}
-		return packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{reason}}, errors.Wrap(err, "evaluate package policy")
+		return packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{reason}, Audit: c.policyAudit}, errors.Wrap(err, "evaluate package policy")
 	}
 	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {

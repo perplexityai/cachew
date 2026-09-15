@@ -292,6 +292,7 @@ func TestCodeArtifactPrivateLinkPreservesPolicyExclusions(t *testing.T) {
 	target, err := url.Parse("https://" + host)
 	assert.NoError(t, err)
 	policy, err := packagepolicy.New(packagepolicy.Config{
+		Mode:         "enforce",
 		ExcludePURLs: []string{"pkg:npm/@private/*"},
 		OnFailure:    "deny",
 		Socket:       &packagepolicy.SocketConfig{APIURL: "https://socket.example.com", Organization: "example", Token: "dummy-token"},
@@ -445,25 +446,32 @@ func TestCodeArtifactCachedPackageIsStillEvaluated(t *testing.T) {
 	}
 	assert.Equal(t, int32(1), originRequests.Load())
 
-	policy.decision = packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}}
+	assert.Equal(t, []string{"pkg:npm/lodash@4.17.21", "pkg:npm/lodash@4.17.21"}, policy.purls)
+	policy = &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}}}
+	strategy.packagePolicy = policy
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
 	assert.Equal(t, http.StatusForbidden, w.Code)
 	assert.Equal(t, "deny", w.Header().Get("X-Cachew-Package-Policy"))
 
-	assert.Equal(t, []string{"pkg:npm/lodash@4.17.21", "pkg:npm/lodash@4.17.21", "pkg:npm/lodash@4.17.21"}, policy.purls)
+	assert.Equal(t, []string{"pkg:npm/lodash@4.17.21"}, policy.purls)
 	assert.Equal(t, int32(1), originRequests.Load())
 }
 
-func TestCodeArtifactDoesNotCachePolicyFailOpenResponses(t *testing.T) {
+func TestCodeArtifactPolicyControlsCacheAdmission(t *testing.T) {
 	tests := []struct {
-		name     string
-		decision packagepolicy.Decision
-		err      error
-		header   string
+		name           string
+		decision       packagepolicy.Decision
+		err            error
+		header         string
+		originRequests int32
 	}{
-		{name: "pending", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictPending}, header: "pending"},
-		{name: "provider error", err: errors.New("Socket API unavailable"), header: "unavailable"},
+		{name: "pending", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictPending}, header: "pending", originRequests: 2},
+		{name: "provider error", err: errors.New("Socket API unavailable"), header: "unavailable", originRequests: 2},
+		{name: "audit pending", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictPending, Audit: true}, header: "audit-would_allow", originRequests: 1},
+		{name: "audit deny", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Audit: true}, header: "audit-would_deny", originRequests: 1},
+		{name: "audit error", decision: packagepolicy.Decision{Audit: true}, err: packagepolicy.ErrCircuitOpen, header: "audit-would_allow", originRequests: 1},
+		{name: "audit overload", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Audit: true}, err: packagepolicy.ErrOverloaded, header: "audit-would_deny", originRequests: 1},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -486,10 +494,29 @@ func TestCodeArtifactDoesNotCachePolicyFailOpenResponses(t *testing.T) {
 				assert.Equal(t, test.header, w.Header().Get("X-Cachew-Package-Policy"))
 			}
 
-			assert.Equal(t, int32(2), originRequests.Load())
+			assert.Equal(t, test.originRequests, originRequests.Load())
 			assert.Equal(t, []string{"pkg:npm/package@1.2.3", "pkg:npm/package@1.2.3"}, policy.purls)
 		})
 	}
+}
+
+func TestCodeArtifactAuditDoesNotBlockUnmappablePackage(t *testing.T) {
+	var originRequests atomic.Int32
+	mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	}))
+	strategy.policyAudit = true
+	policy := &recordingPackagePolicy{}
+	strategy.packagePolicy = policy
+	w := httptest.NewRecorder()
+	path := codeArtifactPath(originServer, "/npm/repository/package/-/not-a-version.tgz")
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, testCodeArtifactBody, w.Body.String())
+	assert.Equal(t, "audit-would_deny", w.Header().Get("X-Cachew-Package-Policy"))
+	assert.Equal(t, int32(1), originRequests.Load())
+	assert.Equal(t, []string(nil), policy.purls)
 }
 
 func TestCodeArtifactConcurrentDeniedRequestsReachPolicyTogether(t *testing.T) {

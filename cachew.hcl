@@ -12,12 +12,19 @@
 #   region         = "us-east-1"
 #   role-arn       = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
 #   package-policy {
+#     mode          = "audit" # no enforcement; omitted mode defaults to enforce
 #     exclude-purls = ["pkg:npm/%40myorg/*"]
+#     verdict-ttl   = "10m"
+#     pending-ttl   = "15s"
+#     on-failure    = "allow"
 #
 #     socket {
 #       api-url      = "https://api.socket.dev"
 #       organization = "my-socket-org"
 #       token        = "${SOCKET_SECURITY_API_TOKEN}"
+#       label        = "cachew" # optional existing Socket policy label
+#       timeout      = "10s"
+#       queue-timeout = "100ms"
 #     }
 #   }
 # }

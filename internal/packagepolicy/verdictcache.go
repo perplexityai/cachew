@@ -13,62 +13,77 @@ const maxCachedVerdicts = 100_000
 
 type cachedVerdict struct {
 	decision  Decision
+	err       error
 	expiresAt time.Time
 	position  *list.Element
 }
 
-// cachingEvaluator reuses definitive verdicts so cache hits and repeated downloads do not
-// each cost a provider call, while a changed provider verdict still takes effect within ttl.
+// cachingEvaluator bounds approval age while briefly reusing inconclusive results to avoid
+// repeated provider calls for every artifact belonging to the same package version.
 type cachingEvaluator struct {
 	Evaluator
-	ttl time.Duration
-	now func() time.Time
+	ttl        time.Duration
+	pendingTTL time.Duration
+	metrics    metricRecorder
+	now        func() time.Time
 
 	mu       sync.Mutex
 	verdicts map[string]cachedVerdict
 	recent   list.List
 }
 
-func newCachingEvaluator(inner Evaluator, ttl time.Duration) *cachingEvaluator {
+func newCachingEvaluator(inner Evaluator, ttl, pendingTTL time.Duration, metrics metricRecorder) *cachingEvaluator {
 	return &cachingEvaluator{
-		Evaluator: inner,
-		ttl:       ttl,
-		now:       time.Now,
-		verdicts:  make(map[string]cachedVerdict),
+		Evaluator:  inner,
+		ttl:        ttl,
+		pendingTTL: pendingTTL,
+		metrics:    metrics,
+		now:        time.Now,
+		verdicts:   make(map[string]cachedVerdict),
 	}
 }
 
 func (c *cachingEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
-	if decision, ok := c.lookup(purl); ok {
-		return decision, nil
+	entry, hit := c.lookup(purl)
+	if ctx.Err() == nil {
+		c.metrics.recordCacheLookup(context.WithoutCancel(ctx), hit)
+	}
+	if hit {
+		return entry.decision, entry.err
 	}
 	decision, err := c.Evaluator.Evaluate(ctx, purl)
 	if err != nil {
-		return decision, errors.Wrap(err, "package policy: evaluate provider")
+		err = errors.Wrap(err, "package policy: evaluate provider")
 	}
-	if decision.Verdict == VerdictAllow || decision.Verdict == VerdictDeny {
-		c.store(purl, decision)
+	ttl := c.ttl
+	if err != nil || decision.Verdict == VerdictPending {
+		ttl = c.pendingTTL
+	} else if decision.Verdict != VerdictAllow && decision.Verdict != VerdictDeny {
+		return decision, nil
 	}
-	return decision, nil
+	if ttl > 0 && ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrOverloaded) && !errors.Is(err, ErrCircuitOpen) {
+		c.store(purl, decision, err, ttl)
+	}
+	return decision, err
 }
 
-func (c *cachingEvaluator) lookup(purl string) (Decision, bool) {
+func (c *cachingEvaluator) lookup(purl string) (cachedVerdict, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.verdicts[purl]
 	if !ok {
-		return Decision{}, false
+		return cachedVerdict{}, false
 	}
 	if !c.now().Before(entry.expiresAt) {
 		c.recent.Remove(entry.position)
 		delete(c.verdicts, purl)
-		return Decision{}, false
+		return cachedVerdict{}, false
 	}
 	c.recent.MoveToFront(entry.position)
-	return entry.decision, true
+	return entry, true
 }
 
-func (c *cachingEvaluator) store(purl string, decision Decision) {
+func (c *cachingEvaluator) store(purl string, decision Decision, err error, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.verdicts[purl]
@@ -83,6 +98,7 @@ func (c *cachingEvaluator) store(purl string, decision Decision) {
 		entry.position = c.recent.PushFront(purl)
 	}
 	entry.decision = decision
-	entry.expiresAt = c.now().Add(c.ttl)
+	entry.err = err
+	entry.expiresAt = c.now().Add(ttl)
 	c.verdicts[purl] = entry
 }

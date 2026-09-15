@@ -241,6 +241,8 @@ package-policy {
 		vars                          map[string]string
 	}{
 		{name: "omitted defaults"},
+		{name: "empty policy mode", policy: `mode = ""`, wantErr: "mode must be disabled, audit or enforce"},
+		{name: "missing policy mode variable", policy: `mode = "${POLICY_MODE}"`, wantErr: "mode must be disabled, audit or enforce"},
 		{name: "empty failure mode", policy: `on-failure = ""`, wantErr: "on-failure must be allow or deny"},
 		{name: "missing failure mode variable", policy: `on-failure = "${POLICY_MODE}"`, wantErr: "on-failure must be allow or deny"},
 		{name: "empty API origin", socket: `api-url = ""`, wantErr: "API URL must be an HTTPS origin"},

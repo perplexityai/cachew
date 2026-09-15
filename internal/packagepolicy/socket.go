@@ -19,10 +19,8 @@ import (
 )
 
 const (
-	defaultTimeout = 10 * time.Second
-	// Requests queue for a slot until their own context ends. Waiting is local backpressure, not a
-	// provider failure, so it never trips the breaker; the Socket timeout bounds how long a
-	// never-scanned package can hold a slot.
+	defaultTimeout      = 10 * time.Second
+	defaultQueueTimeout = 100 * time.Millisecond
 	maxConcurrentCalls  = 16
 	maxResponseBytes    = 4 << 20
 	maxResponseLineSize = 1 << 20
@@ -35,23 +33,30 @@ var (
 
 var errSharedEvaluationOwnerDone = errors.New("socket policy: shared evaluation owner finished")
 
+// ErrOverloaded rejects work that cannot obtain local provider capacity before its queue deadline.
+var ErrOverloaded = errors.New("socket policy: provider queue is full")
+
 // SocketConfig configures Socket's organization-scoped PURL evaluator.
 type SocketConfig struct {
 	APIURL       string        `hcl:"api-url,optional" help:"Socket API origin." default:"https://api.socket.dev"`
 	Organization string        `hcl:"organization" help:"Socket organization slug whose security policy is evaluated."`
 	Token        string        `hcl:"token" help:"Socket API token with packages:list scope. Use an environment variable placeholder rather than a literal secret."`
 	Timeout      time.Duration `hcl:"timeout,optional" help:"Maximum time Socket may spend resolving and scanning a package before Cachew treats it as pending." default:"10s"`
+	QueueTimeout time.Duration `hcl:"queue-timeout,optional" help:"Maximum local wait for provider capacity; saturation rejects requests independently of on-failure." default:"100ms"`
+	Label        string        `hcl:"label,optional" help:"Optional Socket policy label used for evaluation."`
 }
 
 type socketEvaluator struct {
-	endpoint   *url.URL
-	token      string
-	timeoutSec int
-	httpClient *http.Client
-	metrics    metricRecorder
-	inflight   singleflight.Group
-	callSlots  chan struct{}
-	breaker    circuitBreaker
+	endpoint     *url.URL
+	token        string
+	timeoutSec   int
+	queueTimeout time.Duration
+	label        string
+	httpClient   *http.Client
+	metrics      metricRecorder
+	inflight     singleflight.Group
+	callSlots    chan struct{}
+	breaker      circuitBreaker
 }
 
 var _ Evaluator = (*socketEvaluator)(nil)
@@ -66,6 +71,12 @@ func (c *socketEvaluator) ObserveNotApplicable(ctx context.Context) {
 func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, error) {
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
+	}
+	if config.QueueTimeout == 0 {
+		config.QueueTimeout = defaultQueueTimeout
+	}
+	if config.QueueTimeout < 0 {
+		return nil, errors.New("socket policy: queue-timeout must not be negative")
 	}
 	if !organizationPattern.MatchString(config.Organization) {
 		return nil, errors.New("socket policy: organization must be a non-empty slug")
@@ -88,16 +99,18 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 	endpoint := base.JoinPath("v0", "orgs", config.Organization, "purl")
 
 	return &socketEvaluator{
-		endpoint:   endpoint,
-		token:      config.Token,
-		timeoutSec: int(config.Timeout / time.Second),
+		endpoint:     endpoint,
+		token:        config.Token,
+		timeoutSec:   int(config.Timeout / time.Second),
+		queueTimeout: config.QueueTimeout,
+		label:        config.Label,
 		httpClient: &http.Client{
 			Timeout: config.Timeout + 5*time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
-		metrics:   newMetrics("socket"),
+		metrics:   newMetrics(),
 		callSlots: providerCallSlots,
 		breaker:   circuitBreaker{now: time.Now},
 	}, nil
@@ -116,32 +129,11 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision D
 			return Decision{}, errors.Wrap(cause, "socket policy: request ended before evaluation completed")
 		}
 		if !c.breaker.allow() {
+			c.metrics.recordBreakerSkip(context.WithoutCancel(ctx))
 			return Decision{}, ErrCircuitOpen
 		}
 		resultCh := c.inflight.DoChan(purl, func() (any, error) {
-			select {
-			case c.callSlots <- struct{}{}:
-				defer func() { <-c.callSlots }()
-			case <-ctx.Done():
-				return Decision{}, errSharedEvaluationOwnerDone
-			}
-			if context.Cause(ctx) != nil {
-				return Decision{}, errSharedEvaluationOwnerDone
-			}
-			if !c.breaker.allow() {
-				return Decision{}, ErrCircuitOpen
-			}
-
-			requestCtx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
-			defer cancel()
-			started := time.Now()
-			providerDecision, providerErr := c.evaluateProvider(requestCtx, purl)
-			if providerErr != nil && context.Cause(ctx) != nil {
-				return Decision{}, errSharedEvaluationOwnerDone
-			}
-			c.breaker.observe(providerErr)
-			c.metrics.recordDuration(context.WithoutCancel(ctx), providerDecision, providerErr, time.Since(started))
-			return providerDecision, providerErr
+			return c.evaluateQueued(ctx, purl)
 		})
 		select {
 		case <-ctx.Done():
@@ -153,16 +145,53 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision D
 				}
 				continue
 			}
-			if result.Err != nil {
-				return Decision{}, result.Err
-			}
 			sharedDecision, ok := result.Val.(Decision)
 			if !ok {
 				return Decision{}, errors.New("socket policy: invalid shared evaluation")
 			}
-			return sharedDecision, nil
+			return sharedDecision, result.Err
 		}
 	}
+}
+
+func (c *socketEvaluator) evaluateQueued(ctx context.Context, purl string) (Decision, error) {
+	metricsCtx := context.WithoutCancel(ctx)
+	queued := time.Now()
+	timer := time.NewTimer(c.queueTimeout)
+	var queueErr error
+	select {
+	case c.callSlots <- struct{}{}:
+		defer func() { <-c.callSlots }()
+	case <-ctx.Done():
+		queueErr = errSharedEvaluationOwnerDone
+	case <-timer.C:
+		queueErr = ErrOverloaded
+	}
+	timer.Stop()
+	c.metrics.recordQueueWait(metricsCtx, time.Since(queued))
+	if errors.Is(queueErr, ErrOverloaded) {
+		return Decision{Verdict: VerdictDeny, Reasons: []string{"overloaded"}}, queueErr
+	}
+	if queueErr != nil || context.Cause(ctx) != nil {
+		return Decision{}, errSharedEvaluationOwnerDone
+	}
+	if !c.breaker.allow() {
+		c.metrics.recordBreakerSkip(metricsCtx)
+		return Decision{}, ErrCircuitOpen
+	}
+
+	requestCtx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
+	defer cancel()
+	c.metrics.recordInflight(metricsCtx, 1)
+	started := time.Now()
+	decision, err := c.evaluateProvider(requestCtx, purl)
+	c.metrics.recordInflight(metricsCtx, -1)
+	c.metrics.recordDuration(metricsCtx, decision, err, time.Since(started))
+	if err != nil && context.Cause(ctx) != nil {
+		return Decision{}, errSharedEvaluationOwnerDone
+	}
+	c.breaker.observe(err)
+	return decision, err
 }
 
 func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (Decision, error) {
@@ -178,6 +207,9 @@ func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (De
 	query.Set("poll", "true")
 	query.Set("purlErrors", "false")
 	query.Set("timeoutSec", strconv.Itoa(c.timeoutSec))
+	if c.label != "" {
+		query.Set("labels", c.label)
+	}
 	endpoint.RawQuery = query.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
@@ -206,7 +238,7 @@ func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (De
 	if err != nil {
 		return Decision{}, err
 	}
-	if limited.N == 0 {
+	if limited.N == 0 && decision.Verdict != VerdictDeny {
 		return Decision{}, errors.New("socket policy: response exceeds size limit")
 	}
 	return decision, nil
@@ -246,6 +278,7 @@ func evaluateStream(r io.Reader, requestedPURL string) (Decision, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64<<10), maxResponseLineSize)
 	state := evaluationState{denied: make(map[string]struct{})}
+	var firstError error
 
 	for scanner.Scan() {
 		if strings.TrimSpace(scanner.Text()) == "" {
@@ -254,17 +287,23 @@ func evaluateStream(r io.Reader, requestedPURL string) (Decision, error) {
 		state.records++
 		var decoded apiArtifact
 		if err := json.Unmarshal(scanner.Bytes(), &decoded); err != nil {
-			return Decision{}, errors.Wrap(err, "socket policy: decode response")
+			if firstError == nil {
+				firstError = errors.Wrap(err, "socket policy: decode response")
+			}
+			continue
 		}
-		if err := state.add(decoded, requestedPURL); err != nil && len(state.denied) == 0 {
-			return Decision{}, err
+		if err := state.add(decoded, requestedPURL); err != nil && firstError == nil {
+			firstError = err
 		}
 		if len(state.denied) > 0 {
 			return state.decision()
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return Decision{}, errors.Wrap(err, "socket policy: read response")
+	if err := scanner.Err(); err != nil && firstError == nil {
+		firstError = errors.Wrap(err, "socket policy: read response")
+	}
+	if firstError != nil {
+		return Decision{}, firstError
 	}
 	return state.decision()
 }

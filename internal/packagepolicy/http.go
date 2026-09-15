@@ -14,22 +14,34 @@ var safeReasonPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 const policyHeader = "X-Cachew-Package-Policy"
 
-// AllowRequest reports whether an HTTP package request may continue and writes
-// a response only for an explicit denial. Provider failures and pending analysis
-// fail open unless the evaluator already converted them into a denial; the
-// pass-through response is labelled so clients and logs can see it was unchecked.
+// AllowRequest enforces denials and local overload, or reports a non-blocking audit outcome.
+// Provider failures and pending analysis fail open unless already converted into a denial.
 func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
+	if decision.Audit {
+		outcome := "audit-would_allow"
+		if decision.Verdict == VerdictDeny || errors.Is(err, ErrOverloaded) {
+			outcome = "audit-would_deny"
+		}
+		w.Header().Set(policyHeader, outcome)
+		return true
+	}
+	if errors.Is(err, ErrOverloaded) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set(policyHeader, "overloaded")
+		http.Error(w, "Package policy capacity unavailable", http.StatusServiceUnavailable)
+		return false
+	}
 	if decision.Verdict != VerdictDeny {
 		switch {
 		case err != nil:
-			w.Header().Set(policyHeader, "unavailable")
+			w.Header().Set(policyHeader, outcomeUnavailable)
 		case decision.Verdict == VerdictPending:
 			w.Header().Set(policyHeader, "pending")
 		}
 		return true
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set(policyHeader, "deny")
+	w.Header().Set(policyHeader, string(VerdictDeny))
 	message := "Package denied by security policy"
 	if reasons := safeReasons(decision.Reasons); len(reasons) > 0 {
 		message += ": " + strings.Join(reasons, ", ")
@@ -46,7 +58,7 @@ func LogLevel(err error) slog.Level {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return slog.LevelDebug
-	case errors.Is(err, ErrCircuitOpen), errors.Is(err, ErrEncodedSeparator):
+	case errors.Is(err, ErrCircuitOpen), errors.Is(err, ErrOverloaded), errors.Is(err, ErrEncodedSeparator):
 		return slog.LevelWarn
 	default:
 		return slog.LevelError
@@ -54,9 +66,9 @@ func LogLevel(err error) slog.Level {
 }
 
 // Cacheable reports whether a response served under this decision may be admitted to the cache.
-// Fail-open responses are not, so a later request re-evaluates the package.
+// Audit leaves caching unchanged; enforce admits only approved or out-of-scope responses.
 func Cacheable(decision Decision, err error) bool {
-	return err == nil && decision.Verdict != VerdictPending
+	return decision.Audit || (err == nil && decision.Verdict != VerdictPending && decision.Verdict != VerdictDeny)
 }
 
 func safeReasons(reasons []string) []string {

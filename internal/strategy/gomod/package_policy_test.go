@@ -103,6 +103,26 @@ func TestGoModuleHandlesPackagePolicyBeforeOrigin(t *testing.T) {
 			statusCode: http.StatusForbidden,
 			policy:     "deny",
 		},
+		{
+			name: "local overload", err: packagepolicy.ErrOverloaded,
+			statusCode: http.StatusServiceUnavailable, policy: "overloaded",
+		},
+		{
+			name: "audit deny", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Audit: true},
+			statusCode: http.StatusOK, policy: "audit-would_deny", originRequests: 1, cacheWrites: 1,
+		},
+		{
+			name: "audit pending", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictPending, Audit: true},
+			statusCode: http.StatusOK, policy: "audit-would_allow", originRequests: 1, cacheWrites: 1,
+		},
+		{
+			name: "audit fail closed", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Audit: true}, err: io.ErrUnexpectedEOF,
+			statusCode: http.StatusOK, policy: "audit-would_deny", originRequests: 1, cacheWrites: 1,
+		},
+		{
+			name: "audit overload", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Audit: true}, err: packagepolicy.ErrOverloaded,
+			statusCode: http.StatusOK, policy: "audit-would_deny", originRequests: 1, cacheWrites: 1,
+		},
 	}
 
 	for _, test := range tests {

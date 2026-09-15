@@ -66,6 +66,8 @@ gomod {
   private-paths = ["github.com/myorg/*"]
 
   package-policy {
+    mode = "audit" # start here; omitted mode defaults to enforce
+
     socket {
       api-url      = "https://api.socket.dev"
       organization = "my-socket-org"
@@ -75,7 +77,7 @@ gomod {
 }
 ```
 
-When `package-policy` is configured, Cachew evaluates the PURL for each
+In `audit` or `enforce` mode, Cachew evaluates the PURL for each
 canonical-version public module `GET`, including cached module files, before
 it serves or downloads them. Branch and revision `.info` queries pass through so
 the Go proxy can resolve them; the resulting canonical version's module files are
@@ -86,8 +88,11 @@ up to `verdict-ttl`, subject to the verdict cache capacity described below.
 routing and policy exclusion: a pattern matches the module itself and every module
 nested beneath it, so `github.com/myorg/*` also covers `github.com/myorg/repo/sub`.
 
-Pending analysis and provider failures fail open by default, but their downloaded
-module files are not cached. A later request therefore re-evaluates the package.
+In `enforce` mode, pending analysis and provider failures fail open by default,
+but newly downloaded module files are not cached. Their policy results can be
+reused briefly under `pending-ttl`; they are not approvals. In `audit` mode,
+policy results do not change serving or artifact caching. See the shared
+[package-policy contract](#package-policy-modes-and-outcomes) below.
 Go module `HEAD` requests return `405 Method Not Allowed`, whether or not package
 policy is enabled, so bodyless requests cannot trigger uncached module downloads.
 
@@ -131,15 +136,19 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
   origin-read-idle-timeout = "30s"
 
   package-policy {
+    mode          = "audit" # start here; default is enforce for compatibility
     exclude-purls = ["pkg:npm/%40myorg/*"]
-    verdict-ttl   = "10m"   # default; 0 disables verdict reuse
-    on-failure    = "allow" # default; "deny" returns 403 when Socket is unavailable
+    verdict-ttl   = "10m"   # default; 0 disables definitive verdict reuse
+    pending-ttl   = "15s"   # default; 0 disables pending/provider-error reuse
+    on-failure    = "allow" # default; audit records what enforce would do
 
     socket {
       api-url      = "https://api.socket.dev"
       organization = "my-socket-org"
       token        = "${SOCKET_SECURITY_API_TOKEN}"
-      timeout      = "10s"  # default
+      label        = "cachew" # optional existing Socket policy label
+      timeout      = "10s"   # default; provider resolution/analysis wait
+      queue-timeout = "100ms" # default; local provider-slot wait
     }
   }
 }
@@ -170,22 +179,52 @@ through their lifetime.
 Omitting a timeout or setting it to zero uses the documented default. Negative
 timeout values are rejected.
 
-The optional `package-policy` block is a provider-independent package-admission
-interface based on standard Package URLs (PURLs). Its `socket` provider checks
-npm artifact PURLs, including cache hits, with the
-configured organization's [Socket package
-policy](https://docs.socket.dev/reference/batchpackagefetchbyorg) before Cachew
-serves a cached body, mints a CodeArtifact token, or contacts the repository. Another provider
-can implement the same PURL-to-decision interface without changing the
-CodeArtifact or Go module strategies.
+#### Package-policy modes and outcomes
+
+The optional `package-policy` block checks standard Package URLs (PURLs) against
+the configured organization's [Socket package
+policy](https://docs.socket.dev/reference/batchpackagefetchbyorg). It runs before
+Cachew returns an artifact body, including a cache hit, or requests origin
+credentials. Omitting the block disables policy checks.
 Package-policy evaluation currently supports only npm through CodeArtifact and
 Go modules through `/gomod/`. PyPI, Maven, Cargo, and other CodeArtifact formats
 retain their existing proxy/cache behavior but are not evaluated by Socket.
 
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `mode` | `enforce` | `disabled` makes no provider queries and requires no Socket configuration; `audit` evaluates but never blocks or changes artifact caching; `enforce` applies the decision before serving. |
+| `on-failure` | `allow` | Maps pending analysis and provider errors to fail-open behavior; `deny` maps them to denial. Audit reports the same mapping without enforcing it. |
+| `verdict-ttl` | `10m` | Maximum reuse of definitive allow/deny results; `0` disables this reuse. |
+| `pending-ttl` | `15s` | Short reuse of pending results and provider errors; `0` disables this reuse. It never turns them into approvals. |
+| `socket.label` | omitted | Selects one existing Socket policy-label slug using the API's `labels` parameter. Confirm the label's intended policy before rollout. |
+| `socket.timeout` | `10s` | Provider resolution/analysis wait, from `1s` to `20m`; HTTP completion has a further five-second allowance. Zero selects the default. |
+| `socket.queue-timeout` | `100ms` | Maximum local wait for a provider slot; zero selects the default. Negative values are rejected. |
+
+`mode = "audit"` adds `X-Cachew-Package-Policy: audit-would_allow` or
+`audit-would_deny` to evaluated responses and records `would_allow` or
+`would_deny` outcomes. Ordinary origin/cache errors and existing authorization
+rules still apply. Audit is not an asynchronous background check: a cold request
+can still wait for evaluation. `on-failure = "allow"` in `enforce` mode is
+**not audit**: a definitive Socket denial still blocks the download.
+
+| Result | Enforce, `on-failure = "allow"` | Enforce, `on-failure = "deny"` | Audit |
+| --- | --- | --- | --- |
+| Socket allows | Serve; normal cache rules | Serve; normal cache rules | Serve normally; `would_allow` |
+| Socket denies (`error` action) | `403`, policy header `deny` | `403`, policy header `deny` | Serve normally; `would_deny` |
+| Pending/unindexed package | Serve cached bytes or fetch without storing new bytes; header `pending` | `403`, policy header `deny` | Serve normally; `would_allow` / `would_deny` according to `on-failure` |
+| Provider error, malformed response, or open breaker | Serve cached bytes or fetch without storing new bytes; header `unavailable` | `403`, policy header `deny` | Serve normally; `would_allow` / `would_deny` according to `on-failure` |
+| Unsafe or unmappable npm body path | `403` | `403` | Serve normally; `would_deny` |
+| Provider-slot queue deadline | `503`, policy header `overloaded` | `503`, policy header `overloaded` | Serve normally; `would_deny` |
+
+Disabled policy and privacy exclusions retain normal proxy/cache behavior without
+provider queries. Client cancellation ends the request; it is not an audit
+result or a provider outage. Local queue overload is not a Socket failure and
+does not become fail-open merely because `on-failure = "allow"`.
+
 `exclude-purls` accepts Go-style path glob patterns for npm PURLs only; npm scopes
 may be written as `@scope` or `%40scope`. Matching packages are recorded as
-`not_applicable` and continue to
-the origin without sending their names or versions to the policy provider. Use it
+`not_applicable` and continue through normal cache/origin handling without sending
+their names or versions to the policy provider. Use it
 for private packages that share a CodeArtifact repository with public
 dependencies. Use `private-paths` for Go module exclusions. Repository metadata
 and all non-npm CodeArtifact formats pass through unevaluated.
@@ -194,48 +233,57 @@ evaluation for recognized package asset paths. The PURL is derived from the
 escaped request path, so a percent-encoded slash cannot change which package is
 evaluated: `@scope%2Fname` in the package-name position is evaluated as the
 scoped npm package, and any other encoded separator under the npm format is
-denied with `403` because the origin would receive a path Cachew did not evaluate.
+denied in `enforce` mode because the origin would receive a path Cachew did not evaluate.
 For CodeArtifact VPC endpoint origins (`vpce.amazonaws.com`), Cachew normalizes
 `/npm/d/domain-owner/repository/` to `/npm/repository/` before deriving the PURL.
-Recognized npm package bodies that cannot be mapped are denied with `403`, independent
-of `on-failure`; repository metadata and unsupported formats remain unevaluated.
-
-For the Socket provider, a policy action of `error` returns `403` with
-`X-Cachew-Package-Policy: deny`. A package Socket has not indexed (`notFound`) is
-treated like pending analysis. With the default `on-failure = "allow"`, pending
-analysis, provider failures, and malformed responses fail open: Cachew records
-the outcome, labels the response `X-Cachew-Package-Policy: pending` or
-`unavailable`, and serves an already-cached body or continues to the package
-origin without admitting the response to the cache. `on-failure = "deny"`
-returns `403` for those cases instead. After five consecutive transport or HTTP
-failures Cachew skips Socket for 30 seconds and counts each skipped request as
-`unavailable`, so an outage fails fast rather than holding every request to the
-`timeout` (default `10s`, accepted range 1s to 20m; a version Socket has never
-scanned can wait up to that long before it is reported pending). When the cooldown
-ends the breaker closes again and the next five consecutive failures reopen it, so
-requests in flight at that moment can wait for the `timeout`. A request whose
-client disconnects before Socket answers is neither a provider failure nor an
-`unavailable` outcome. At most 16
-provider calls run at once across all strategies in a process; further requests
-queue for a slot until their own request ends. Waiting for a slot is local
-backpressure, never a provider failure,
-so it does not count toward the breaker and is never served unchecked. Cancelled
-queued requests are rejected regardless of `on-failure`. Lower
-`timeout` if bursts of never-scanned packages make queued requests wait too long.
-A malformed response for one package fails open without tripping the breaker.
+Recognized npm bodies that cannot be mapped are also denied in `enforce` mode,
+independent of `on-failure`. Audit records these denials without enforcing them.
 CodeArtifact `HEAD` requests are never evaluated and never admit a body to the cache.
 
-`on-failure = "allow"` is an availability-first mode: anything that makes Socket
-fail or rate-limit five times in a row opens a 30-second window in which packages
-are served unchecked. Treat that mode as monitoring and use `on-failure = "deny"`
-where the policy must be enforced.
+#### Verdict reuse and overload
 
-Allow and deny verdicts are reused for up to `verdict-ttl` (default 10 minutes).
-Each configured strategy retains at most 100,000 verdicts and evicts the least
-recently used entry when full; an evicted verdict is evaluated again on the next
-request. Every `GET`, including a cache hit, is checked against that verdict cache,
-so a newly denied package stops being served within one TTL even though its bytes remain
-stored until they expire or are deleted.
+Every eligible `GET`, including an artifact-cache hit, consults the verdict
+cache. An unexpired definitive result avoids Socket; after expiry or eviction,
+Cachew waits for a new result before returning the body. This is a fresh-policy
+check within the configured TTL, not a guarantee that Socket has freshly scanned
+the artifact. Socket can return its latest available analysis, with unresolved
+or incomplete analysis treated as pending by Cachew.
+
+Pending analysis (`pendingScan` or `notFound`) and provider errors are reused for
+`pending-ttl` to avoid repeatedly calling Socket for the same unresolved package.
+The original pending/error semantics remain intact, including the prohibition on
+storing new artifact bytes under fail-open enforcement. Open-breaker responses,
+local overload, and caller cancellations are not cached. A provider deadline
+error may be reused only when the requesting client is still active.
+
+Each strategy instance keeps at most 100,000 results in an in-memory LRU and
+coalesces concurrent misses for the same PURL. There is no reuse or coalescing
+across strategies, replicas, or restarts. A large working set, simultaneous TTL
+expiry, or rollout can therefore amplify provider traffic even when artifact
+bytes are warm. Each provider request contains one PURL.
+
+At most 16 provider calls run concurrently across all strategies in one process.
+Other callers wait up to `socket.queue-timeout` for a slot; the provider timeout
+starts only after acquisition. This limits wait duration, not the number of
+arrivals or requests per second. Configure [HTTP admission](#request-admission)
+to bound total in-process requests as well; it is disabled by default.
+
+Five consecutive transport or HTTP failures open the strategy's breaker for
+30 seconds. Malformed responses, pending analysis, and local overload do not
+trip it. The breaker closes after cooldown without a single-probe recovery phase.
+In fail-open enforcement, an open breaker permits unchecked traffic; in fail-closed
+enforcement it denies traffic. Audit still reports the corresponding hypothetical
+outcome. A temporary error-cache hit does not make another provider call or
+advance the breaker.
+
+Checking Socket only on an artifact-body miss would be **admission-only** policy:
+a later denial could not stop already-cached bytes. Serving an expired allow
+while refreshing in the background would be **stale-while-revalidate** policy:
+requests during refresh could still receive a newly denied package. Neither is
+implemented. The current synchronous check preserves policy changes independently
+of artifact retention, subject to verdict TTLs and the chosen failure mode.
+
+#### Package identity and privileged cache access
 
 A later policy change does not remove an admitted object's bytes from the cache.
 Keep the generic `/api/v1/object/{namespace}/{key}` API restricted to trusted
@@ -264,8 +312,12 @@ backing tier with deployment-specific tooling or wait for the origin TTL; Cachew
 does not currently provide a reliable targeted purge for that incident.
 
 Socket receives the public ecosystem, package name, and version from the
-CodeArtifact request path. Cachew does not send package contents, CodeArtifact
-credentials, repository names, or AWS identity to Socket. Operators should
+request path, plus the configured policy label when present. This identifies a
+public package coordinate, **not the identity of the bytes returned by
+CodeArtifact**: Cachew does not prove those bytes match Socket's analyzed artifact.
+Private or republished packages sharing a public name/version need an explicit
+exclusion or a separate identity policy. Cachew does not send package contents,
+CodeArtifact credentials, repository names, or AWS identity to Socket. Operators should
 still treat the package name and version as data crossing from their
 CodeArtifact environment to Socket's SaaS boundary.
 
@@ -275,30 +327,83 @@ file by using an environment placeholder as shown above and inject
 secret manager. For example, Kubernetes can source the environment variable
 from a `Secret` with `env[].valueFrom.secretKeyRef`; the secret does not need to
 be exposed to package-manager clients.
-Omitted `on-failure` and `socket.api-url` attributes use their HCL defaults;
-explicit empty values, including unset environment placeholders, fail startup.
+For enabled policy, omitted `mode`, `on-failure`, and `socket.api-url` use their
+HCL defaults; explicit empty values, including unset required environment
+placeholders, fail startup. `mode = "disabled"` does not require a provider or token.
 
-Policy outcomes and API latency are exported as
-`cachew.package_policy.evaluations_total` and
-`cachew.package_policy.evaluation_duration_seconds`. The evaluation counter has
-bounded provider and outcome attributes (`allow`, `deny`, `pending`,
-`unavailable`, or `not_applicable`); package names and versions are not metric
-labels. The latency histogram covers actual provider evaluations; verdict-cache
-hits and circuit-breaker skips increment the counter without a latency sample.
+#### Provider quota and rollout
+
+Socket's published [rate-limit guide](https://docs.socket.dev/reference/rate-limits)
+states 600 requests per minute and notes that unsuccessful requests also count.
+The [org-scoped PURL endpoint](https://docs.socket.dev/reference/batchpackagefetchbyorg)
+documents 100 quota units per request, a default maximum batch of 1,024 PURLs,
+and one optional policy label. Cachew currently sends only one PURL per request.
+The [quota guide](https://docs.socket.dev/reference/quota) separately describes
+token quota exhaustion returning `429` with `Retry-After`. These published
+numbers are not confirmation of this deployment's organization/token limits.
+Cachew does not provide a fleet-wide rate limiter, batch requests, or schedule
+retries from Socket's `Retry-After`; its bounded concurrency and breaker do not
+replace quota budgeting.
+
+Before enforcement:
+
+1. Confirm the Socket organization, token scopes and actual quota/rate limits,
+   intended label policy, approved public-coordinate disclosure, and private
+   package exclusions with their owners. Deployment and secret provisioning are
+   separate, explicitly authorized work; changing this example does not roll out
+   the service or provision credentials.
+2. Start with `mode = "audit"` and the intended `on-failure` setting. Verify known
+   allow/deny, private exclusions, and cached-body cases. Exercise provider error,
+   pending, overload, and cancellation behavior in an isolated test environment,
+   not by disrupting the live provider.
+3. Measure provider-call rate, verdict hit ratio, queue wait, in-flight calls,
+   overloads, and end-to-end latency under representative warm, cold, expired,
+   and restart workloads. Budget all replicas and other token consumers against
+   confirmed limits; review `would_deny` outcomes and require headroom before
+   proceeding. No production-QPS or organization-quota validation is implied by
+   the unit tests.
+4. Roll out `mode = "enforce"` gradually through the deployment's normal change
+   controls, verify cached-body denials and failure-mode behavior, and monitor
+   admission failures and provider quota. Keep an explicit rollback to `audit`
+   (same evaluation load, no enforcement) or `disabled` (no provider traffic).
+
+A persistent approval store, batching, separate pending/unavailable policies,
+or a different freshness model should be added only if measured traffic or an
+explicit security requirement justifies them. They are not current features.
+
+#### Policy metrics
+
+All names below use the `cachew.package_policy.` prefix. Attributes are bounded;
+package coordinates, URLs, and policy-label slugs are not metric labels.
+
+| Suffix | Meaning | Attributes |
+| --- | --- | --- |
+| `evaluations_total` | Completed request-level policy outcomes, including reused results and singleflight waiters | `provider`, `outcome` |
+| `provider_calls_total` | Actual provider evaluations, not request-level policy checks | `provider`, `outcome` |
+| `evaluation_duration_seconds` | Provider duration, excluding local queue wait | `provider`, `outcome` |
+| `queue_wait_seconds` | Each provider-slot attempt, including immediate acquisition, timeout, and cancellation; excludes coalesced waiters | `provider` |
+| `inflight` | Active provider evaluations | `provider` |
+| `verdict_cache_total` | Lookups when result reuse is enabled, including definitive and temporary results | `provider`, `result` (`hit` or `miss`) |
+| `breaker_skips_total` | Evaluations skipped while the circuit is open | `provider` |
+
 Each request that joins an in-flight evaluation is counted separately, but requests
-abandoned by the client before evaluation completes are not counted. Counter outcomes
-describe the final policy decision: with `on-failure = "deny"`, pending analysis
-and provider failures count as `deny`. Histogram outcomes retain the provider
-result. Encoded-separator and unmappable-body denials are logged rather than
-counted. Unsupported ecosystems, non-package metadata, and excluded private Go modules
+abandoned by the client before evaluation completes have no final request outcome.
+Provider calls that already started still contribute their call count and duration.
+Counter outcomes describe the final policy decision: with `on-failure = "deny"`, pending analysis
+and provider failures count as `deny`; audit records `would_allow` or `would_deny`
+instead. Local queue rejection counts as `overloaded` in enforce mode and
+`would_deny` in audit. Provider-call and latency outcomes retain the provider result, not the
+audit or fail-closed mapping. Verdict-cache hits and circuit-breaker skips do not
+produce provider-call or provider-duration samples. Unsupported ecosystems,
+non-package metadata, and excluded private Go modules
 record `not_applicable` so gaps in enforcement coverage remain visible. Metadata
 GETs can dominate that outcome, so dashboards should chart it separately and
-exclude it from allow/deny availability ratios. `HEAD` requests are not counted
-because they cannot admit a package body.
-
-Within a configured strategy, concurrent requests for the same PURL share one
-in-flight provider call. The resulting allow or deny verdict is reused until its
-TTL expires or it is evicted; pending results and failures are never cached.
+exclude it from allow/deny availability ratios. Encoded-separator and unmappable-body
+denials are logged rather than counted, including audit's corresponding
+`audit-would_deny` responses. `HEAD` requests are not counted
+because they cannot admit a package body. Compare provider-call totals with
+request outcomes rather than treating every evaluation-counter increment as a
+Socket request.
 
 Cachew checks its cache for every full CodeArtifact `GET` without a query string,
 range, or encoded path separator. On a miss, it stores only a successful,

@@ -50,7 +50,7 @@ func PackageURLForCodeArtifact(origin *url.URL) (string, error) {
 	if len(parts) > 2 && npmScopedName(parts[2]) {
 		parts = slices.Concat(parts[:2], strings.SplitN(parts[2], "/", 2), parts[3:])
 	}
-	if purl, ok := npmPackageURL(parts); ok {
+	if purl, found := npmPackageURL(parts); found {
 		return purl, nil
 	}
 	if len(parts) > 2 && slices.Contains(parts[2:], "-") && strings.HasSuffix(parts[len(parts)-1], ".tgz") {
