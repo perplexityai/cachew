@@ -13,7 +13,7 @@ import (
 	"github.com/alecthomas/errors"
 )
 
-const deadlineTestBudget = 10 * time.Second
+const deadlineTestBudget = 200 * time.Millisecond
 
 type deadlineTestResult struct {
 	decision Decision
@@ -33,7 +33,7 @@ func newDeadlineTestClient(t *testing.T, transport roundTripperFunc) (*socketEva
 	t.Helper()
 	client, err := newSocketEvaluator(SocketConfig{
 		APIURL: "https://socket.example.com", Organization: testOrganization, Token: testToken,
-		Timeout: deadlineTestBudget, QueueTimeout: 2 * deadlineTestBudget,
+		QueueTimeout: 2 * deadlineTestBudget,
 	}, false)
 	assert.NoError(t, err)
 	metrics := &recordingMetrics{}
@@ -56,7 +56,7 @@ func TestSocketDeadlineIncludesQueueAndProvider(t *testing.T) {
 		start := time.Now()
 		result := evaluateDeadlineAsync(t.Context(), client)
 		synctest.Wait()
-		time.Sleep(6 * time.Second)
+		time.Sleep(3 * deadlineTestBudget / 5)
 		<-client.callSlots
 		assert.Equal(t, start.Add(deadlineTestBudget), <-started)
 		got := <-result
@@ -109,11 +109,11 @@ func TestSocketDeadlineDoesNotResetAfterSharedOwnerCancellation(t *testing.T) {
 		ownerStart := time.Now()
 		owner := evaluateDeadlineAsync(ownerCtx, client)
 		assert.Equal(t, ownerStart.Add(deadlineTestBudget), <-started)
-		time.Sleep(2 * time.Second)
+		time.Sleep(deadlineTestBudget / 5)
 		waiterStart := time.Now()
 		waiter := evaluateDeadlineAsync(t.Context(), client)
 		synctest.Wait()
-		time.Sleep(4 * time.Second)
+		time.Sleep(2 * deadlineTestBudget / 5)
 		cancelOwner()
 		assert.IsError(t, (<-owner).err, context.Canceled)
 		assert.Equal(t, waiterStart.Add(deadlineTestBudget), <-started)
@@ -140,7 +140,7 @@ func TestSocketSharedProviderDeadlineDoesNotRetry(t *testing.T) {
 		start := time.Now()
 		owner := evaluateDeadlineAsync(t.Context(), client)
 		<-started
-		time.Sleep(2 * time.Second)
+		time.Sleep(deadlineTestBudget / 5)
 		waiter := evaluateDeadlineAsync(t.Context(), client)
 		synctest.Wait()
 		assert.IsError(t, (<-owner).err, context.DeadlineExceeded)
@@ -163,7 +163,7 @@ func TestSocketDeadlineBeforeAdmissionRemainsOverload(t *testing.T) {
 		start := time.Now()
 		owner := evaluateDeadlineAsync(t.Context(), client)
 		synctest.Wait()
-		time.Sleep(2 * time.Second)
+		time.Sleep(deadlineTestBudget / 5)
 		waiter := evaluateDeadlineAsync(t.Context(), client)
 		synctest.Wait()
 		for _, result := range []<-chan deadlineTestResult{owner, waiter} {

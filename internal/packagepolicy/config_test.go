@@ -27,7 +27,7 @@ package-policy {
     api-url      = "https://socket.example.com"
     organization = "example-org"
     token        = "test-token"
-    timeout      = "45s"
+    timeout      = "350ms"
     queue-timeout = "250ms"
     label        = "cachew-rollout"
   }
@@ -45,7 +45,7 @@ package-policy {
 		APIURL:       "https://socket.example.com",
 		Organization: "example-org",
 		Token:        "test-token",
-		Timeout:      45 * time.Second,
+		Timeout:      350 * time.Millisecond,
 		QueueTimeout: 250 * time.Millisecond,
 		Label:        "cachew-rollout",
 	}, config.PackagePolicy.Socket)
@@ -68,6 +68,7 @@ func TestPackagePolicyModeAndDefaults(t *testing.T) {
 	assert.NoError(t, hcl.Unmarshal([]byte(`package-policy { socket { organization = "example" token = "test-token" } }`), &config))
 	assert.Equal(t, "enforce", config.PackagePolicy.Mode)
 	assert.Equal(t, 15*time.Second, config.PackagePolicy.PendingTTL)
+	assert.Equal(t, 200*time.Millisecond, config.PackagePolicy.Socket.Timeout)
 	assert.Equal(t, 5*time.Second, config.PackagePolicy.Socket.QueueTimeout)
 	_, err := packagepolicy.New(*config.PackagePolicy)
 	assert.NoError(t, err)

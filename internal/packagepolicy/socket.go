@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	defaultTimeout      = 10 * time.Second
+	defaultTimeout      = 200 * time.Millisecond
 	defaultQueueTimeout = 5 * time.Second
 	maxConcurrentCalls  = 16
 	maxResponseBytes    = 4 << 20
@@ -44,7 +44,7 @@ type SocketConfig struct {
 	APIURL       string        `hcl:"api-url,optional" help:"Socket API origin." default:"https://api.socket.dev"`
 	Organization string        `hcl:"organization" help:"Socket organization slug whose security policy is evaluated."`
 	Token        string        `hcl:"token" help:"Socket API token with packages:list scope. Use an environment variable placeholder rather than a literal secret."`
-	Timeout      time.Duration `hcl:"timeout,optional" help:"Total policy evaluation budget, including queueing, shared calls, retries, and the Socket response." default:"10s"`
+	Timeout      time.Duration `hcl:"timeout,optional" help:"Total policy evaluation budget, including queueing, shared calls, retries, and the Socket response." default:"200ms"`
 	QueueTimeout time.Duration `hcl:"queue-timeout,optional" help:"Maximum local wait for provider capacity; saturation rejects requests independently of on-failure." default:"5s"`
 	Label        string        `hcl:"label,optional" help:"Optional Socket policy label used for evaluation."`
 }
@@ -98,8 +98,8 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 	if config.Label != "" && !labelPattern.MatchString(config.Label) {
 		return nil, errors.New("socket policy: label must be a single slug")
 	}
-	if config.Timeout < time.Second || config.Timeout > 20*time.Minute {
-		return nil, errors.New("socket policy: timeout must be between 1s and 20m")
+	if config.Timeout < 0 || config.Timeout > 20*time.Minute {
+		return nil, errors.New("socket policy: timeout must be positive and no greater than 20m")
 	}
 
 	base, err := url.Parse(config.APIURL)
@@ -115,7 +115,7 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 	return &socketEvaluator{
 		endpoint:     endpoint,
 		token:        config.Token,
-		timeoutSec:   int(config.Timeout / time.Second),
+		timeoutSec:   int((config.Timeout + time.Second - 1) / time.Second),
 		queueTimeout: config.QueueTimeout,
 		label:        config.Label,
 		httpClient: &http.Client{

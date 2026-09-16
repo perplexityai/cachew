@@ -23,7 +23,7 @@
 #       organization = "my-socket-org"
 #       token        = "${SOCKET_SECURITY_API_TOKEN}"
 #       label        = "cachew" # optional existing Socket policy label
-#       timeout      = "10s" # total policy-evaluation budget, including queueing
+#       timeout      = "200ms" # total policy-evaluation budget, including queueing
 #       queue-timeout = "5s"
 #     }
 #   }

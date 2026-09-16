@@ -201,6 +201,7 @@ func TestClientUsesPolicyLabel(t *testing.T) {
 	assert.NoError(t, err)
 	client.httpClient.Transport = roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		assert.Equal(t, label, r.URL.Query().Get("labels"))
+		assert.Equal(t, "1", r.URL.Query().Get("timeoutSec"))
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Body:       io.NopCloser(strings.NewReader(testAllowResponse)),
@@ -211,12 +212,43 @@ func TestClientUsesPolicyLabel(t *testing.T) {
 	assert.Equal(t, VerdictAllow, decision.Verdict)
 }
 
+func TestSocketTimeoutValidation(t *testing.T) {
+	for _, test := range []struct {
+		timeout    time.Duration
+		budget     time.Duration
+		timeoutSec int
+	}{
+		{0, 200 * time.Millisecond, 1},
+		{time.Nanosecond, time.Nanosecond, 1},
+		{200 * time.Millisecond, 200 * time.Millisecond, 1},
+		{350 * time.Millisecond, 350 * time.Millisecond, 1},
+		{1500 * time.Millisecond, 1500 * time.Millisecond, 2},
+		{20 * time.Minute, 20 * time.Minute, 1200},
+	} {
+		t.Run(test.timeout.String(), func(t *testing.T) {
+			client, err := newSocketEvaluator(SocketConfig{
+				APIURL: "https://socket.example.com", Organization: testOrganization, Token: testToken,
+				Timeout: test.timeout,
+			}, false)
+			assert.NoError(t, err)
+			assert.Equal(t, test.budget, client.httpClient.Timeout)
+			assert.Equal(t, test.timeoutSec, client.timeoutSec)
+		})
+	}
+	for _, timeout := range []time.Duration{-time.Nanosecond, 20*time.Minute + time.Nanosecond} {
+		_, err := newSocketEvaluator(SocketConfig{
+			APIURL: "https://socket.example.com", Organization: testOrganization, Token: testToken,
+			Timeout: timeout,
+		}, false)
+		assert.Error(t, err)
+	}
+}
+
 func TestSocketQueueTimeoutValidation(t *testing.T) {
 	config := SocketConfig{APIURL: "https://socket.example.com", Organization: testOrganization, Token: testToken}
 	client, err := newSocketEvaluator(config, false)
 	assert.NoError(t, err)
 	assert.Equal(t, defaultQueueTimeout, client.queueTimeout)
-	assert.Equal(t, defaultTimeout, client.httpClient.Timeout)
 	config.QueueTimeout = -time.Second
 	_, err = newSocketEvaluator(config, false)
 	assert.Error(t, err)
