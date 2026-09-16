@@ -11,6 +11,22 @@
 #   domain-owner   = "111122223333"
 #   region         = "us-east-1"
 #   role-arn       = "arn:aws:iam::111122223333:role/cachew-codeartifact-read"
+#   package-policy {
+#     mode          = "audit" # no enforcement; omitted mode defaults to enforce
+#     exclude-purls = ["pkg:npm/%40myorg/*"]
+#     verdict-ttl   = "10m"
+#     pending-ttl   = "15s"
+#     on-failure    = "allow"
+#
+#     socket {
+#       api-url      = "https://api.socket.dev"
+#       organization = "my-socket-org"
+#       token        = "${SOCKET_SECURITY_API_TOKEN}"
+#       label        = "cachew" # optional existing Socket policy label
+#       timeout      = "200ms" # total policy-evaluation budget, including queueing
+#       queue-timeout = "5s"
+#     }
+#   }
 # }
 
 state = "./state"
@@ -77,6 +93,14 @@ strategy github-releases {
 
 strategy gomod {
   proxy = "https://proxy.golang.org"
+  # package-policy {
+  #   mode = "audit" # no enforcement; omitted mode defaults to enforce
+  #   socket {
+  #     api-url      = "https://api.socket.dev"
+  #     organization = "my-socket-org"
+  #     token        = "${SOCKET_SECURITY_API_TOKEN}"
+  #   }
+  # }
 }
 
 strategy hermit { }
