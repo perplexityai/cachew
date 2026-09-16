@@ -2,6 +2,7 @@ package config //nolint:testpackage
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/logging"
 	"github.com/block/cachew/internal/metadatadb"
+	"github.com/block/cachew/internal/packagepolicy"
 	"github.com/block/cachew/internal/strategy"
 )
 
@@ -222,6 +224,59 @@ opa {
 	assert.Contains(t, out, `caller_principal == "spiffe://example/ns/warm/sa/x"`)
 	// No literal placeholder remains anywhere in the rendered AST.
 	assert.Equal(t, false, strings.Contains(out, "${CACHEW_"))
+}
+
+func TestExpandedPackagePolicyRejectsEmptySecuritySettings(t *testing.T) {
+	const input = `
+package-policy {
+  %s
+  socket {
+    %s
+    organization = "example-org"
+    token = "test-token"
+  }
+}`
+	tests := []struct {
+		name, policy, socket, wantErr string
+		vars                          map[string]string
+	}{
+		{name: "omitted defaults"},
+		{name: "empty policy mode", policy: `mode = ""`, wantErr: "mode must be disabled, audit or enforce"},
+		{name: "missing policy mode variable", policy: `mode = "${POLICY_MODE}"`, wantErr: "mode must be disabled, audit or enforce"},
+		{name: "empty failure mode", policy: `on-failure = ""`, wantErr: "on-failure must be allow or deny"},
+		{name: "missing failure mode variable", policy: `on-failure = "${POLICY_MODE}"`, wantErr: "on-failure must be allow or deny"},
+		{name: "empty API origin", socket: `api-url = ""`, wantErr: "API URL must be an HTTPS origin"},
+		{name: "missing API origin variable", socket: `api-url = "${POLICY_API}"`, wantErr: "API URL must be an HTTPS origin"},
+		{
+			name: "explicit variables", policy: `on-failure = "${POLICY_MODE}"`, socket: `api-url = "${POLICY_API}"`,
+			vars: map[string]string{"POLICY_MODE": "deny", "POLICY_API": "https://socket.example.com"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ast, err := hcl.Parse(strings.NewReader(fmt.Sprintf(input, test.policy, test.socket)))
+			assert.NoError(t, err)
+			expandVars(ast, test.vars)
+			var decoded struct {
+				Policy packagepolicy.Config `hcl:"package-policy,block"`
+			}
+			assert.NoError(t, hcl.UnmarshalAST(ast, &decoded))
+			_, err = packagepolicy.New(decoded.Policy)
+			if test.wantErr != "" {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), test.wantErr)
+				return
+			}
+			assert.NoError(t, err)
+			if test.vars != nil {
+				assert.Equal(t, test.vars["POLICY_MODE"], decoded.Policy.OnFailure)
+				assert.Equal(t, test.vars["POLICY_API"], decoded.Policy.Socket.APIURL)
+				return
+			}
+			assert.Equal(t, "allow", decoded.Policy.OnFailure)
+			assert.Equal(t, "https://api.socket.dev", decoded.Policy.Socket.APIURL)
+		})
+	}
 }
 
 func TestLoadRequiresMetadataBackend(t *testing.T) {
