@@ -147,7 +147,7 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
       organization = "my-socket-org"
       token        = "${SOCKET_SECURITY_API_TOKEN}"
       label        = "cachew" # optional existing Socket policy label
-      timeout      = "10s"   # default; provider resolution/analysis wait
+      timeout      = "10s"   # default; total policy-evaluation budget
       queue-timeout = "5s"    # default; local provider-slot wait
     }
   }
@@ -197,8 +197,8 @@ retain their existing proxy/cache behavior but are not evaluated by Socket.
 | `verdict-ttl` | `10m` | Maximum reuse of definitive allow/deny results; `0` disables this reuse. |
 | `pending-ttl` | `15s` | Short reuse of pending results and provider errors; `0` disables this reuse. It never turns them into approvals. |
 | `socket.label` | omitted | Selects one existing Socket policy-label slug using the API's `labels` parameter. Confirm the label's intended policy before rollout. |
-| `socket.timeout` | `10s` | Provider resolution/analysis wait, from `1s` to `20m`; HTTP completion has a further five-second allowance. Zero selects the default. |
-| `socket.queue-timeout` | `5s` | Maximum local wait for a provider slot; zero selects the default. Negative values are rejected. |
+| `socket.timeout` | `10s` | Total Socket evaluation budget, including queueing, shared-call waits, retries, and HTTP response reading, from `1s` to `20m`. Zero selects the default. |
+| `socket.queue-timeout` | `5s` | Maximum local wait for a provider slot, also bounded by the remaining total evaluation budget; zero selects the default. Negative values are rejected. |
 
 `mode = "audit"` adds `X-Cachew-Package-Policy: audit-would_allow` or
 `audit-would_deny` to evaluated responses and records `would_allow` or
@@ -213,9 +213,9 @@ can still wait for evaluation. `on-failure = "allow"` in `enforce` mode is
 | Socket allows | Serve; normal cache rules | Serve; normal cache rules | Serve normally; `would_allow` |
 | Socket denies (`error` action) | `403`, policy header `deny` | `403`, policy header `deny` | Serve normally; `would_deny` |
 | Pending/unindexed package | Serve cached bytes or fetch without storing new bytes; header `pending` | `403`, policy header `deny` | Serve normally; `would_allow` / `would_deny` according to `on-failure` |
-| Provider error, malformed response, or open breaker | Serve cached bytes or fetch without storing new bytes; header `unavailable` | `403`, policy header `deny` | Serve normally; `would_allow` / `would_deny` according to `on-failure` |
+| Provider error, evaluation timeout during an active provider call, malformed response, or open breaker | Serve cached bytes or fetch without storing new bytes; header `unavailable` | `403`, policy header `deny` | Serve normally; `would_allow` / `would_deny` according to `on-failure` |
 | Unsafe or unmappable npm body path | `403` | `403` | Serve normally; `would_deny` |
-| Provider-slot queue deadline | `503`, policy header `overloaded` | `503`, policy header `overloaded` | Serve normally; `would_deny` |
+| Provider-slot queue deadline or total budget exhausted while waiting for a slot | `503`, policy header `overloaded` | `503`, policy header `overloaded` | Serve normally; `would_deny` |
 
 Disabled policy and privacy exclusions retain normal proxy/cache behavior without
 provider queries. Client cancellation ends the request; it is not an audit
@@ -263,10 +263,19 @@ across strategies, replicas, or restarts. A large working set, simultaneous TTL
 expiry, or rollout can therefore amplify provider traffic even when artifact
 bytes are warm. Each provider request contains one PURL.
 
+Every Socket evaluation has one `socket.timeout` budget covering provider-slot
+queueing, waiting for a shared call, retries after a shared call's owner cancels,
+and the full HTTP response. Retries do not reset this deadline, and there is no
+additional HTTP grace period. This budget applies only to policy evaluation, not
+the subsequent artifact download. If the budget expires while Socket is being
+queried (including a shared query), the result follows `on-failure`, which defaults
+to fail-open.
+
 At most 16 provider calls run concurrently across all strategies in one process.
-Other callers wait up to `socket.queue-timeout` for a slot; the provider timeout
-starts only after acquisition. Waiting past the deadline returns `503` with
-`Retry-After: 1` in enforce mode. The `go` command treats any proxy error other
+Other callers wait for a slot for at most `socket.queue-timeout` or the remaining
+evaluation budget, whichever is shorter. Exhausting either limit while waiting
+for local capacity remains overload, not a fail-open provider error: it returns
+`503` with `Retry-After: 1` in enforce mode. The `go` command treats any proxy error other
 than `404` or `410` as terminal and does not retry, so size the deadline for the
 largest expected cold install rather than relying on client retries. This limits
 wait duration, not the number of arrivals or requests per second. Configure [HTTP admission](#request-admission)

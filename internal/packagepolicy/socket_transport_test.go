@@ -216,6 +216,7 @@ func TestSocketQueueTimeoutValidation(t *testing.T) {
 	client, err := newSocketEvaluator(config, false)
 	assert.NoError(t, err)
 	assert.Equal(t, defaultQueueTimeout, client.queueTimeout)
+	assert.Equal(t, defaultTimeout, client.httpClient.Timeout)
 	config.QueueTimeout = -time.Second
 	_, err = newSocketEvaluator(config, false)
 	assert.Error(t, err)

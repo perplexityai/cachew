@@ -12,10 +12,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alecthomas/errors"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -43,7 +44,7 @@ type SocketConfig struct {
 	APIURL       string        `hcl:"api-url,optional" help:"Socket API origin." default:"https://api.socket.dev"`
 	Organization string        `hcl:"organization" help:"Socket organization slug whose security policy is evaluated."`
 	Token        string        `hcl:"token" help:"Socket API token with packages:list scope. Use an environment variable placeholder rather than a literal secret."`
-	Timeout      time.Duration `hcl:"timeout,optional" help:"Maximum time Socket may spend resolving and scanning a package before Cachew treats it as pending." default:"10s"`
+	Timeout      time.Duration `hcl:"timeout,optional" help:"Total policy evaluation budget, including queueing, shared calls, retries, and the Socket response." default:"10s"`
 	QueueTimeout time.Duration `hcl:"queue-timeout,optional" help:"Maximum local wait for provider capacity; saturation rejects requests independently of on-failure." default:"5s"`
 	Label        string        `hcl:"label,optional" help:"Optional Socket policy label used for evaluation."`
 }
@@ -56,9 +57,17 @@ type socketEvaluator struct {
 	label        string
 	httpClient   *http.Client
 	metrics      metricRecorder
-	inflight     singleflight.Group
+	mu           sync.Mutex
+	inflight     map[string]*socketEvaluation
 	callSlots    chan struct{}
 	breaker      circuitBreaker
+}
+
+type socketEvaluation struct {
+	done            chan struct{}
+	providerStarted atomic.Bool
+	decision        Decision
+	err             error
 }
 
 var _ Evaluator = (*socketEvaluator)(nil)
@@ -110,7 +119,7 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 		queueTimeout: config.QueueTimeout,
 		label:        config.Label,
 		httpClient: &http.Client{
-			Timeout: config.Timeout + 5*time.Second,
+			Timeout: config.Timeout,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -129,37 +138,73 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision D
 			err = errors.Wrap(cause, "socket policy: request ended before evaluation completed")
 		}
 	}()
+	deadline := time.Now().Add(c.httpClient.Timeout)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	var shared *socketEvaluation
 	for {
 		if cause := context.Cause(ctx); cause != nil {
 			return Decision{}, errors.Wrap(cause, "socket policy: request ended before evaluation completed")
+		}
+		if !time.Now().Before(deadline) {
+			return evaluationDeadlineResult(shared)
 		}
 		if !c.breaker.allow() {
 			c.metrics.recordBreakerSkip(context.WithoutCancel(ctx))
 			return Decision{}, ErrCircuitOpen
 		}
-		resultCh := c.inflight.DoChan(purl, func() (any, error) {
-			return c.evaluateQueued(ctx, purl)
-		})
+		shared = c.sharedEvaluation(ctx, purl, deadline)
 		select {
 		case <-ctx.Done():
 			return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
-		case result := <-resultCh:
-			if errors.Is(result.Err, errSharedEvaluationOwnerDone) {
-				if context.Cause(ctx) != nil {
-					return Decision{}, errors.Wrap(context.Cause(ctx), "socket policy: wait for shared evaluation")
-				}
-				continue
+		case <-timer.C:
+			select {
+			case <-shared.done:
+			default:
+				return evaluationDeadlineResult(shared)
 			}
-			sharedDecision, ok := result.Val.(Decision)
-			if !ok {
-				return Decision{}, errors.New("socket policy: invalid shared evaluation")
-			}
-			return sharedDecision, result.Err
+		case <-shared.done:
 		}
+		if errors.Is(shared.err, errSharedEvaluationOwnerDone) {
+			continue
+		}
+		return shared.decision, shared.err
 	}
 }
 
-func (c *socketEvaluator) evaluateQueued(ctx context.Context, purl string) (Decision, error) {
+func evaluationDeadlineResult(shared *socketEvaluation) (Decision, error) {
+	if shared == nil || !shared.providerStarted.Load() {
+		return Decision{Verdict: VerdictDeny, Reasons: []string{"overloaded"}}, ErrOverloaded
+	}
+	return Decision{}, errors.Wrap(context.DeadlineExceeded, "socket policy: evaluation deadline exceeded")
+}
+
+// sharedEvaluation keeps admission state with the coalesced work so a caller's deadline cannot
+// turn local queue saturation into a fail-open provider failure.
+func (c *socketEvaluator) sharedEvaluation(ctx context.Context, purl string, deadline time.Time) *socketEvaluation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if shared, ok := c.inflight[purl]; ok {
+		return shared
+	}
+	shared := &socketEvaluation{done: make(chan struct{})}
+	if c.inflight == nil {
+		c.inflight = make(map[string]*socketEvaluation)
+	}
+	c.inflight[purl] = shared
+	go func() {
+		shared.decision, shared.err = c.evaluateQueued(ctx, purl, deadline, shared)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		delete(c.inflight, purl)
+		close(shared.done)
+	}()
+	return shared
+}
+
+func (c *socketEvaluator) evaluateQueued(ctx context.Context, purl string, deadline time.Time, shared *socketEvaluation) (Decision, error) {
+	requestCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	metricsCtx := context.WithoutCancel(ctx)
 	queued := time.Now()
 	timer := time.NewTimer(c.queueTimeout)
@@ -167,26 +212,25 @@ func (c *socketEvaluator) evaluateQueued(ctx context.Context, purl string) (Deci
 	select {
 	case c.callSlots <- struct{}{}:
 		defer func() { <-c.callSlots }()
-	case <-ctx.Done():
-		queueErr = errSharedEvaluationOwnerDone
+	case <-requestCtx.Done():
+		queueErr = ErrOverloaded
 	case <-timer.C:
 		queueErr = ErrOverloaded
 	}
 	timer.Stop()
 	c.metrics.recordQueueWait(metricsCtx, time.Since(queued))
-	if errors.Is(queueErr, ErrOverloaded) {
-		return Decision{Verdict: VerdictDeny, Reasons: []string{"overloaded"}}, queueErr
-	}
-	if queueErr != nil || context.Cause(ctx) != nil {
+	if context.Cause(ctx) != nil {
 		return Decision{}, errSharedEvaluationOwnerDone
+	}
+	if queueErr != nil || requestCtx.Err() != nil || !time.Now().Before(deadline) {
+		return Decision{Verdict: VerdictDeny, Reasons: []string{"overloaded"}}, ErrOverloaded
 	}
 	if !c.breaker.allow() {
 		c.metrics.recordBreakerSkip(metricsCtx)
 		return Decision{}, ErrCircuitOpen
 	}
 
-	requestCtx, cancel := context.WithTimeout(ctx, c.httpClient.Timeout)
-	defer cancel()
+	shared.providerStarted.Store(true)
 	c.metrics.recordInflight(metricsCtx, 1)
 	started := time.Now()
 	decision, err := c.evaluateProvider(requestCtx, purl)
@@ -194,6 +238,9 @@ func (c *socketEvaluator) evaluateQueued(ctx context.Context, purl string) (Deci
 	c.metrics.recordDuration(metricsCtx, decision, err, time.Since(started))
 	if err != nil && context.Cause(ctx) != nil {
 		return Decision{}, errSharedEvaluationOwnerDone
+	}
+	if err != nil && requestCtx.Err() != nil {
+		err = markUnavailable(errors.Wrap(context.Cause(requestCtx), "socket policy: evaluation deadline exceeded"))
 	}
 	c.breaker.observe(err)
 	return decision, err
