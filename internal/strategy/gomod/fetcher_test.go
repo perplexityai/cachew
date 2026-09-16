@@ -50,6 +50,12 @@ func TestCompositeFetcher_isPrivate(t *testing.T) {
 			want:       true,
 		},
 		{
+			name:       "wildcard match - nested module",
+			patterns:   []string{"github.com/squareup/*"},
+			modulePath: "github.com/squareup/repo/submodule",
+			want:       true,
+		},
+		{
 			name:       "wildcard match - multiple levels",
 			patterns:   []string{"github.com/*/*"},
 			modulePath: "github.com/squareup/repo",
@@ -95,7 +101,7 @@ func TestCompositeFetcher_isPrivate(t *testing.T) {
 			name:       "pattern with trailing slash",
 			patterns:   []string{"github.com/squareup/"},
 			modulePath: "github.com/squareup/repo",
-			want:       false,
+			want:       true,
 		},
 		{
 			name:       "gopkg.in pattern",

@@ -1,6 +1,7 @@
 package strategy //nolint:testpackage // White-box coverage is required for token and transport injection.
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/packagepolicy"
 )
 
 const (
@@ -194,6 +196,368 @@ type codeArtifactRoundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f codeArtifactRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+type recordingPackagePolicy struct {
+	decision      packagepolicy.Decision
+	err           error
+	purls         []string
+	notApplicable int
+}
+
+type blockingPackagePolicy struct {
+	mu        sync.Mutex
+	decision  packagepolicy.Decision
+	expected  int
+	callers   int
+	allJoined chan struct{}
+	release   chan struct{}
+}
+
+func (r *recordingPackagePolicy) Evaluate(_ context.Context, purl string) (packagepolicy.Decision, error) {
+	r.purls = append(r.purls, purl)
+	return r.decision, r.err
+}
+
+func (r *recordingPackagePolicy) ObserveNotApplicable(context.Context) {
+	r.notApplicable++
+}
+
+func (b *blockingPackagePolicy) Evaluate(context.Context, string) (packagepolicy.Decision, error) {
+	b.mu.Lock()
+	b.callers++
+	if b.callers == b.expected {
+		close(b.allJoined)
+	}
+	b.mu.Unlock()
+
+	<-b.release
+	return b.decision, nil
+}
+
+func (b *blockingPackagePolicy) ObserveNotApplicable(context.Context) {}
+
+func (b *blockingPackagePolicy) calls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.callers
+}
+
+func TestCodeArtifactRecordsNotApplicablePolicyRequests(t *testing.T) {
+	target, err := url.Parse("https://codeartifact.example.com")
+	assert.NoError(t, err)
+	for _, path := range []string{
+		"/npm/repository/package",
+		"/pypi/repository/simple/requests/2.32.3/requests.whl",
+		"/maven/repository/com/perplexity/tool/1.2.3/tool-1.2.3.jar",
+		"/cargo/repository/crates/serde/1.0.210",
+	} {
+		t.Run(path, func(t *testing.T) {
+			policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+			strategy := &CodeArtifact{target: target, prefix: "/codeartifact.example.com", packagePolicy: policy}
+			request := httptest.NewRequest(http.MethodGet, "/codeartifact.example.com"+path, nil)
+
+			decision, err := strategy.evaluatePackage(request)
+			assert.NoError(t, err)
+			assert.Equal(t, packagepolicy.VerdictNotApplicable, decision.Verdict)
+			assert.Equal(t, 1, policy.notApplicable)
+			assert.Equal(t, []string(nil), policy.purls)
+		})
+	}
+}
+
+func TestCodeArtifactEvaluatesEncodedScopeSeparatorAsScopedPackage(t *testing.T) {
+	for _, test := range []struct{ host, path string }{
+		{"codeartifact.example.com", "/npm/repository/@ctrl%2Ftinycolor/-/tinycolor-4.1.1.tgz"},
+		{"vpce-test.codeartifact.repositories.us-east-1.vpce.amazonaws.com", "/npm/d/example-123456789012/repository/@ctrl%2Ftinycolor/-/tinycolor-4.1.1.tgz"},
+	} {
+		t.Run(test.host, func(t *testing.T) {
+			target, err := url.Parse("https://" + test.host)
+			assert.NoError(t, err)
+			policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+			strategy := &CodeArtifact{target: target, prefix: "/" + test.host, packagePolicy: policy}
+			request := httptest.NewRequest(http.MethodGet, "/"+test.host+test.path, nil)
+
+			decision, err := strategy.evaluatePackage(request)
+			assert.NoError(t, err)
+			assert.Equal(t, packagepolicy.VerdictDeny, decision.Verdict)
+			assert.Equal(t, []string{"pkg:npm/%40ctrl/tinycolor@4.1.1"}, policy.purls)
+			assert.Equal(t, 0, policy.notApplicable)
+		})
+	}
+}
+
+func TestCodeArtifactPrivateLinkPreservesPolicyExclusions(t *testing.T) {
+	const host = "vpce-test.codeartifact.repositories.us-east-1.vpce.amazonaws.com"
+	target, err := url.Parse("https://" + host)
+	assert.NoError(t, err)
+	policy, err := packagepolicy.New(packagepolicy.Config{
+		Mode:         "enforce",
+		ExcludePURLs: []string{"pkg:npm/@private/*"},
+		OnFailure:    "deny",
+		Socket:       &packagepolicy.SocketConfig{APIURL: "https://socket.example.com", Organization: "example", Token: "dummy-token"},
+	})
+	assert.NoError(t, err)
+	strategy := &CodeArtifact{target: target, prefix: "/" + host, packagePolicy: policy}
+	request := httptest.NewRequest(http.MethodGet, "/"+host+"/npm/d/example-123456789012/repository/@private/agents/-/agents-1.0.0.tgz", nil)
+
+	decision, err := strategy.evaluatePackage(request)
+	assert.NoError(t, err)
+	assert.Equal(t, packagepolicy.VerdictNotApplicable, decision.Verdict)
+}
+
+func TestCodeArtifactDeniesUnmappableBodiesBeforeOrigin(t *testing.T) {
+	tests := []struct {
+		path   string
+		reason string
+	}{
+		{path: "/npm/repository/safe%2F..%2F..%2Fevil/-/evil-1.0.0.tgz", reason: "encoded_separator"},
+		{path: "/npm/repository/package/-/different-1.0.0.tgz", reason: "unmappable_package"},
+	}
+	for _, test := range tests {
+		t.Run(test.path, func(t *testing.T) {
+			var originRequests atomic.Int32
+			mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				originRequests.Add(1)
+			}))
+			policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow}}
+			strategy.packagePolicy = policy
+			w := httptest.NewRecorder()
+			path := codeArtifactPath(originServer, test.path)
+
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+
+			assert.Equal(t, http.StatusForbidden, w.Code)
+			assert.Equal(t, "deny", w.Header().Get("X-Cachew-Package-Policy"))
+			assert.Contains(t, w.Body.String(), test.reason)
+			assert.Equal(t, []string(nil), policy.purls)
+			assert.Equal(t, 0, policy.notApplicable)
+			assert.Equal(t, 0, tokenServer.requestCount())
+			assert.Equal(t, int32(0), originRequests.Load())
+		})
+	}
+}
+
+func TestCodeArtifactEvaluatesQueryBearingPackageRequests(t *testing.T) {
+	var originRequests atomic.Int32
+	mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		originRequests.Add(1)
+	}))
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}}
+	strategy.packagePolicy = policy
+	w := httptest.NewRecorder()
+	path := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz?download=1")
+
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, []string{"pkg:npm/package@1.2.3"}, policy.purls)
+	assert.Equal(t, 0, policy.notApplicable)
+	assert.Equal(t, 0, tokenServer.requestCount())
+	assert.Equal(t, int32(0), originRequests.Load())
+}
+
+func TestCodeArtifactHandlesPackagePolicyBeforeOriginAuthentication(t *testing.T) {
+	tests := []struct {
+		name           string
+		decision       packagepolicy.Decision
+		err            error
+		statusCode     int
+		policy         string
+		tokenRequests  int
+		originRequests int32
+	}{
+		{
+			name:       "denied package",
+			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}},
+			statusCode: http.StatusForbidden,
+			policy:     "deny",
+		},
+		{
+			name:           "pending package",
+			decision:       packagepolicy.Decision{Verdict: packagepolicy.VerdictPending, Reasons: []string{"pendingScan"}},
+			statusCode:     http.StatusOK,
+			policy:         "pending",
+			tokenRequests:  1,
+			originRequests: 1,
+		},
+		{
+			name:           "policy unavailable",
+			err:            errors.New("Socket API unavailable"),
+			statusCode:     http.StatusOK,
+			policy:         "unavailable",
+			tokenRequests:  1,
+			originRequests: 1,
+		},
+		{
+			name:       "fail-closed denial keeps the cause",
+			decision:   packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"unavailable"}},
+			err:        errors.New("Socket API unavailable"),
+			statusCode: http.StatusForbidden,
+			policy:     "deny",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			var originRequests atomic.Int32
+			mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				originRequests.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			strategy.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			policy := &recordingPackagePolicy{decision: test.decision, err: test.err}
+			strategy.packagePolicy = policy
+
+			w := httptest.NewRecorder()
+			path := "/npm/repository/chromatitle-js/-/chromatitle-js-1.0.0.tgz"
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(originServer, path), nil).WithContext(ctx))
+
+			assert.Equal(t, test.statusCode, w.Code)
+			assert.Equal(t, test.policy, w.Header().Get("X-Cachew-Package-Policy"))
+			assert.Equal(t, []string{"pkg:npm/chromatitle-js@1.0.0"}, policy.purls)
+			assert.Equal(t, test.tokenRequests, tokenServer.requestCount())
+			assert.Equal(t, test.originRequests, originRequests.Load())
+			if test.err != nil {
+				assert.Contains(t, logs.String(), test.err.Error())
+			}
+		})
+	}
+}
+
+func TestCodeArtifactCachedPackageIsStillEvaluated(t *testing.T) {
+	var originRequests atomic.Int32
+	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	})
+	mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, origin)
+	policy := &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow}}
+	strategy.packagePolicy = policy
+	path := codeArtifactPath(originServer, "/npm/repository/lodash/-/lodash-4.17.21.tgz")
+
+	for range 2 {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, testCodeArtifactBody, w.Body.String())
+	}
+	assert.Equal(t, int32(1), originRequests.Load())
+
+	assert.Equal(t, []string{"pkg:npm/lodash@4.17.21", "pkg:npm/lodash@4.17.21"}, policy.purls)
+	policy = &recordingPackagePolicy{decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"malware"}}}
+	strategy.packagePolicy = policy
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+	assert.Equal(t, "deny", w.Header().Get("X-Cachew-Package-Policy"))
+
+	assert.Equal(t, []string{"pkg:npm/lodash@4.17.21"}, policy.purls)
+	assert.Equal(t, int32(1), originRequests.Load())
+}
+
+func TestCodeArtifactPolicyControlsCacheAdmission(t *testing.T) {
+	tests := []struct {
+		name           string
+		decision       packagepolicy.Decision
+		err            error
+		header         string
+		originRequests int32
+	}{
+		{name: "pending", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictPending}, header: "pending", originRequests: 2},
+		{name: "provider error", err: errors.New("Socket API unavailable"), header: "unavailable", originRequests: 2},
+		{name: "audit pending", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictPending, Audit: true}, header: "audit-would_allow", originRequests: 1},
+		{name: "audit deny", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Audit: true}, header: "audit-would_deny", originRequests: 1},
+		{name: "audit error", decision: packagepolicy.Decision{Audit: true}, err: packagepolicy.ErrCircuitOpen, header: "audit-would_allow", originRequests: 1},
+		{name: "audit overload", decision: packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Audit: true}, err: packagepolicy.ErrOverloaded, header: "audit-would_deny", originRequests: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var originRequests atomic.Int32
+			origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				originRequests.Add(1)
+				w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+				_, _ = w.Write([]byte(testCodeArtifactBody))
+			})
+			mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, origin)
+			policy := &recordingPackagePolicy{decision: test.decision, err: test.err}
+			strategy.packagePolicy = policy
+			path := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz")
+
+			for range 2 {
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+				assert.Equal(t, http.StatusOK, w.Code)
+				assert.Equal(t, testCodeArtifactBody, w.Body.String())
+				assert.Equal(t, test.header, w.Header().Get("X-Cachew-Package-Policy"))
+			}
+
+			assert.Equal(t, test.originRequests, originRequests.Load())
+			assert.Equal(t, []string{"pkg:npm/package@1.2.3", "pkg:npm/package@1.2.3"}, policy.purls)
+		})
+	}
+}
+
+func TestCodeArtifactAuditDoesNotBlockUnmappablePackage(t *testing.T) {
+	var originRequests atomic.Int32
+	mux, originServer, _, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		_, _ = w.Write([]byte(testCodeArtifactBody))
+	}))
+	strategy.policyAudit = true
+	policy := &recordingPackagePolicy{}
+	strategy.packagePolicy = policy
+	w := httptest.NewRecorder()
+	path := codeArtifactPath(originServer, "/npm/repository/package/-/not-a-version.tgz")
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, testCodeArtifactBody, w.Body.String())
+	assert.Equal(t, "audit-would_deny", w.Header().Get("X-Cachew-Package-Policy"))
+	assert.Equal(t, int32(1), originRequests.Load())
+	assert.Equal(t, []string(nil), policy.purls)
+}
+
+func TestCodeArtifactConcurrentDeniedRequestsReachPolicyTogether(t *testing.T) {
+	const callers = 8
+	var originRequests atomic.Int32
+	mux, originServer, tokenServer, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		originRequests.Add(1)
+	}))
+	policy := &blockingPackagePolicy{
+		decision:  packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny},
+		expected:  callers,
+		allJoined: make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	strategy.packagePolicy = policy
+	path := codeArtifactPath(originServer, "/npm/repository/package/-/package-1.2.3.tgz")
+	begin := make(chan struct{})
+	results := make(chan int, callers)
+	for range callers {
+		go func() {
+			<-begin
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+			results <- w.Code
+		}()
+	}
+	close(begin)
+	select {
+	case <-policy.allJoined:
+		close(policy.release)
+	case <-time.After(time.Second):
+		close(policy.release)
+		t.Fatal("concurrent requests did not share the in-flight policy evaluation")
+	}
+
+	for range callers {
+		assert.Equal(t, http.StatusForbidden, <-results)
+	}
+	assert.Equal(t, callers, policy.calls())
+	assert.Equal(t, 0, tokenServer.requestCount())
+	assert.Equal(t, int32(0), originRequests.Load())
 }
 
 func TestCodeArtifactSanitizesOriginTransportErrors(t *testing.T) {

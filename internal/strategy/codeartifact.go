@@ -15,6 +15,7 @@ import (
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/packagepolicy"
 )
 
 const codeArtifactUsername = "aws"
@@ -27,15 +28,16 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	Target                string        `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	ProxyBaseURL          string        `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
-	Domain                string        `hcl:"domain" help:"The CodeArtifact domain name."`
-	DomainOwner           string        `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
-	Region                string        `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
-	RoleARN               string        `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
-	OriginHeaderTimeout   time.Duration `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
-	OriginReadIdleTimeout time.Duration `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
-	CredentialTimeout     time.Duration `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
+	Target                string                `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
+	ProxyBaseURL          string                `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
+	Domain                string                `hcl:"domain" help:"The CodeArtifact domain name."`
+	DomainOwner           string                `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
+	Region                string                `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
+	RoleARN               string                `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	OriginHeaderTimeout   time.Duration         `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
+	OriginReadIdleTimeout time.Duration         `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
+	CredentialTimeout     time.Duration         `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
+	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm artifact reads, including cache hits. Other formats remain unevaluated."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
@@ -49,6 +51,8 @@ type CodeArtifact struct {
 	client                *http.Client
 	logger                *slog.Logger
 	metric                codeArtifactMetricRecorder
+	packagePolicy         packagepolicy.Evaluator
+	policyAudit           bool
 	fills                 singleflight.Group
 	originReadIdleTimeout time.Duration
 }
@@ -75,7 +79,18 @@ func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredC
 	if err != nil {
 		return nil, err
 	}
-	return newCodeArtifact(ctx, config, mux, tokens, configuredCache, false)
+	strategy, err := newCodeArtifact(ctx, config, mux, tokens, configuredCache, false)
+	if err != nil {
+		return nil, err
+	}
+	if config.PackagePolicy != nil {
+		strategy.packagePolicy, err = packagepolicy.New(*config.PackagePolicy)
+		if err != nil {
+			return nil, errors.Wrap(err, "create package policy")
+		}
+		strategy.policyAudit = config.PackagePolicy.Mode == packagepolicy.ModeAudit
+	}
+	return strategy, nil
 }
 
 func newCodeArtifact(
@@ -202,11 +217,21 @@ func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mode := classifyCodeArtifactRequest(r)
 	c.metric.recordRequest(r.Context(), mode)
-	if mode != codeArtifactCacheLookup {
-		c.serveOrigin(w, r, mode)
+	decision, err := c.evaluatePackage(r)
+	if err != nil {
+		c.logger.Log(r.Context(), packagepolicy.LogLevel(err), "Package policy evaluation failed", "error", err)
+	}
+	if !packagepolicy.AllowRequest(w, decision, err) {
 		return
 	}
-	if c.serveCached(w, r) {
+	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
+		return
+	}
+	if !packagepolicy.Cacheable(decision, err) {
+		mode = codeArtifactCachePassthrough
+	}
+	if mode != codeArtifactCacheLookup {
+		c.serveOrigin(w, r, mode)
 		return
 	}
 
@@ -228,13 +253,11 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
 	rewriteMetadata := shouldRewriteCodeArtifactMetadata(c.originURL(r).Path)
-	token, err := c.tokens.Token(r.Context(), 0)
+	token, err := c.authorizationToken(r.Context())
 	if err != nil {
-		c.metric.recordAuth(r.Context(), codeArtifactAuthFailure)
-		c.writeError(w, r, errors.Wrap(err, "obtain CodeArtifact authorization"))
+		c.writeError(w, r, err)
 		return
 	}
-	c.metric.recordAuth(r.Context(), token.event)
 
 	resp, err := c.do(r, token.value)
 	if err != nil {
@@ -312,6 +335,40 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		c.logger.ErrorContext(r.Context(), "Failed to stream CodeArtifact response", "error", err)
 	}
+}
+
+func (c *CodeArtifact) authorizationToken(ctx context.Context) (codeArtifactToken, error) {
+	token, err := c.tokens.Token(ctx, 0)
+	if err != nil {
+		c.metric.recordAuth(ctx, codeArtifactAuthFailure)
+		return codeArtifactToken{}, errors.Wrap(err, "obtain CodeArtifact authorization")
+	}
+	c.metric.recordAuth(ctx, token.event)
+	return token, nil
+}
+
+func (c *CodeArtifact) evaluatePackage(r *http.Request) (packagepolicy.Decision, error) {
+	if c.packagePolicy == nil || r.Method != http.MethodGet {
+		return packagepolicy.Decision{}, nil
+	}
+	origin := c.originURL(r)
+	purl, err := packagepolicy.PackageURLForCodeArtifact(&origin)
+	switch {
+	case errors.Is(err, packagepolicy.ErrNotApplicable):
+		c.packagePolicy.ObserveNotApplicable(r.Context())
+		return packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil
+	case err != nil:
+		reason := "unmappable_package"
+		if errors.Is(err, packagepolicy.ErrEncodedSeparator) {
+			reason = "encoded_separator"
+		}
+		return packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{reason}, Audit: c.policyAudit}, errors.Wrap(err, "evaluate package policy")
+	}
+	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
+	if err != nil {
+		return decision, errors.Wrap(err, "evaluate package policy")
+	}
+	return decision, nil
 }
 
 func (c *CodeArtifact) rewriteOriginMetadata(
