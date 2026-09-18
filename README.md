@@ -249,10 +249,16 @@ CodeArtifact `HEAD` requests are never evaluated and never admit a body to the c
 
 Every eligible `GET`, including an artifact-cache hit, consults the verdict
 cache. An unexpired definitive result avoids Socket; after expiry or eviction,
-Cachew waits for a new result before returning the body. This is a fresh-policy
-check within the configured TTL, not a guarantee that Socket has freshly scanned
-the artifact. Socket can return its latest available analysis, with unresolved
-or incomplete analysis treated as pending by Cachew.
+Cachew waits for a new result before returning the body. Socket requests explicitly
+use `poll=false` to return the current known state without waiting for pending
+analysis to complete. An allow reflects Socket's available analysis, not proof of
+a fresh or completed scan. Explicit `pendingScan` and `notFound` results still
+follow `on-failure`; setting it to `deny` does not make available-analysis allows
+wait for a fresh scan.
+
+Available-analysis allow/deny results retain `verdict-ttl` (default `10m`), so an
+allow can delay reevaluation for that duration even if additional Socket analysis
+finishes sooner. Requests remain bounded by `socket.timeout` (default `200ms`).
 
 Pending analysis (`pendingScan` or `notFound`) and provider errors are reused for
 `pending-ttl` to avoid repeatedly calling Socket for the same unresolved package.
