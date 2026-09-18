@@ -40,6 +40,7 @@ func (m *mockArtifactoryServer) handleRequest(w http.ResponseWriter, r *http.Req
 	m.lastRequestPath = r.URL.Path
 	m.lastHeaders = r.Header.Clone()
 
+	w.Header().Set("Cache-Control", "public, max-age=60")
 	w.WriteHeader(m.responseStatus)
 	_, _ = w.Write([]byte(m.responseContent))
 }

@@ -110,6 +110,22 @@ hermit {}
 
 Caches artifacts from JFrog Artifactory with host-based or path-based routing.
 
+Only complete, anonymous `GET` responses with explicit positive `max-age`,
+`s-maxage`, or `Expires` freshness are cached. Origin age and fetch time reduce
+that lifetime. `private`, `no-cache`, `no-store`, cookies, and unsupported `Vary`
+fields prevent storage. `Accept` and `Accept-Encoding` variants have separate
+keys. Requests with credentials, cookies, cache directives, ranges or conditional
+headers, and `HEAD` requests go to Artifactory; response status and headers are
+preserved. Redirects are returned to the client without forwarding credentials to
+another server. Origin requests have a one-minute deadline.
+
+This replaces unconditional caching under the backend default TTL. Existing
+entries use a different key namespace and are no longer read. Deployments whose
+origins omit freshness, or whose clients always authenticate, will send more
+requests to Artifactory. Set appropriate origin freshness for anonymous reads to
+benefit from caching; this adapter does not perform origin revalidation.
+
+
 ```hcl
 artifactory "example.jfrog.io" {
   target = "https://example.jfrog.io"

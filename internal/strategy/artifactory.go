@@ -7,12 +7,12 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/errors"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/handler"
 )
 
 func RegisterArtifactory(r *Registry) {
@@ -59,20 +59,16 @@ func NewArtifactory(ctx context.Context, config ArtifactoryConfig, cache cache.C
 		return nil, errors.Errorf("invalid target URL: %w", err)
 	}
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableCompression = true
 	a := &Artifactory{
 		target: u,
 		cache:  cache,
-		client: &http.Client{},
+		client: &http.Client{Transport: transport, Timeout: time.Minute, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 		logger: logging.FromContext(ctx),
 	}
 
-	hdlr := handler.New(a.client, cache).
-		CacheKey(func(r *http.Request) string {
-			return a.buildTargetURL(r).String()
-		}).
-		Transform(func(r *http.Request) (*http.Request, error) {
-			return a.transformRequest(r)
-		})
+	hdlr := http.HandlerFunc(a.serveHTTP)
 
 	// Register path-based route (for backward compatibility)
 	a.registerPathBased(ctx, u, hdlr, mux)
@@ -112,7 +108,7 @@ func (a *Artifactory) String() string { return "artifactory:" + a.target.Host + 
 func (a *Artifactory) transformRequest(r *http.Request) (*http.Request, error) {
 	targetURL := a.buildTargetURL(r)
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL.String(), nil)
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), nil)
 	if err != nil {
 		return nil, errors.Errorf("failed to create request: %w", err)
 	}
@@ -130,6 +126,7 @@ func (a *Artifactory) transformRequest(r *http.Request) (*http.Request, error) {
 // buildTargetURL constructs the target URL from the incoming request.
 func (a *Artifactory) buildTargetURL(r *http.Request) *url.URL {
 	var path string
+	rawPath := r.URL.EscapedPath()
 
 	// Dynamically detect routing mode based on request
 	// If request Host matches one of our configured hosts, use host-based routing
@@ -150,9 +147,8 @@ func (a *Artifactory) buildTargetURL(r *http.Request) *url.URL {
 		// Strip "/global.example.jfrog.io" -> "/libs-release/foo.jar"
 		// Proxy to: GET https://global.example.jfrog.io/libs-release/foo.jar
 		path = r.URL.Path
-		if len(path) >= len(a.prefix) {
-			path = path[len(a.prefix):]
-		}
+		path = strings.TrimPrefix(path, "/"+a.target.Host+a.target.Path)
+		rawPath = strings.TrimPrefix(rawPath, a.prefix)
 		if path == "" {
 			path = "/"
 		}
@@ -163,6 +159,7 @@ func (a *Artifactory) buildTargetURL(r *http.Request) *url.URL {
 
 	targetURL := *a.target
 	targetURL.Path = a.target.Path + path
+	targetURL.RawPath = a.target.EscapedPath() + rawPath
 	targetURL.RawQuery = r.URL.RawQuery
 
 	a.logger.Debug("buildTargetURL result", "url", targetURL)
