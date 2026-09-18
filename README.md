@@ -129,6 +129,7 @@ and `Expires`. Explicit stale or invalid freshness is never overridden. Rewritte
 package metadata is excluded. Origin `Age` and `Date` reduce the budget, and cache
 hits retain the origin policy and validators while reporting their current age.
 Disabling or shortening the option also restricts existing fallback entries.
+Requests with `Cache-Control` or `Pragma` directives bypass artifact reuse and storage.
 This is an operator-selected policy: enabling it can delay visibility of artifact
 removal or access revocation by up to the configured lifetime.
 

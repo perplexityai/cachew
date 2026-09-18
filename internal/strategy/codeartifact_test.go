@@ -2137,9 +2137,15 @@ func TestCodeArtifactImmutableFallbackWarmReadAndDisable(t *testing.T) {
 		assert.Equal(t, "", w.Header().Get(codeArtifactFallbackLifetimeHeader))
 	}
 	assert.Equal(t, int32(1), calls.Load())
+	for _, directive := range []string{"no-cache", "no-store", "max-age=0"} {
+		req := httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx)
+		req.Header.Set("Cache-Control", directive)
+		mux.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	assert.Equal(t, int32(4), calls.Load(), "request cache directives must reach the origin")
 	strategy.immutableFallbackTTL = 0
 	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx))
-	assert.Equal(t, int32(2), calls.Load(), "disabling fallback must also bypass retained fallback entries")
+	assert.Equal(t, int32(5), calls.Load(), "disabling fallback must also bypass retained fallback entries")
 }
 
 func TestCodeArtifactImmutableFallbackRejectsInvalidConfig(t *testing.T) {

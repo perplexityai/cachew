@@ -26,6 +26,9 @@ const (
 )
 
 func classifyCodeArtifactRequest(r *http.Request) codeArtifactCacheMode {
+	if len(r.Header.Values("Cache-Control")) != 0 || len(r.Header.Values("Pragma")) != 0 {
+		return codeArtifactCachePassthrough
+	}
 	if r.Method != http.MethodGet || r.Header.Get("Range") != "" || r.URL.RawQuery != "" {
 		return codeArtifactCachePassthrough
 	}
