@@ -146,7 +146,7 @@ func codeArtifactCacheEntry(headers http.Header, now time.Time, fallback time.Du
 	}
 	_, hasMaxAge := directives["max-age"]
 	_, hasSharedMaxAge := directives["s-maxage"]
-	useFallback := !hasMaxAge && !hasSharedMaxAge && headers.Get("Expires") == "" && fallback > 0
+	useFallback := !hasMaxAge && !hasSharedMaxAge && len(headers.Values("Expires")) == 0 && fallback > 0
 	if useFallback {
 		directives["max-age"] = strconv.FormatInt(int64(fallback/time.Second), 10)
 	}
