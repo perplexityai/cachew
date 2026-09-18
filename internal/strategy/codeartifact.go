@@ -28,6 +28,7 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
+	ImmutableFallbackTTL  time.Duration         `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
 	Target                string                `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
 	ProxyBaseURL          string                `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
 	Domain                string                `hcl:"domain" help:"The CodeArtifact domain name."`
@@ -43,6 +44,7 @@ type CodeArtifactConfig struct {
 // CodeArtifact caches origin-declared immutable responses and passes all other
 // authenticated reads through.
 type CodeArtifact struct {
+	immutableFallbackTTL  time.Duration
 	target                *url.URL
 	proxyBase             *url.URL
 	prefix                string
@@ -125,6 +127,7 @@ func newCodeArtifact(
 		logger:                logging.FromContext(ctx),
 		metric:                newCodeArtifactMetrics(),
 		originReadIdleTimeout: config.OriginReadIdleTimeout,
+		immutableFallbackTTL:  config.ImmutableFallbackTTL,
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
@@ -150,6 +153,9 @@ func codeArtifactConfigWithDefaults(config CodeArtifactConfig) CodeArtifactConfi
 }
 
 func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, *url.URL, error) {
+	if config.ImmutableFallbackTTL < 0 || config.ImmutableFallbackTTL > 24*time.Hour || (config.ImmutableFallbackTTL > 0 && config.ImmutableFallbackTTL < time.Second) {
+		return nil, nil, errors.New("codeartifact: immutable-fallback-ttl must be zero or between 1s and 24h")
+	}
 	timeouts := []struct {
 		name  string
 		value time.Duration
@@ -284,6 +290,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	}
 	responseHeaders := endToEndHeaders(resp.Header)
 	responseHeaders.Del(codeArtifactOriginValidatorsHeader)
+	responseHeaders.Del(codeArtifactFallbackLifetimeHeader)
 	responseHeaders.Del(cache.ExpirationKey)
 	if location := responseHeaders.Get("Location"); location != "" {
 		rewritten, ok := c.rewriteSameOriginLocation(resp.Request.URL, location)
@@ -312,6 +319,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 			responseHeaders = endToEndHeaders(resp.Header)
 		}
 	}
+	responseHeaders.Del(codeArtifactFallbackLifetimeHeader)
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
 			c.logger.ErrorContext(r.Context(), "Failed to close CodeArtifact response", "error", err)
