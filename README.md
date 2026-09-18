@@ -158,6 +158,17 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
 CodeArtifact URLs in npm, Cargo, NuGet, and Swift package metadata so clients
 continue downloading through the unauthenticated proxy.
 
+Metadata requests to npm, Cargo, and NuGet origins negotiate gzip independently
+of the client. Cachew decodes the response before rewriting, enforcing the 64 MiB
+metadata limit on decompressed bytes, and compresses rewritten metadata when
+the client's `Accept-Encoding` permits gzip. Responses vary on both the origin's
+existing dimensions and `Accept-Encoding`; upstream validators are not reused
+for rewritten bytes. `HEAD` responses omit the transformed length and body.
+Archive and range requests retain their existing encoding behavior. Swift
+origin requests retain identity encoding because extensionless URLs can return
+either JSON metadata or archives; rewritten Swift metadata can still be gzipped
+for clients. Compression does not change metadata freshness or cache admission.
+
 The role needs `codeartifact:GetAuthorizationToken` and its underlying principal
 needs `sts:GetServiceBearerToken`. Repository read permissions remain governed by
 the CodeArtifact resource policy.
