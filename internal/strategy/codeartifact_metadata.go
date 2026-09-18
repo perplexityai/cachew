@@ -14,6 +14,8 @@ import (
 const (
 	maxCodeArtifactMetadataBytes = 64 << 20
 	codeArtifactCargoFormat      = "cargo"
+	codeArtifactNPMFormat        = "npm"
+	codeArtifactPyPIFormat       = "pypi"
 	codeArtifactSwiftFormat      = "swift"
 )
 
@@ -22,7 +24,7 @@ func shouldRewriteCodeArtifactMetadata(path string) bool {
 	switch codeArtifactPackageFormat(lowerPath) {
 	case codeArtifactCargoFormat:
 		return strings.HasSuffix(lowerPath, "/config.json")
-	case "npm":
+	case codeArtifactNPMFormat:
 		return !strings.Contains(lowerPath, "/-/") || !strings.HasSuffix(lowerPath, ".tgz")
 	case "nuget":
 		return !strings.HasSuffix(lowerPath, ".nupkg") && !strings.HasSuffix(lowerPath, ".snupkg")
