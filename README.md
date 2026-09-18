@@ -460,7 +460,9 @@ so they are outside this HTTP proxy strategy.
 #### Optional npm metadata cache
 
 A CodeArtifact strategy can opt specific repositories into a short-lived,
-process-local cache of rewritten npm package metadata:
+process-local cache of rewritten npm package metadata. Add this block inside the
+`codeartifact` strategy for the desired origin; repository names are relative to
+that origin, and cache keys retain the full URL:
 
 ```hcl
 # Inside codeartifact { ... }
@@ -480,10 +482,14 @@ or insertion; the earliest-expiring entries are evicted when space is needed.
 Each process warms independently; this cache does not use shared disk or S3.
 
 Only package metadata (`react`, `@sanity/vision`, or `@sanity%2Fvision`) in the
-configured repositories qualifies. Version-specific documents, tarballs, other
+configured repositories qualifies. VPC endpoint origins (`vpce.amazonaws.com`
+and `vpce.amazonaws.com.cn`) also recognize
+`/npm/d/domain-owner/repository/package`; the domain-owner routing segment stays
+in the key so domains remain isolated. Version-specific documents, tarballs, other
 formats, and query requests retain the existing behavior. Full/abbreviated `Accept`
 variants and gzip/identity responses remain separate. Package policy runs before
-cache access. Cookies, ranges and conditional requests bypass this cache.
+cache access. Cookies, ranges and conditional requests bypass cache reuse and
+storage, while authoritative failures still invalidate retained variants.
 
 Freshness never slides on a hit and starts at fetch initiation. Origin age and
 shorter explicit freshness reduce the budget. `no-cache` or `max-age=0` requests
@@ -492,8 +498,10 @@ oversized, private, `no-store`, `no-cache`, cookie-bearing, and unsupported `Var
 responses are not retained. Forced refresh invalidates the previous representation
 before fetching, including on an origin error. A final 401, 403, or 404 also
 invalidates every representation of that package and prevents older concurrent
-fills from republishing it. Stale data is never served as a fallback. Downstream cacheable metadata is marked `private, no-cache`, so clients
-must return to Cachew rather than extending its freshness window.
+fills from republishing it, including failures on bypassed requests. Stale data
+is never served as a fallback. Downstream cacheable metadata is marked
+`private, no-cache`, so clients must return to Cachew rather than extending its
+freshness window.
 
 Concurrent equivalent requests share a complete successful response, with
 independent client writes. Canceling a waiter does not cancel the service-owned

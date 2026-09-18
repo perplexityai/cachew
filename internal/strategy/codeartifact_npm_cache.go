@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,6 +22,8 @@ type NPMMetadataCacheConfig struct {
 	MaxBytes      int           `hcl:"max-bytes" help:"Maximum retained metadata bytes, from 1MiB through 1GiB."`
 	MaxConcurrent int           `hcl:"max-concurrent,optional" help:"Maximum concurrent metadata fills; default 4, maximum 32."`
 }
+
+var npmMetadataRoutingSegment = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 var npmMetadataPath = regexp.MustCompile(`^/npm/([A-Za-z0-9][A-Za-z0-9._-]*)/((?:@[a-z0-9][a-z0-9._-]*(?:/|%2[fF]))?[a-z0-9][a-z0-9._-]*)$`)
 
@@ -44,6 +47,7 @@ type npmMetadataFlight struct {
 
 type npmMetadataCache struct {
 	ctx          context.Context
+	now          func() time.Time
 	config       NPMMetadataCacheConfig
 	repositories map[string]bool
 	mu           sync.Mutex
@@ -69,7 +73,7 @@ func validateNPMMetadataCache(config *NPMMetadataCacheConfig) error {
 		return errors.New("npm-metadata-cache: repositories must not be empty")
 	}
 	for _, repo := range config.Repositories {
-		if parts := npmMetadataPath.FindStringSubmatch("/npm/" + repo + "/package"); len(parts) != 3 || parts[1] != repo {
+		if !npmMetadataRoutingSegment.MatchString(repo) {
 			return errors.Errorf("npm-metadata-cache: invalid repository %q", repo)
 		}
 	}
@@ -80,7 +84,7 @@ func newNPMMetadataCache(ctx context.Context, config *NPMMetadataCacheConfig) *n
 	if config == nil {
 		return nil
 	}
-	c := &npmMetadataCache{ctx: ctx, config: *config, repositories: map[string]bool{}, entries: map[string]*npmMetadataResponse{}, flights: map[string]*npmMetadataFlight{}}
+	c := &npmMetadataCache{ctx: ctx, now: time.Now, config: *config, repositories: map[string]bool{}, entries: map[string]*npmMetadataResponse{}, flights: map[string]*npmMetadataFlight{}}
 	if c.config.MaxConcurrent == 0 {
 		c.config.MaxConcurrent = 4
 	}
@@ -96,31 +100,35 @@ func (c *CodeArtifact) serveNPMMetadata(w http.ResponseWriter, r *http.Request) 
 		return false
 	}
 	origin := c.originURL(r)
-	parts := npmMetadataPath.FindStringSubmatch(origin.EscapedPath())
-	if len(parts) != 3 || !m.repositories[parts[1]] {
+	if !m.repositories[npmMetadataRepository(origin)] {
 		return false
 	}
+	resource := origin.Scheme + "://" + origin.Host + origin.Path
+	key := origin.String() + "\nAccept=" + strings.Join(r.Header.Values("Accept"), ",") + "\nGzip=" + strconv.FormatBool(codeArtifactGzipAccepted(r.Header))
 	bypass := false
 	for _, name := range []string{"Cookie", "Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Range"} {
 		bypass = bypass || len(r.Header.Values(name)) != 0
 	}
 	directives, ok := parseCodeArtifactCacheControl(r.Header.Values("Cache-Control"))
 	_, noStore := directives["no-store"]
+	_, noCache := directives["no-cache"]
+	force := len(directives) != 0 || r.Header.Get("Pragma") != ""
 	if bypass || !ok || noStore {
-		c.serveOrigin(w, r, codeArtifactCachePassthrough)
+		if force && (!noStore || noCache || directives["max-age"] == "0") {
+			m.forget(key)
+		}
+		c.serveOrigin(&npmMetadataInvalidationWriter{ResponseWriter: w, cache: m, resource: resource}, r, codeArtifactCachePassthrough)
 		return true
 	}
-	force := len(directives) != 0 || r.Header.Get("Pragma") != ""
-	key := origin.String() + "\nAccept=" + strings.Join(r.Header.Values("Accept"), ",") + "\nGzip=" + strconv.FormatBool(codeArtifactGzipAccepted(r.Header))
 	for {
-		response, flight, owner, busy := m.lookup(key, origin.Scheme+"://"+origin.Host+origin.Path, force)
+		response, flight, owner, busy := m.lookup(key, resource, force)
 		if busy {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "metadata fetch capacity exhausted", http.StatusServiceUnavailable)
 			return true
 		}
 		if response != nil {
-			if err := response.serve(w); err != nil {
+			if err := response.serve(w, m.now()); err != nil {
 				c.logger.ErrorContext(r.Context(), "Failed to serve npm metadata", "error", err)
 			}
 			return true
@@ -133,8 +141,8 @@ func (c *CodeArtifact) serveNPMMetadata(w http.ResponseWriter, r *http.Request) 
 		case <-r.Context().Done():
 			return true
 		case <-flight.done:
-			if owner || (flight.reusable && time.Now().Before(flight.response.expires)) {
-				if err := flight.response.serve(w); err != nil {
+			if owner || (flight.reusable && m.now().Before(flight.response.expires)) {
+				if err := flight.response.serve(w, m.now()); err != nil {
 					c.logger.ErrorContext(r.Context(), "Failed to serve npm metadata", "error", err)
 				}
 				return true
@@ -143,11 +151,58 @@ func (c *CodeArtifact) serveNPMMetadata(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func npmMetadataRepository(origin url.URL) string {
+	path := origin.EscapedPath()
+	host := strings.ToLower(origin.Hostname())
+	if strings.HasSuffix(host, ".vpce.amazonaws.com") || strings.HasSuffix(host, ".vpce.amazonaws.com.cn") {
+		remainder, ok := strings.CutPrefix(path, "/npm/d/")
+		if !ok {
+			return ""
+		}
+		domain, packagePath, ok := strings.Cut(remainder, "/")
+		if !ok || !npmMetadataRoutingSegment.MatchString(domain) {
+			return ""
+		}
+		path = "/npm/" + packagePath
+	}
+	parts := npmMetadataPath.FindStringSubmatch(path)
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[1]
+}
+
+type npmMetadataInvalidationWriter struct {
+	http.ResponseWriter
+	cache    *npmMetadataCache
+	resource string
+}
+
+func (w *npmMetadataInvalidationWriter) WriteHeader(status int) {
+	if npmMetadataAuthoritativeFailure(status) {
+		w.cache.invalidateResource(w.resource)
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func npmMetadataAuthoritativeFailure(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound
+}
+
+func (m *npmMetadataCache) forget(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.remove(key)
+	if flight := m.flights[key]; flight != nil {
+		flight.invalidated = true
+	}
+}
+
 func (m *npmMetadataCache) lookup(key, resource string, force bool) (*npmMetadataResponse, *npmMetadataFlight, bool, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if entry := m.entries[key]; entry != nil {
-		if !force && time.Now().Before(entry.expires) {
+		if !force && m.now().Before(entry.expires) {
 			return entry, nil, false, false
 		}
 		m.remove(key)
@@ -165,17 +220,17 @@ func (m *npmMetadataCache) lookup(key, resource string, force bool) (*npmMetadat
 
 func (c *CodeArtifact) fillNPMMetadata(key string, r *http.Request, flight *npmMetadataFlight) {
 	m := c.npmMetadata
-	started := time.Now()
+	started := m.now()
 	ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
 	defer cancel()
 	capture := &npmMetadataCapture{headers: make(http.Header)}
 	c.serveOrigin(capture, r.WithContext(ctx), codeArtifactCachePassthrough)
-	response := &npmMetadataResponse{headers: capture.headers.Clone(), status: capture.status, body: bytes.Clone(capture.body.Bytes()), stored: time.Now()}
+	response := &npmMetadataResponse{headers: capture.headers.Clone(), status: capture.status, body: bytes.Clone(capture.body.Bytes()), stored: m.now()}
 	if response.status == 0 {
 		response.status = http.StatusOK
 	}
 	if capture.failed {
-		response = &npmMetadataResponse{headers: make(http.Header), status: http.StatusBadGateway, body: []byte("metadata response exceeds size limit\n"), stored: time.Now()}
+		response = &npmMetadataResponse{headers: make(http.Header), status: http.StatusBadGateway, body: []byte("metadata response exceeds size limit\n"), stored: m.now()}
 	}
 	response.resource = flight.resource
 	response.expires = npmMetadataExpiry(response, started, m.config.TTL)
@@ -186,19 +241,19 @@ func (c *CodeArtifact) fillNPMMetadata(key string, r *http.Request, flight *npmM
 			response.size += len(value)
 		}
 	}
-	reusable := response.status == http.StatusOK && time.Now().Before(response.expires) && response.size <= m.config.MaxBytes && !capture.failed
+	reusable := response.status == http.StatusOK && m.now().Before(response.expires) && response.size <= m.config.MaxBytes && !capture.failed
 	m.complete(key, flight, response, reusable)
 }
 
 func (m *npmMetadataCache) complete(key string, flight *npmMetadataFlight, response *npmMetadataResponse, reusable bool) {
 	m.mu.Lock()
-	if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == http.StatusNotFound {
-		m.invalidate(response.resource)
+	if npmMetadataAuthoritativeFailure(response.status) {
+		m.invalidateLocked(response.resource)
 	}
 	reusable = reusable && !flight.invalidated
 	if reusable {
 		for key, entry := range m.entries {
-			if !time.Now().Before(entry.expires) {
+			if !m.now().Before(entry.expires) {
 				m.remove(key)
 			}
 		}
@@ -221,7 +276,13 @@ func (m *npmMetadataCache) complete(key string, flight *npmMetadataFlight, respo
 	m.mu.Unlock()
 }
 
-func (m *npmMetadataCache) invalidate(resource string) {
+func (m *npmMetadataCache) invalidateResource(resource string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.invalidateLocked(resource)
+}
+
+func (m *npmMetadataCache) invalidateLocked(resource string) {
 	for key, entry := range m.entries {
 		if entry.resource == resource {
 			m.remove(key)
@@ -287,7 +348,7 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
-func (r *npmMetadataResponse) serve(w http.ResponseWriter) error {
+func (r *npmMetadataResponse) serve(w http.ResponseWriter, now time.Time) error {
 	headers := r.headers.Clone()
 	if r.status == http.StatusOK && !r.expires.IsZero() {
 		headers.Set("Cache-Control", "private, no-cache")
@@ -300,7 +361,7 @@ func (r *npmMetadataResponse) serve(w http.ResponseWriter) error {
 	if date, err := http.ParseTime(headers.Get("Date")); err == nil {
 		age = max(age, int64(r.stored.Sub(date)/time.Second))
 	}
-	headers.Set("Age", strconv.FormatInt(max(0, age)+max(0, int64(time.Since(r.stored)/time.Second)), 10))
+	headers.Set("Age", strconv.FormatInt(max(0, age)+max(0, int64(now.Sub(r.stored)/time.Second)), 10))
 	copyHeaders(w.Header(), headers)
 	w.WriteHeader(r.status)
 	_, err = w.Write(r.body) //nolint:gosec // G705: proxy responses retain their content type; successful metadata is validated JSON.
