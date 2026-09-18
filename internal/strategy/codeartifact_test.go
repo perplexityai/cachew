@@ -2077,8 +2077,9 @@ func TestCodeArtifactRewritesSameOriginAndFollowsCrossOriginRedirects(t *testing
 func TestCodeArtifactImmutableFallbackFreshness(t *testing.T) {
 	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
-		name, policy, age, expires string
-		fallback, want             time.Duration
+		name, policy, age string
+		expires           []string
+		fallback, want    time.Duration
 	}{
 		{name: "disabled", policy: "public, immutable"},
 		{name: "enabled", policy: "public, immutable", fallback: time.Hour, want: time.Hour},
@@ -2088,7 +2089,10 @@ func TestCodeArtifactImmutableFallbackFreshness(t *testing.T) {
 		{name: "explicit stale", policy: "public, immutable, max-age=0", fallback: time.Hour},
 		{name: "shared stale", policy: "public, immutable, max-age=60, s-maxage=0", fallback: time.Hour},
 		{name: "malformed", policy: "public, immutable, max-age=bad", fallback: time.Hour},
-		{name: "expires", policy: "public, immutable", expires: now.Add(-time.Hour).Format(http.TimeFormat), fallback: time.Hour},
+		{name: "expires", policy: "public, immutable", expires: []string{now.Add(-time.Hour).Format(http.TimeFormat)}, fallback: time.Hour},
+		{name: "empty expires", policy: "public, immutable", expires: []string{""}, fallback: time.Hour},
+		{name: "invalid expires", policy: "public, immutable", expires: []string{"invalid"}, fallback: time.Hour},
+		{name: "empty first expires", policy: "public, immutable", expires: []string{"", now.Add(-time.Hour).Format(http.TimeFormat)}, fallback: time.Hour},
 		{name: "mutable", policy: "public", fallback: time.Hour},
 		{name: "private", policy: "public, immutable, private", fallback: time.Hour},
 		{name: "no store", policy: "public, immutable, no-store", fallback: time.Hour},
@@ -2100,8 +2104,8 @@ func TestCodeArtifactImmutableFallbackFreshness(t *testing.T) {
 			if test.age != "" {
 				headers.Set("Age", test.age)
 			}
-			if test.expires != "" {
-				headers.Set("Expires", test.expires)
+			if test.expires != nil {
+				headers["Expires"] = test.expires
 			}
 			stored, ttl, _, ok := codeArtifactCacheEntry(headers, now, test.fallback)
 			assert.Equal(t, test.want > 0, ok)
