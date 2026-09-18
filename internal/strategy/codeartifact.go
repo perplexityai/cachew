@@ -377,17 +377,23 @@ func (c *CodeArtifact) rewriteOriginMetadata(
 	r *http.Request,
 	rewrite bool,
 ) (http.Header, error) {
-	if !rewrite || resp.StatusCode != http.StatusOK {
+	if !rewrite {
 		return headers, nil
 	}
 	originPath := c.originURL(r).Path
+	if isCodeArtifactSwiftArchiveResponse(originPath, headers) {
+		return headers, nil
+	}
+	if err := decodeCodeArtifactMetadata(resp, headers, r.Method); err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return headers, nil
+	}
 	if !isCodeArtifactJSONResponse(originPath, headers) {
-		if isCodeArtifactSwiftArchiveResponse(originPath, headers) {
-			return headers, nil
-		}
 		return nil, errors.New("CodeArtifact package metadata is not JSON")
 	}
-	return c.rewriteMetadataResponse(resp, headers, r.Method, originPath)
+	return c.rewriteMetadataResponse(resp, headers, r, originPath)
 }
 
 func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error) {
