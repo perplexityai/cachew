@@ -977,7 +977,7 @@ func TestCodeArtifactRejectsUnsafeSharedCachePolicies(t *testing.T) {
 				"Vary":          {test.vary},
 				"Set-Cookie":    {test.setCookie},
 			}
-			_, _, _, cacheable := codeArtifactCacheEntry(headers, time.Now())
+			_, _, _, cacheable := codeArtifactCacheEntry(headers, time.Now(), 0)
 			assert.False(t, cacheable)
 		})
 	}
@@ -989,7 +989,7 @@ func TestCodeArtifactUsesRemainingSharedFreshness(t *testing.T) {
 		"Cache-Control": {"public, max-age=3600, s-maxage=600, immutable"},
 		"Age":           {"120"},
 	}
-	_, ttl, _, cacheable := codeArtifactCacheEntry(headers, now)
+	_, ttl, _, cacheable := codeArtifactCacheEntry(headers, now, 0)
 
 	assert.True(t, cacheable)
 	assert.Equal(t, 8*time.Minute, ttl)
@@ -2072,4 +2072,87 @@ func TestCodeArtifactRewritesSameOriginAndFollowsCrossOriginRedirects(t *testing
 		codeArtifactRedirectSameOrigin,
 		codeArtifactRedirectCrossOrigin,
 	}, recorded.redirect)
+}
+
+func TestCodeArtifactImmutableFallbackFreshness(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name, policy, age, expires string
+		fallback, want             time.Duration
+	}{
+		{name: "disabled", policy: "public, immutable"},
+		{name: "enabled", policy: "public, immutable", fallback: time.Hour, want: time.Hour},
+		{name: "remaining age", policy: "public, immutable", age: "120", fallback: time.Hour, want: 58 * time.Minute},
+		{name: "already old", policy: "public, immutable", age: "3600", fallback: time.Hour},
+		{name: "explicit wins", policy: "public, immutable, max-age=60", fallback: time.Hour, want: time.Minute},
+		{name: "explicit stale", policy: "public, immutable, max-age=0", fallback: time.Hour},
+		{name: "shared stale", policy: "public, immutable, max-age=60, s-maxage=0", fallback: time.Hour},
+		{name: "malformed", policy: "public, immutable, max-age=bad", fallback: time.Hour},
+		{name: "expires", policy: "public, immutable", expires: now.Add(-time.Hour).Format(http.TimeFormat), fallback: time.Hour},
+		{name: "mutable", policy: "public", fallback: time.Hour},
+		{name: "private", policy: "public, immutable, private", fallback: time.Hour},
+		{name: "no store", policy: "public, immutable, no-store", fallback: time.Hour},
+		{name: "no cache", policy: "public, immutable, no-cache", fallback: time.Hour},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			headers := http.Header{"Cache-Control": {test.policy}, "Date": {now.Format(http.TimeFormat)}}
+			if test.age != "" {
+				headers.Set("Age", test.age)
+			}
+			if test.expires != "" {
+				headers.Set("Expires", test.expires)
+			}
+			stored, ttl, _, ok := codeArtifactCacheEntry(headers, now, test.fallback)
+			assert.Equal(t, test.want > 0, ok)
+			assert.Equal(t, test.want, ttl)
+			if ok {
+				served := codeArtifactOriginHeaders(stored, now.Add(10*time.Second))
+				assert.Equal(t, test.policy, served.Get("Cache-Control"))
+				assert.Equal(t, "", served.Get(codeArtifactFallbackLifetimeHeader))
+				assert.NotEqual(t, "", served.Get("Age"))
+			}
+		})
+	}
+}
+
+func TestCodeArtifactImmutableFallbackWarmReadAndDisable(t *testing.T) {
+	var calls atomic.Int32
+	origin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "public, immutable")
+		w.Header().Set("ETag", testCodeArtifactETag)
+		_, _ = io.WriteString(w, testCodeArtifactBody)
+	})
+	mux, server, _, strategy, ctx := newTestCachingCodeArtifact(t, origin)
+	strategy.immutableFallbackTTL = time.Hour
+	requestURL := codeArtifactPath(server, "/npm/repository/package/-/package-1.2.3.tgz")
+	for range 2 {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx))
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, testCodeArtifactBody, w.Body.String())
+		assert.Equal(t, testCodeArtifactETag, w.Header().Get("ETag"))
+		assert.Equal(t, "public, immutable", w.Header().Get("Cache-Control"))
+		assert.Equal(t, "", w.Header().Get(codeArtifactFallbackLifetimeHeader))
+	}
+	assert.Equal(t, int32(1), calls.Load())
+	for _, directive := range []string{"no-cache", "no-store", "max-age=0"} {
+		req := httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx)
+		req.Header.Set("Cache-Control", directive)
+		mux.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	assert.Equal(t, int32(4), calls.Load(), "request cache directives must reach the origin")
+	strategy.immutableFallbackTTL = 0
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, requestURL, nil).WithContext(ctx))
+	assert.Equal(t, int32(5), calls.Load(), "disabling fallback must also bypass retained fallback entries")
+}
+
+func TestCodeArtifactImmutableFallbackRejectsInvalidConfig(t *testing.T) {
+	for _, ttl := range []time.Duration{-time.Second, time.Millisecond, 25 * time.Hour} {
+		config := testCodeArtifactConfig("https://example.com")
+		config.ImmutableFallbackTTL = ttl
+		_, _, err := validateCodeArtifactConfig(config, false)
+		assert.Error(t, err)
+	}
 }
