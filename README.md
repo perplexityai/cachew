@@ -122,6 +122,16 @@ Proxies read-only package requests to an AWS CodeArtifact repository. Cachew
 assumes the configured IAM role and refreshes CodeArtifact authorization tokens
 without exposing them to clients. Requests use host-based routing.
 
+CodeArtifact deployments may opt into `immutable-fallback-ttl = "1h"` (allowed:
+1 second through 24 hours; default `0`, disabled). This supplies a local freshness
+budget only for `public, immutable` artifacts that omit both `max-age`/`s-maxage`
+and `Expires`. Explicit stale or invalid freshness is never overridden. Rewritten
+package metadata is excluded. Origin `Age` and `Date` reduce the budget, and cache
+hits retain the origin policy and validators while reporting their current age.
+Disabling or shortening the option also restricts existing fallback entries.
+This is an operator-selected policy: enabling it can delay visibility of artifact
+removal or access revocation by up to the configured lifetime.
+
 ```hcl
 codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
   target         = "https://example-111122223333.d.codeartifact.us-east-1.amazonaws.com"
@@ -456,16 +466,6 @@ coalesced. This keeps cache eligibility independent of package-format path
 conventions without overriding HTTP shared-cache safety. CodeArtifact generic
 packages use AWS CLI or SDK asset APIs rather than a package repository endpoint,
 so they are outside this HTTP proxy strategy.
-
-CodeArtifact deployments may opt into `immutable-fallback-ttl = "1h"` (allowed:
-1 second through 24 hours; default `0`, disabled). This supplies a local freshness
-budget only for `public, immutable` artifacts that omit both `max-age`/`s-maxage`
-and `Expires`. Explicit stale or invalid freshness is never overridden. Rewritten
-package metadata is excluded. Origin `Age` and `Date` reduce the budget, and cache
-hits retain the origin policy and validators while reporting their current age.
-Disabling or shortening the option also restricts existing fallback entries.
-This is an operator-selected policy: enabling it can delay visibility of artifact
-removal or access revocation by up to the configured lifetime.
 
 ### Host
 
