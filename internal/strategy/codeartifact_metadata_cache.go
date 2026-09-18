@@ -248,7 +248,8 @@ func (c *CodeArtifact) fillMetadata(key string, r *http.Request, flight *metadat
 	ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
 	defer cancel()
 	capture := &metadataCapture{headers: make(http.Header)}
-	err := c.writeOrigin(capture, r.WithContext(ctx), codeArtifactCachePassthrough)
+	writer := &metadataInvalidationWriter{ResponseWriter: capture, cache: m, resource: flight.resource}
+	err := c.writeOrigin(writer, r.WithContext(ctx), codeArtifactCachePassthrough)
 	body, finishErr := capture.finish(m.config.MaxBytes)
 	err = errors.Join(err, finishErr)
 	response := &metadataResponse{headers: capture.headers.Clone(), status: capture.status, body: body, stored: m.now()}

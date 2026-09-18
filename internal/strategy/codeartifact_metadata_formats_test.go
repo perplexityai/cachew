@@ -288,3 +288,89 @@ func TestMetadataCanceledWaiterSpoolCleanup(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 0, len(files))
 }
+
+func TestMetadataTruncatedAuthoritativeResponseInvalidatesVariants(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone, http.StatusUnavailableForLegalReasons} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var removed atomic.Bool
+			mux, origin, _ := newMetadataCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				if removed.Load() {
+					w.Header().Set("Content-Length", "100")
+					w.WriteHeader(status)
+				}
+				_, _ = io.WriteString(w, "index")
+			}), allMetadataTestConfig())
+			request := func(accept string) int {
+				r := httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/pypi/python/simple/pip/"), nil)
+				r.Header.Set("Accept", accept)
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, r)
+				return w.Code
+			}
+			assert.Equal(t, http.StatusOK, request("text/html"))
+			removed.Store(true)
+			assert.Equal(t, http.StatusBadGateway, request("*/*"))
+			assert.Equal(t, http.StatusBadGateway, request("text/html"))
+		})
+	}
+}
+
+type metadataBlockedFailWriter struct {
+	header  http.Header
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *metadataBlockedFailWriter) Header() http.Header { return w.header }
+func (w *metadataBlockedFailWriter) WriteHeader(int)     {}
+func (w *metadataBlockedFailWriter) Write([]byte) (int, error) {
+	close(w.entered)
+	<-w.release
+	return 0, io.ErrClosedPipe
+}
+
+func TestMetadataSpoolLastWriterFailurePreservesOtherReaders(t *testing.T) {
+	directory := t.TempDir()
+	t.Setenv("TMPDIR", directory)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	body := strings.Repeat("abcdefgh", 1<<18)
+	mux, origin, _ := newMetadataCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, body)
+	}), allMetadataTestConfig())
+	path := codeArtifactPath(origin, "/pypi/python/simple/pip/")
+	failed := &metadataBlockedFailWriter{header: make(http.Header), entered: make(chan struct{}), release: make(chan struct{})}
+	ownerDone := make(chan struct{})
+	go func() { defer close(ownerDone); mux.ServeHTTP(failed, httptest.NewRequest(http.MethodGet, path, nil)) }()
+	<-entered
+	joined := make(chan struct{}, 1)
+	healthy := httptest.NewRecorder()
+	healthyDone := make(chan struct{})
+	go func() {
+		defer close(healthyDone)
+		ctx := &metadataWaitContext{Context: t.Context(), joined: joined}
+		mux.ServeHTTP(healthy, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+	}()
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		t.Fatal("follower did not join")
+	}
+	close(release)
+	<-failed.entered
+	<-healthyDone
+	assert.Equal(t, http.StatusOK, healthy.Code)
+	assert.Equal(t, body, healthy.Body.String())
+	files, err := os.ReadDir(directory)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(files))
+	close(failed.release)
+	<-ownerDone
+	files, err = os.ReadDir(directory)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, len(files))
+}
