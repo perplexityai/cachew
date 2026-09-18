@@ -503,13 +503,30 @@ is never served as a fallback. Downstream cacheable metadata is marked
 `private, no-cache`, so clients must return to Cachew rather than extending its
 freshness window.
 
-Concurrent equivalent requests share a complete successful response, with
-independent client writes. Canceling a waiter does not cancel the service-owned
-fill, which has a one-minute deadline and the existing origin idle/header limits.
-The 64 MiB decoded metadata limit still applies; rewritten responses above 64 MiB
-fail with 502. Filling a different key beyond `max-concurrent` returns 503 with
-`Retry-After: 1`. Active JSON transformations and client writes require memory in
-addition to the retained byte budget; size pod memory accordingly.
+Concurrent equivalent requests share a complete response when its policy permits,
+including errors and successful responses too large to retain. Errors are never
+stored for later requests. Private, cookie-bearing, and otherwise unshareable
+responses remain isolated. Each caller has a one-minute total wait budget across
+fills; exhausting it returns 504. Canceling a waiter does not cancel the
+service-owned fill, which has its own one-minute deadline and the existing origin
+idle/header limits.
+
+The existing 64 MiB decoded-input limit protects JSON rewriting. Valid metadata
+that grows beyond 64 MiB during rewriting is still delivered; the retained byte
+budget determines whether it can be cached. Non-success response bodies captured
+for waiting callers are capped at 64 MiB. Filling a different key beyond
+`max-concurrent` returns 503 with `Retry-After: 1`. Active JSON transformations and
+client writes require memory in addition to the retained byte budget; size pod
+memory accordingly.
+
+Metadata requests use `cache_mode=npm_metadata` on
+`cachew.codeartifact.requests_total`. Filter
+`cachew.codeartifact.cache_operations_total` by `tier=npm_metadata` for `hit`,
+`miss` (a new fill), `coalesced` (joining a fill), `stored`, `not_cacheable`,
+`evicted` (capacity eviction), `bypass`, `capacity_rejected`, and `wait_timeout`
+events. A retry joining another fill records another miss or coalesced event;
+these are operation counts, not unique request counts. Labels contain no package
+names or URLs.
 
 Enabling this policy can delay visibility of new versions, tag changes, removals,
 and origin permission changes by the configured interval. It is an explicit local

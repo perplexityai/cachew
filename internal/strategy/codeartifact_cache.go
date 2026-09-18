@@ -19,6 +19,7 @@ import (
 type codeArtifactCacheMode string
 
 const (
+	codeArtifactCacheNPMMetadata       codeArtifactCacheMode = "npm_metadata"
 	codeArtifactCacheLookup            codeArtifactCacheMode = "lookup"
 	codeArtifactCachePassthrough       codeArtifactCacheMode = "passthrough"
 	codeArtifactOriginValidatorsHeader                       = "X-Cachew-Codeartifact-Origin-Validators"

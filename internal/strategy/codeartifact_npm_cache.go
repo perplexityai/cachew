@@ -42,7 +42,7 @@ type npmMetadataFlight struct {
 	invalidated bool
 	done        chan struct{}
 	response    *npmMetadataResponse
-	reusable    bool
+	shareable   bool
 }
 
 type npmMetadataCache struct {
@@ -114,34 +114,46 @@ func (c *CodeArtifact) serveNPMMetadata(w http.ResponseWriter, r *http.Request) 
 	_, noCache := directives["no-cache"]
 	force := len(directives) != 0 || r.Header.Get("Pragma") != ""
 	if bypass || !ok || noStore {
+		c.metric.recordCache(r.Context(), codeArtifactCacheBypass, codeArtifactCacheTierNPMMetadata)
 		if force && (!noStore || noCache || directives["max-age"] == "0") {
 			m.forget(key)
 		}
 		c.serveOrigin(&npmMetadataInvalidationWriter{ResponseWriter: w, cache: m, resource: resource}, r, codeArtifactCachePassthrough)
 		return true
 	}
+	waitLimit := time.NewTimer(time.Minute)
+	defer waitLimit.Stop()
 	for {
 		response, flight, owner, busy := m.lookup(key, resource, force)
 		if busy {
+			c.metric.recordCache(r.Context(), codeArtifactCacheCapacityRejected, codeArtifactCacheTierNPMMetadata)
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "metadata fetch capacity exhausted", http.StatusServiceUnavailable)
 			return true
 		}
 		if response != nil {
+			c.metric.recordCache(r.Context(), codeArtifactCacheHit, codeArtifactCacheTierNPMMetadata)
 			if err := response.serve(w, m.now()); err != nil {
 				c.logger.ErrorContext(r.Context(), "Failed to serve npm metadata", "error", err)
 			}
 			return true
 		}
 		if owner {
+			c.metric.recordCache(r.Context(), codeArtifactCacheMiss, codeArtifactCacheTierNPMMetadata)
 			request := r.Clone(m.ctx)
 			go c.fillNPMMetadata(key, request, flight)
+		} else {
+			c.metric.recordCache(r.Context(), codeArtifactCacheCoalesced, codeArtifactCacheTierNPMMetadata)
 		}
 		select {
 		case <-r.Context().Done():
 			return true
+		case <-waitLimit.C:
+			c.metric.recordCache(r.Context(), codeArtifactCacheWaitTimeout, codeArtifactCacheTierNPMMetadata)
+			http.Error(w, "metadata fetch wait timed out", http.StatusGatewayTimeout)
+			return true
 		case <-flight.done:
-			if owner || (flight.reusable && m.now().Before(flight.response.expires)) {
+			if owner || flight.shareable {
 				if err := flight.response.serve(w, m.now()); err != nil {
 					c.logger.ErrorContext(r.Context(), "Failed to serve npm metadata", "error", err)
 				}
@@ -225,12 +237,12 @@ func (c *CodeArtifact) fillNPMMetadata(key string, r *http.Request, flight *npmM
 	defer cancel()
 	capture := &npmMetadataCapture{headers: make(http.Header)}
 	c.serveOrigin(capture, r.WithContext(ctx), codeArtifactCachePassthrough)
-	response := &npmMetadataResponse{headers: capture.headers.Clone(), status: capture.status, body: bytes.Clone(capture.body.Bytes()), stored: m.now()}
+	response := &npmMetadataResponse{headers: capture.headers.Clone(), status: capture.status, body: capture.body.Bytes(), stored: m.now()}
 	if response.status == 0 {
 		response.status = http.StatusOK
 	}
 	if capture.failed {
-		response = &npmMetadataResponse{headers: make(http.Header), status: http.StatusBadGateway, body: []byte("metadata response exceeds size limit\n"), stored: m.now()}
+		response = &npmMetadataResponse{headers: make(http.Header), status: http.StatusBadGateway, body: []byte("metadata error response exceeds size limit\n"), stored: m.now()}
 	}
 	response.resource = flight.resource
 	response.expires = npmMetadataExpiry(response, started, m.config.TTL)
@@ -242,10 +254,14 @@ func (c *CodeArtifact) fillNPMMetadata(key string, r *http.Request, flight *npmM
 		}
 	}
 	reusable := response.status == http.StatusOK && m.now().Before(response.expires) && response.size <= m.config.MaxBytes && !capture.failed
-	m.complete(key, flight, response, reusable)
+	if reusable {
+		response.body = bytes.Clone(response.body)
+	}
+	c.completeNPMMetadata(key, flight, response, reusable)
 }
 
-func (m *npmMetadataCache) complete(key string, flight *npmMetadataFlight, response *npmMetadataResponse, reusable bool) {
+func (c *CodeArtifact) completeNPMMetadata(key string, flight *npmMetadataFlight, response *npmMetadataResponse, reusable bool) {
+	m := c.npmMetadata
 	m.mu.Lock()
 	if npmMetadataAuthoritativeFailure(response.status) {
 		m.invalidateLocked(response.resource)
@@ -266,11 +282,16 @@ func (m *npmMetadataCache) complete(key string, flight *npmMetadataFlight, respo
 				}
 			}
 			m.remove(oldest)
+			c.metric.recordCache(m.ctx, codeArtifactCacheEvicted, codeArtifactCacheTierNPMMetadata)
 		}
 		m.entries[key] = response
 		m.bytes += response.size
+		c.metric.recordCache(m.ctx, codeArtifactCacheStored, codeArtifactCacheTierNPMMetadata)
+	} else {
+		c.metric.recordCache(m.ctx, codeArtifactCacheNotCacheable, codeArtifactCacheTierNPMMetadata)
 	}
-	flight.response, flight.reusable = response, reusable
+	flight.response = response
+	flight.shareable = npmMetadataShareable(response) && (!flight.invalidated || response.status >= 400)
 	delete(m.flights, key)
 	close(flight.done)
 	m.mu.Unlock()
@@ -302,17 +323,32 @@ func (m *npmMetadataCache) remove(key string) {
 	}
 }
 
-func npmMetadataExpiry(response *npmMetadataResponse, started time.Time, ttl time.Duration) time.Time {
-	headers := response.headers
+func npmMetadataShareable(response *npmMetadataResponse) bool {
+	if response.status == http.StatusOK {
+		return !response.expires.IsZero()
+	}
+	return response.status >= 400 && npmMetadataAllowsSharing(response.headers)
+}
+
+func npmMetadataAllowsSharing(headers http.Header) bool {
 	directives, ok := parseCodeArtifactCacheControl(headers.Values("Cache-Control"))
 	if !ok || headers.Get("Set-Cookie") != "" || !supportedCodeArtifactVary(headers.Values("Vary")) {
-		return time.Time{}
+		return false
 	}
 	for _, name := range []string{"private", "no-cache", "no-store"} {
 		if _, found := directives[name]; found {
-			return time.Time{}
+			return false
 		}
 	}
+	return true
+}
+
+func npmMetadataExpiry(response *npmMetadataResponse, started time.Time, ttl time.Duration) time.Time {
+	headers := response.headers
+	if !npmMetadataAllowsSharing(headers) {
+		return time.Time{}
+	}
+	directives, _ := parseCodeArtifactCacheControl(headers.Values("Cache-Control"))
 	_, maxAge := directives["max-age"]
 	_, sharedAge := directives["s-maxage"]
 	if !maxAge && !sharedAge {
@@ -382,7 +418,7 @@ func (w *npmMetadataCapture) WriteHeader(status int) {
 	}
 }
 func (w *npmMetadataCapture) Write(body []byte) (int, error) {
-	if w.body.Len()+len(body) > maxCodeArtifactMetadataBytes {
+	if w.status != http.StatusOK && w.body.Len()+len(body) > maxCodeArtifactMetadataBytes {
 		w.failed = true
 		return 0, io.ErrShortBuffer
 	}

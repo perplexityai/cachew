@@ -223,7 +223,7 @@ func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host 
 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mode := classifyCodeArtifactRequest(r)
-	c.metric.recordRequest(r.Context(), mode)
+	defer func() { c.metric.recordRequest(r.Context(), mode) }()
 	decision, err := c.evaluatePackage(r)
 	if err != nil {
 		c.logger.Log(r.Context(), packagepolicy.LogLevel(err), "Package policy evaluation failed", "error", err)
@@ -232,6 +232,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if packagepolicy.Cacheable(decision, err) && c.serveNPMMetadata(w, r) {
+		mode = codeArtifactCacheNPMMetadata
 		return
 	}
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {

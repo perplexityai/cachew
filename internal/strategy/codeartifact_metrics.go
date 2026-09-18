@@ -37,12 +37,21 @@ const (
 	codeArtifactCacheNotCacheable codeArtifactCacheEvent = "not_cacheable"
 )
 
+const (
+	codeArtifactCacheBypass           codeArtifactCacheEvent = "bypass"
+	codeArtifactCacheCoalesced        codeArtifactCacheEvent = "coalesced"
+	codeArtifactCacheCapacityRejected codeArtifactCacheEvent = "capacity_rejected"
+	codeArtifactCacheWaitTimeout      codeArtifactCacheEvent = "wait_timeout"
+	codeArtifactCacheEvicted          codeArtifactCacheEvent = "evicted"
+)
+
 type codeArtifactCacheTier string
 
 const (
-	codeArtifactCacheTierAll     codeArtifactCacheTier = "all"
-	codeArtifactCacheTierNone    codeArtifactCacheTier = "none"
-	codeArtifactCacheTierUnknown codeArtifactCacheTier = "unknown"
+	codeArtifactCacheTierNPMMetadata codeArtifactCacheTier = "npm_metadata"
+	codeArtifactCacheTierAll         codeArtifactCacheTier = "all"
+	codeArtifactCacheTierNone        codeArtifactCacheTier = "none"
+	codeArtifactCacheTierUnknown     codeArtifactCacheTier = "unknown"
 )
 
 type codeArtifactRedirectEvent string

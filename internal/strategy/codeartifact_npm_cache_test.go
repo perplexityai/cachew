@@ -3,6 +3,7 @@ package strategy //nolint:testpackage // Exercise the cache with real HTTP origi
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/alecthomas/assert/v2"
@@ -143,7 +145,7 @@ func TestNPMMetadataCacheCoalescingCancellationAndCapacity(t *testing.T) {
 	var calls atomic.Int32
 	config := npmCacheTestConfig()
 	config.MaxConcurrent = 1
-	mux, origin, _ := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux, origin, strategy := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
@@ -155,6 +157,7 @@ func TestNPMMetadataCacheCoalescingCancellationAndCapacity(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"name":"react"}`)
 	}), config)
+	recorded := recordNPMMetadataMetrics(strategy)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -188,22 +191,25 @@ func TestNPMMetadataCacheCoalescingCancellationAndCapacity(t *testing.T) {
 	close(release)
 	group.Wait()
 	assert.Equal(t, int32(1), calls.Load())
+	assert.Equal(t, map[codeArtifactCacheEvent]int{codeArtifactCacheMiss: 1, codeArtifactCacheCoalesced: 8, codeArtifactCacheCapacityRejected: 1, codeArtifactCacheStored: 1}, recorded.events()) //nolint:exhaustive // Assert only events emitted by this scenario.
 }
 
 func TestNPMMetadataCacheByteBudget(t *testing.T) {
 	var calls atomic.Int32
 	config := npmCacheTestConfig()
-	mux, origin, _ := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	mux, origin, strategy := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"data":%q}`, strings.Repeat("x", 600<<10))
 	}), config)
+	recorded := recordNPMMetadataMetrics(strategy)
 	for _, name := range []string{"first", "second", "first", "first"} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/npm/frontend/"+name), nil))
 		assert.Equal(t, http.StatusOK, w.Code)
 	}
 	assert.Equal(t, int32(3), calls.Load())
+	assert.Equal(t, map[codeArtifactCacheEvent]int{codeArtifactCacheMiss: 3, codeArtifactCacheStored: 3, codeArtifactCacheHit: 1, codeArtifactCacheEvicted: 2}, recorded.events()) //nolint:exhaustive // Assert only events emitted by this scenario.
 }
 
 func TestNPMMetadataExpiryBudget(t *testing.T) {
@@ -234,17 +240,32 @@ func TestNPMMetadataExpiryRejectsOverageOrigin(t *testing.T) {
 }
 
 func TestNPMMetadataCacheRejectsOversizedAndFailedResponses(t *testing.T) {
-	for _, body := range []string{`{"data":"` + strings.Repeat("x", 1100<<10) + `"}`, `{"broken":`, `{"one":1}{"two":2}`} {
-		var calls atomic.Int32
-		mux, origin, _ := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			calls.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, body)
-		}), npmCacheTestConfig())
-		for range 2 {
-			mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/npm/frontend/react"), nil))
-		}
-		assert.Equal(t, int32(2), calls.Load())
+	for _, tt := range []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"above retention budget", `{"data":"` + strings.Repeat("x", 1100<<10) + `"}`, http.StatusOK},
+		{"malformed JSON", `{"broken":`, http.StatusBadGateway},
+		{"multiple documents", `{"one":1}{"two":2}`, http.StatusBadGateway},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			mux, origin, _ := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tt.body)
+			}), npmCacheTestConfig())
+			for range 2 {
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/npm/frontend/react"), nil))
+				assert.Equal(t, tt.status, w.Code)
+				if tt.status == http.StatusOK {
+					assert.Equal(t, tt.body, w.Body.String())
+				}
+			}
+			assert.Equal(t, int32(2), calls.Load())
+		})
 	}
 }
 
@@ -442,4 +463,192 @@ func TestNPMMetadataCacheExpiryDoesNotSlide(t *testing.T) {
 	clock.Store(start.Add(config.TTL).UnixNano())
 	assert.Equal(t, `{"version":2}`, request().Body.String())
 	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestNPMMetadataCoalescesUnretainedResponses(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  int
+		headers http.Header
+		padding int
+		expire  bool
+		shared  bool
+	}{
+		{name: "origin error", status: http.StatusBadGateway, shared: true},
+		{name: "not found", status: http.StatusNotFound, shared: true},
+		{name: "above retention budget", status: http.StatusOK, padding: 1100 << 10, shared: true},
+		{name: "expires during fetch", status: http.StatusOK, expire: true, shared: true},
+		{name: "private", status: http.StatusOK, headers: http.Header{"Cache-Control": {"private"}}},
+		{name: "private error", status: http.StatusBadGateway, headers: http.Header{"Cache-Control": {"private"}}},
+		{name: "no store", status: http.StatusOK, headers: http.Header{"Cache-Control": {"no-store"}}},
+		{name: "cookie", status: http.StatusOK, headers: http.Header{"Set-Cookie": {"session=value"}}},
+		{name: "unsupported vary", status: http.StatusOK, headers: http.Header{"Vary": {"X-Custom"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			var calls atomic.Int32
+			var clock atomic.Int64
+			clock.Store(time.Now().UnixNano())
+			now := func() time.Time { return time.Unix(0, clock.Load()) }
+			mux, origin, strategy := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				n := calls.Add(1)
+				if n == 1 {
+					close(entered)
+				}
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+				maps.Copy(w.Header(), tt.headers)
+				w.Header().Set("Date", now().UTC().Format(http.TimeFormat))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = fmt.Fprintf(w, `{"call":%d,"padding":%q}`, n, strings.Repeat("x", tt.padding))
+			}), npmCacheTestConfig())
+			strategy.npmMetadata.now = now
+			done := make(chan *httptest.ResponseRecorder, 3)
+			request := func(ctx context.Context) {
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/npm/frontend/react"), nil).WithContext(ctx))
+				done <- w
+			}
+			go request(t.Context())
+			<-entered
+			joined := make(chan struct{}, 2)
+			for range 2 {
+				go request(&npmMetadataWaitContext{Context: t.Context(), joined: joined})
+			}
+			for range 2 {
+				select {
+				case <-joined:
+				case <-time.After(5 * time.Second):
+					t.Fatal("follower did not join")
+				}
+			}
+			if tt.expire {
+				clock.Add(int64(time.Minute))
+			}
+			close(release)
+			bodies := map[string]bool{}
+			for range 3 {
+				select {
+				case w := <-done:
+					assert.Equal(t, tt.status, w.Code)
+					bodies[w.Body.String()] = true
+				case <-time.After(5 * time.Second):
+					t.Fatal("waiter did not complete")
+				}
+			}
+			want := int32(3)
+			if tt.shared {
+				want = 1
+			}
+			assert.Equal(t, want, calls.Load())
+			assert.Equal(t, int(want), len(bodies))
+			request(t.Context())
+			assert.Equal(t, tt.status, (<-done).Code)
+			assert.Equal(t, want+1, calls.Load(), "completed response must not be retained")
+		})
+	}
+}
+
+func TestNPMMetadataWaitDeadlineSpansUnshareableFills(t *testing.T) {
+	mux, origin, strategy := newNPMCacheProxy(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), npmCacheTestConfig())
+	_, err := strategy.authorizationToken(t.Context())
+	assert.NoError(t, err)
+	synctest.Test(t, func(t *testing.T) {
+		strategy.npmMetadata.ctx = t.Context()
+		var calls atomic.Int32
+		strategy.client.Transport = codeArtifactRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			select {
+			case <-time.After(40 * time.Second):
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"private"}}, Body: io.NopCloser(strings.NewReader(`{"name":"react"}`)), Request: r}, nil
+		})
+		started := time.Now()
+		done := make(chan *httptest.ResponseRecorder, 3)
+		for range 3 {
+			go func() {
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/npm/frontend/react"), nil))
+				done <- w
+			}()
+		}
+		synctest.Wait()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		counts := map[int]int{}
+		for range 3 {
+			counts[(<-done).Code]++
+		}
+		assert.Equal(t, map[int]int{http.StatusOK: 1, http.StatusGatewayTimeout: 2}, counts)
+		assert.Equal(t, time.Minute, time.Since(started))
+		assert.Equal(t, int32(2), calls.Load())
+	})
+}
+
+func TestNPMMetadataCacheDeliversExpandedMetadata(t *testing.T) {
+	const expandedCharacters = (64<<20)/6 + 1
+	var calls atomic.Int32
+	mux, origin, _ := newNPMCacheProxy(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = io.WriteString(w, `{"data":"`+strings.Repeat("<", expandedCharacters)+`"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":"next"}`)
+	}), npmCacheTestConfig())
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/npm/frontend/react"), nil))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, w.Body.Len() > 64<<20)
+	var metadata struct {
+		Data string `json:"data"`
+	}
+	assert.NoError(t, json.NewDecoder(w.Body).Decode(&metadata))
+	assert.Equal(t, strings.Repeat("<", expandedCharacters), metadata.Data)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, "/npm/frontend/react"), nil))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, `{"data":"next"}`, w.Body.String())
+	assert.Equal(t, int32(2), calls.Load())
+}
+
+type recordingNPMMetadataMetrics struct {
+	codeArtifactMetricRecorder
+	mu          sync.Mutex
+	cacheEvents map[codeArtifactCacheEvent]int
+}
+
+func recordNPMMetadataMetrics(strategy *CodeArtifact) *recordingNPMMetadataMetrics {
+	recorded := &recordingNPMMetadataMetrics{codeArtifactMetricRecorder: strategy.metric, cacheEvents: map[codeArtifactCacheEvent]int{}}
+	strategy.metric = recorded
+	return recorded
+}
+
+func (m *recordingNPMMetadataMetrics) recordCache(_ context.Context, event codeArtifactCacheEvent, tier codeArtifactCacheTier) {
+	if tier != codeArtifactCacheTierNPMMetadata {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cacheEvents[event]++
+}
+
+func (m *recordingNPMMetadataMetrics) events() map[codeArtifactCacheEvent]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return maps.Clone(m.cacheEvents)
 }
