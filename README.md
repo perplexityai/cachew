@@ -457,6 +457,57 @@ conventions without overriding HTTP shared-cache safety. CodeArtifact generic
 packages use AWS CLI or SDK asset APIs rather than a package repository endpoint,
 so they are outside this HTTP proxy strategy.
 
+#### Optional npm metadata cache
+
+A CodeArtifact strategy can opt specific repositories into a short-lived,
+process-local cache of rewritten npm package metadata:
+
+```hcl
+# Inside codeartifact { ... }
+npm-metadata-cache {
+  repositories = ["pplx-frontend"]
+  ttl = "30s"
+  max-bytes = 67108864
+  max-concurrent = 4
+}
+```
+
+Omit the block to keep the existing behavior. TTL must be 1 second through
+5 minutes, retained bytes 1 MiB through 1 GiB, and concurrent fills 1 through 32
+(default 4). Up to 1,024 representations are retained within the byte budget,
+including bodies, header strings, and keys. Expired entries are removed on access
+or insertion; the earliest-expiring entries are evicted when space is needed.
+Each process warms independently; this cache does not use shared disk or S3.
+
+Only package metadata (`react`, `@sanity/vision`, or `@sanity%2Fvision`) in the
+configured repositories qualifies. Version-specific documents, tarballs, other
+formats, and query requests retain the existing behavior. Full/abbreviated `Accept`
+variants and gzip/identity responses remain separate. Package policy runs before
+cache access. Cookies, ranges and conditional requests bypass this cache.
+
+Freshness never slides on a hit and starts at fetch initiation. Origin age and
+shorter explicit freshness reduce the budget. `no-cache` or `max-age=0` requests
+force an origin refresh; `no-store` bypasses reuse and storage. Failed, incomplete,
+oversized, private, `no-store`, `no-cache`, cookie-bearing, and unsupported `Vary`
+responses are not retained. Forced refresh invalidates the previous representation
+before fetching, including on an origin error. A final 401, 403, or 404 also
+invalidates every representation of that package and prevents older concurrent
+fills from republishing it. Stale data is never served as a fallback. Downstream cacheable metadata is marked `private, no-cache`, so clients
+must return to Cachew rather than extending its freshness window.
+
+Concurrent equivalent requests share a complete successful response, with
+independent client writes. Canceling a waiter does not cancel the service-owned
+fill, which has a one-minute deadline and the existing origin idle/header limits.
+The 64 MiB decoded metadata limit still applies; rewritten responses above 64 MiB
+fail with 502. Filling a different key beyond `max-concurrent` returns 503 with
+`Retry-After: 1`. Active JSON transformations and client writes require memory in
+addition to the retained byte budget; size pod memory accordingly.
+
+Enabling this policy can delay visibility of new versions, tag changes, removals,
+and origin permission changes by the configured interval. It is an explicit local
+freshness policy, not ETag revalidation: sampled CodeArtifact npm metadata did not
+supply usable validators. No validator-based savings are claimed.
+
 ### Host
 
 Generic reverse-proxy caching for arbitrary HTTP hosts, with optional custom headers.

@@ -38,6 +38,8 @@ type CodeArtifactConfig struct {
 	OriginReadIdleTimeout time.Duration         `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
 	CredentialTimeout     time.Duration         `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
 	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm artifact reads, including cache hits. Other formats remain unevaluated."`
+
+	NPMMetadataCache *NPMMetadataCacheConfig `hcl:"npm-metadata-cache,block,optional" help:"Opt-in bounded local npm metadata cache."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
@@ -55,6 +57,7 @@ type CodeArtifact struct {
 	policyAudit           bool
 	fills                 singleflight.Group
 	originReadIdleTimeout time.Duration
+	npmMetadata           *npmMetadataCache
 }
 
 var _ Strategy = (*CodeArtifact)(nil)
@@ -122,6 +125,7 @@ func newCodeArtifact(
 				return http.ErrUseLastResponse
 			},
 		},
+		npmMetadata:           newNPMMetadataCache(ctx, config.NPMMetadataCache),
 		logger:                logging.FromContext(ctx),
 		metric:                newCodeArtifactMetrics(),
 		originReadIdleTimeout: config.OriginReadIdleTimeout,
@@ -193,6 +197,9 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := validateNPMMetadataCache(config.NPMMetadataCache); err != nil {
+		return nil, nil, err
+	}
 	return target, proxyBase, nil
 }
 
@@ -222,6 +229,9 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.logger.Log(r.Context(), packagepolicy.LogLevel(err), "Package policy evaluation failed", "error", err)
 	}
 	if !packagepolicy.AllowRequest(w, decision, err) {
+		return
+	}
+	if packagepolicy.Cacheable(decision, err) && c.serveNPMMetadata(w, r) {
 		return
 	}
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
