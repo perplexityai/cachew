@@ -106,8 +106,8 @@ func TestCodeArtifactRewritesPackageMetadata(t *testing.T) {
 			mux.ServeHTTP(w, req)
 
 			assert.Equal(t, http.StatusOK, w.Code)
-			assertJSONEqual(t, test.want(proxyURL), w.Body.String())
-			assert.Equal(t, "", w.Header().Get("Content-Encoding"))
+			assertJSONEqual(t, test.want(proxyURL), string(codeArtifactGunzip(t, w.Body.Bytes())))
+			assert.Equal(t, "gzip", w.Header().Get("Content-Encoding"))
 			assert.Equal(t, "", w.Header().Get("ETag"))
 			assert.Equal(t, "", w.Header().Get("Last-Modified"))
 			assert.Equal(t, strconv.Itoa(w.Body.Len()), w.Header().Get("Content-Length"))
@@ -115,7 +115,11 @@ func TestCodeArtifactRewritesPackageMetadata(t *testing.T) {
 			headers := observedHeaders.Clone()
 			mu.Unlock()
 			assert.Equal(t, test.wantOriginAccept, headers.Get("Accept"))
-			assert.Equal(t, "", headers.Get("Accept-Encoding"))
+			wantEncoding := "gzip"
+			if strings.HasPrefix(test.path, "/swift/") {
+				wantEncoding = ""
+			}
+			assert.Equal(t, wantEncoding, headers.Get("Accept-Encoding"))
 			assert.Equal(t, "", headers.Get("If-None-Match"))
 			assert.Equal(t, "", headers.Get("Range"))
 		})
@@ -126,6 +130,7 @@ func TestCodeArtifactStreamsExtensionlessSwiftArchive(t *testing.T) {
 	const archive = "swift archive"
 	var originURL string
 	origin := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "", r.Header.Get("Accept-Encoding"))
 		switch r.URL.Path {
 		case "/swift/repository/perplexity/design-tokens":
 			w.Header().Set("Content-Type", "application/json")
@@ -248,8 +253,8 @@ func TestCodeArtifactRewritesRedirectedCargoMetadata(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	proxyURL := "https://cachew.example.com/" + originServer.Listener.Addr().String()
-	assertJSONEqual(t, `{"dl":"`+proxyURL+`/cargo/repository/crates/{crate}/{version}","auth-required":false}`, w.Body.String())
-	assert.Equal(t, observedHeaders{accept: "application/json"}, observed)
+	assertJSONEqual(t, `{"dl":"`+proxyURL+`/cargo/repository/crates/{crate}/{version}","auth-required":false}`, string(codeArtifactGunzip(t, w.Body.Bytes())))
+	assert.Equal(t, observedHeaders{accept: "application/json", acceptEncoding: "gzip"}, observed)
 }
 
 func TestCodeArtifactValidatesProxyBaseURL(t *testing.T) {

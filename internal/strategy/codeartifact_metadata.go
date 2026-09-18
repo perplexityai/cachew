@@ -53,6 +53,9 @@ func normalizeCodeArtifactMetadataRequestHeaders(headers http.Header, path strin
 	} {
 		headers.Del(name)
 	}
+	if codeArtifactPackageFormat(path) != codeArtifactSwiftFormat {
+		headers.Set("Accept-Encoding", "gzip")
+	}
 	if codeArtifactPackageFormat(path) == codeArtifactCargoFormat {
 		headers.Set("Accept", "application/json")
 	}
@@ -84,11 +87,15 @@ func codeArtifactContentType(headers http.Header) string {
 func (c *CodeArtifact) rewriteMetadataResponse(
 	resp *http.Response,
 	headers http.Header,
-	method string,
+	request *http.Request,
 	originPath string,
 ) (http.Header, error) {
 	rewrittenHeaders := codeArtifactRewrittenMetadataHeaders(headers)
-	if method == http.MethodHead {
+	gzipAccepted := codeArtifactGzipAccepted(request.Header)
+	if gzipAccepted {
+		rewrittenHeaders.Set("Content-Encoding", "gzip")
+	}
+	if request.Method == http.MethodHead {
 		return rewrittenHeaders, nil
 	}
 
@@ -119,6 +126,12 @@ func (c *CodeArtifact) rewriteMetadataResponse(
 	rewrittenBody, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, errors.Wrap(err, "encode CodeArtifact package metadata")
+	}
+	if gzipAccepted {
+		rewrittenBody, err = compressCodeArtifactMetadata(rewrittenBody)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := resp.Body.Close(); err != nil {
 		return nil, errors.Wrap(err, "close CodeArtifact package metadata")
@@ -157,6 +170,14 @@ func codeArtifactRewrittenMetadataHeaders(headers http.Header) http.Header {
 	} {
 		rewritten.Del(name)
 	}
+	for _, value := range rewritten.Values("Vary") {
+		for field := range strings.SplitSeq(value, ",") {
+			if field = strings.TrimSpace(field); field == "*" || strings.EqualFold(field, "Accept-Encoding") {
+				return rewritten
+			}
+		}
+	}
+	rewritten.Add("Vary", "Accept-Encoding")
 	return rewritten
 }
 
