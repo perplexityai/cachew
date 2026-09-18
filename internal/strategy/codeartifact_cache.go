@@ -21,6 +21,7 @@ type codeArtifactCacheMode string
 const (
 	codeArtifactCacheLookup            codeArtifactCacheMode = "lookup"
 	codeArtifactCachePassthrough       codeArtifactCacheMode = "passthrough"
+	codeArtifactFallbackLifetimeHeader                       = "X-Cachew-Codeartifact-Fallback-Lifetime"
 	codeArtifactOriginValidatorsHeader                       = "X-Cachew-Codeartifact-Origin-Validators"
 )
 
@@ -51,6 +52,14 @@ func (c *CodeArtifact) cacheKey(r *http.Request) cache.Key {
 
 func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool {
 	body, headers, tier, err := cache.OpenWithTier(r.Context(), c.cache, c.cacheKey(r))
+	if err == nil && headers.Get(codeArtifactFallbackLifetimeHeader) != "" {
+		updateCodeArtifactAge(headers, time.Now())
+		policy := map[string]string{"max-age": strconv.FormatInt(int64(c.immutableFallbackTTL/time.Second), 10)}
+		if _, fresh := codeArtifactFreshnessLifetime(headers, policy, time.Now()); !fresh {
+			_ = body.Close()
+			return false
+		}
+	}
 	if err == nil {
 		headers = codeArtifactOriginHeaders(headers, time.Now())
 		if status := cachedPreconditionStatus(r, headers); status != 0 {
@@ -87,7 +96,11 @@ func (c *CodeArtifact) streamAndCache(
 	resp *http.Response,
 	responseHeaders http.Header,
 ) {
-	cacheHeaders, ttl, createOptions, cacheable := codeArtifactCacheEntry(responseHeaders, time.Now())
+	fallback := c.immutableFallbackTTL
+	if shouldRewriteCodeArtifactMetadata(c.originURL(r).Path) {
+		fallback = 0
+	}
+	cacheHeaders, ttl, createOptions, cacheable := codeArtifactCacheEntry(responseHeaders, time.Now(), fallback)
 	if !cacheable {
 		c.metric.recordCache(r.Context(), codeArtifactCacheNotCacheable, codeArtifactCacheTierNone)
 		c.streamOriginBody(r.Context(), w, resp.Body)
@@ -120,7 +133,7 @@ func (c *CodeArtifact) streamAndCache(
 	c.metric.recordCache(r.Context(), codeArtifactCacheStored, codeArtifactCacheTierAll)
 }
 
-func codeArtifactCacheEntry(headers http.Header, now time.Time) (http.Header, time.Duration, []cache.Option, bool) {
+func codeArtifactCacheEntry(headers http.Header, now time.Time, fallback time.Duration) (http.Header, time.Duration, []cache.Option, bool) {
 	directives, ok := parseCodeArtifactCacheControl(headers.Values("Cache-Control"))
 	if !ok || !codeArtifactSharedCachePolicyAllowsStorage(directives) || !supportedCodeArtifactVary(headers.Values("Vary")) {
 		return nil, 0, nil, false
@@ -128,11 +141,21 @@ func codeArtifactCacheEntry(headers http.Header, now time.Time) (http.Header, ti
 	if headers.Get("Set-Cookie") != "" {
 		return nil, 0, nil, false
 	}
+	_, hasMaxAge := directives["max-age"]
+	_, hasSharedMaxAge := directives["s-maxage"]
+	useFallback := !hasMaxAge && !hasSharedMaxAge && headers.Get("Expires") == "" && fallback > 0
+	if useFallback {
+		directives["max-age"] = strconv.FormatInt(int64(fallback/time.Second), 10)
+	}
 	ttl, ok := codeArtifactFreshnessLifetime(headers, directives, now)
 	if !ok {
 		return nil, 0, nil, false
 	}
 	cacheHeaders := maps.Clone(headers)
+	cacheHeaders.Del(codeArtifactFallbackLifetimeHeader)
+	if useFallback {
+		cacheHeaders.Set(codeArtifactFallbackLifetimeHeader, directives["max-age"])
+	}
 	cacheHeaders.Set(cache.ExpirationKey, now.Add(ttl).UTC().Format(time.RFC3339Nano))
 	validators := make([]string, 0, 2)
 	var createOptions []cache.Option
@@ -257,6 +280,7 @@ func codeArtifactOriginHeaders(headers http.Header, now time.Time) http.Header {
 	originHeaders := maps.Clone(headers)
 	updateCodeArtifactAge(originHeaders, now)
 	originHeaders.Del(cache.ExpirationKey)
+	originHeaders.Del(codeArtifactFallbackLifetimeHeader)
 	validators := originHeaders.Get(codeArtifactOriginValidatorsHeader)
 	originHeaders.Del(codeArtifactOriginValidatorsHeader)
 	if !commaSeparatedValueContains(validators, "etag") {
@@ -282,7 +306,7 @@ func updateCodeArtifactAge(headers http.Header, now time.Time) {
 		value, ok = directives["max-age"]
 	}
 	if !ok {
-		return
+		value = headers.Get(codeArtifactFallbackLifetimeHeader)
 	}
 	seconds, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || seconds < 0 || seconds > int64(time.Duration(1<<63-1)/time.Second) {
