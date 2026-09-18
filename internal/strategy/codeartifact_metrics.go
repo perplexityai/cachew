@@ -48,10 +48,10 @@ const (
 type codeArtifactCacheTier string
 
 const (
-	codeArtifactCacheTierNPMMetadata codeArtifactCacheTier = "npm_metadata"
-	codeArtifactCacheTierAll         codeArtifactCacheTier = "all"
-	codeArtifactCacheTierNone        codeArtifactCacheTier = "none"
-	codeArtifactCacheTierUnknown     codeArtifactCacheTier = "unknown"
+	codeArtifactCacheTierMetadata codeArtifactCacheTier = "metadata"
+	codeArtifactCacheTierAll      codeArtifactCacheTier = "all"
+	codeArtifactCacheTierNone     codeArtifactCacheTier = "none"
+	codeArtifactCacheTierUnknown  codeArtifactCacheTier = "unknown"
 )
 
 type codeArtifactRedirectEvent string

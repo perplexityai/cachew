@@ -39,7 +39,7 @@ type CodeArtifactConfig struct {
 	CredentialTimeout     time.Duration         `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
 	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm artifact reads, including cache hits. Other formats remain unevaluated."`
 
-	NPMMetadataCache *NPMMetadataCacheConfig `hcl:"npm-metadata-cache,block,optional" help:"Opt-in bounded local npm metadata cache."`
+	MetadataCache *MetadataCacheConfig `hcl:"metadata-cache,block,optional" help:"Opt-in bounded local package metadata cache."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
@@ -57,7 +57,7 @@ type CodeArtifact struct {
 	policyAudit           bool
 	fills                 singleflight.Group
 	originReadIdleTimeout time.Duration
-	npmMetadata           *npmMetadataCache
+	metadata              *metadataCache
 }
 
 var _ Strategy = (*CodeArtifact)(nil)
@@ -125,7 +125,7 @@ func newCodeArtifact(
 				return http.ErrUseLastResponse
 			},
 		},
-		npmMetadata:           newNPMMetadataCache(ctx, config.NPMMetadataCache),
+		metadata:              newMetadataCache(ctx, config.MetadataCache),
 		logger:                logging.FromContext(ctx),
 		metric:                newCodeArtifactMetrics(),
 		originReadIdleTimeout: config.OriginReadIdleTimeout,
@@ -197,7 +197,7 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := validateNPMMetadataCache(config.NPMMetadataCache); err != nil {
+	if err := validateMetadataCache(config.MetadataCache); err != nil {
 		return nil, nil, err
 	}
 	return target, proxyBase, nil
@@ -231,8 +231,8 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !packagepolicy.AllowRequest(w, decision, err) {
 		return
 	}
-	if packagepolicy.Cacheable(decision, err) && c.serveNPMMetadata(w, r) {
-		mode = codeArtifactCacheNPMMetadata
+	if packagepolicy.Cacheable(decision, err) && c.serveMetadata(w, r) {
+		mode = codeArtifactCacheMetadata
 		return
 	}
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
@@ -263,17 +263,23 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
+	if err := c.writeOrigin(w, r, mode); err != nil {
+		c.logger.ErrorContext(r.Context(), "Failed to stream CodeArtifact response", "error", err)
+	}
+}
+
+func (c *CodeArtifact) writeOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) error {
 	rewriteMetadata := shouldRewriteCodeArtifactMetadata(c.originURL(r).Path)
 	token, err := c.authorizationToken(r.Context())
 	if err != nil {
 		c.writeError(w, r, err)
-		return
+		return nil
 	}
 
 	resp, err := c.do(r, token.value)
 	if err != nil {
 		c.writeError(w, r, err)
-		return
+		return nil
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
@@ -284,13 +290,13 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 		if refreshErr != nil {
 			c.metric.recordAuth(r.Context(), codeArtifactAuthFailure)
 			c.writeError(w, r, errors.Wrap(refreshErr, "refresh CodeArtifact authorization"))
-			return
+			return nil
 		}
 		c.metric.recordAuth(r.Context(), refreshed.event)
 		resp, err = c.do(r, refreshed.value)
 		if err != nil {
 			c.writeError(w, r, err)
-			return
+			return nil
 		}
 	}
 	responseHeaders := endToEndHeaders(resp.Header)
@@ -309,7 +315,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 			if err != nil {
 				c.metric.recordRedirect(r.Context(), codeArtifactRedirectFailure)
 				c.writeError(w, r, err)
-				return
+				return nil
 			}
 			c.metric.recordRedirect(r.Context(), codeArtifactRedirectCrossOrigin)
 			if resp.Header.Get("Location") != "" {
@@ -318,7 +324,7 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 				}
 				c.metric.recordRedirect(r.Context(), codeArtifactRedirectChainedRejected)
 				c.writeError(w, r, errors.New("CodeArtifact redirect target returned another redirect"))
-				return
+				return nil
 			}
 			responseHeaders = endToEndHeaders(resp.Header)
 		}
@@ -331,21 +337,22 @@ func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode 
 	responseHeaders, err = c.rewriteOriginMetadata(resp, responseHeaders, r, rewriteMetadata)
 	if err != nil {
 		c.writeError(w, r, err)
-		return
+		return nil
 	}
 	sanitizeCodeArtifactETag(responseHeaders)
 	copyHeaders(w.Header(), responseHeaders)
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
-		return
+		return nil
 	}
 	if mode == codeArtifactCacheLookup && resp.StatusCode == http.StatusOK {
 		c.streamAndCache(w, r, resp, responseHeaders)
-		return
+		return nil
 	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		c.logger.ErrorContext(r.Context(), "Failed to stream CodeArtifact response", "error", err)
+		return errors.Wrap(err, "stream CodeArtifact response")
 	}
+	return nil
 }
 
 func (c *CodeArtifact) authorizationToken(ctx context.Context) (codeArtifactToken, error) {
@@ -546,7 +553,7 @@ func (c *CodeArtifact) observeOriginResponse(ctx context.Context, resp *http.Res
 func codeArtifactMetricFormat(path string) string {
 	format := codeArtifactPackageFormat(path)
 	switch format {
-	case codeArtifactCargoFormat, "generic", "maven", "npm", "nuget", "pypi", "ruby", codeArtifactSwiftFormat:
+	case codeArtifactCargoFormat, "generic", "maven", "npm", "nuget", codeArtifactPyPIFormat, "ruby", codeArtifactSwiftFormat:
 		return format
 	default:
 		return "other"

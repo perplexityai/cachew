@@ -457,81 +457,103 @@ conventions without overriding HTTP shared-cache safety. CodeArtifact generic
 packages use AWS CLI or SDK asset APIs rather than a package repository endpoint,
 so they are outside this HTTP proxy strategy.
 
-#### Optional npm metadata cache
+#### Optional package metadata cache
 
-A CodeArtifact strategy can opt specific repositories into a short-lived,
-process-local cache of rewritten npm package metadata. Add this block inside the
-`codeartifact` strategy for the desired origin; repository names are relative to
-that origin, and cache keys retain the full URL:
+A CodeArtifact strategy can opt repositories and package formats into a short-lived,
+process-local metadata cache. Add this block inside the `codeartifact` strategy
+for the desired origin:
 
 ```hcl
 # Inside codeartifact { ... }
-npm-metadata-cache {
-  repositories = ["pplx-frontend"]
+metadata-cache {
+  repositories = ["*"]
+  formats = ["npm", "pypi", "cargo", "swift"]
   ttl = "30s"
   max-bytes = 67108864
   max-concurrent = 4
 }
 ```
 
-Omit the block to keep the existing behavior. TTL must be 1 second through
-5 minutes, retained bytes 1 MiB through 1 GiB, and concurrent fills 1 through 32
-(default 4). Up to 1,024 representations are retained within the byte budget,
-including bodies, header strings, and keys. Expired entries are removed on access
-or insertion; the earliest-expiring entries are evicted when space is needed.
-Each process warms independently; this cache does not use shared disk or S3.
+`repositories = ["*"]` includes all repositories at that configured origin.
+Alternatively, name repositories explicitly, such as `["pplx-frontend", "pplx-ai",
+"pplx-cargo", "pplx-swift"]`. Repository names do not determine package formats:
+`formats` explicitly selects the adapters to enable. Empty lists, unsupported
+formats, and wildcard formats are rejected. Omit the entire block to disable the
+feature. The earlier `npm-metadata-cache` draft block is replaced by this schema;
+for npm-only behavior use `formats = ["npm"]`.
 
-Only package metadata (`react`, `@sanity/vision`, or `@sanity%2Fvision`) in the
-configured repositories qualifies. VPC endpoint origins (`vpce.amazonaws.com`
-and `vpce.amazonaws.com.cn`) also recognize
-`/npm/d/domain-owner/repository/package`; the domain-owner routing segment stays
-in the key so domains remain isolated. Version-specific documents, tarballs, other
-formats, and query requests retain the existing behavior. Full/abbreviated `Accept`
-variants and gzip/identity responses remain separate. Package policy runs before
-cache access. Cookies, ranges and conditional requests bypass cache reuse and
-storage, while authoritative failures still invalidate retained variants.
+| Format | Metadata admitted | Response handling |
+| --- | --- | --- |
+| npm | Package packuments, including `@scope/name` and `@scope%2Fname` | Rewrite JSON URLs; negotiate full/abbreviated JSON and gzip/identity. |
+| PyPI | Normalized project indexes at `/simple/project/` | Preserve HTML or Simple API v1 JSON bytes, links, hashes, and yank attributes. |
+| Cargo | `config.json` and canonical sparse crate-index paths | Rewrite config URLs/auth requirement; preserve complete newline-delimited index bytes and checksums. |
+| Swift | `scope/package` listings and explicit `scope/package/version.json` documents | Rewrite JSON URLs; preserve `Content-Version: 1`. |
+
+Version-specific npm documents, PyPI root listings and distribution sidecars,
+crate downloads, Swift extensionless version URLs, ZIPs and manifests, NuGet,
+Maven, Ruby, unknown formats, and query requests retain their existing behavior.
+Swift extensionless version URLs can return archives and are deliberately outside
+metadata admission. Request paths and response media types must both qualify.
+VPC endpoints (`vpce.amazonaws.com` and `vpce.amazonaws.com.cn`) also recognize
+`/format/d/domain-owner/repository/...`; full origin URLs, including domain routing,
+remain in cache keys. `Accept` and the complete `Accept-Encoding` request header
+select separate representations. Package policy still runs before cache access;
+this feature does not expand which formats the package-policy adapter evaluates.
+
+TTL must be 1 second through 5 minutes, retained bytes 1 MiB through 1 GiB, and
+concurrent fills 1 through 32 (default 4). All enabled repositories and formats
+share those budgets within one strategy instance in each process. Up to 1,024
+representations are retained, accounting for bodies, header strings, and keys.
+Expired entries are removed on access or insertion; the earliest-expiring entries
+are evicted when space is needed. Each process warms independently; retained
+metadata is not shared through the disk/S3 artifact cache.
 
 Freshness never slides on a hit and starts at fetch initiation. Origin age and
 shorter explicit freshness reduce the budget. `no-cache` or `max-age=0` requests
-force an origin refresh; `no-store` bypasses reuse and storage. Failed, incomplete,
-oversized, private, `no-store`, `no-cache`, cookie-bearing, and unsupported `Vary`
-responses are not retained. Forced refresh invalidates the previous representation
-before fetching, including on an origin error. A final 401, 403, or 404 also
-invalidates every representation of that package and prevents older concurrent
-fills from republishing it, including failures on bypassed requests. Stale data
-is never served as a fallback. Downstream cacheable metadata is marked
-`private, no-cache`, so clients must return to Cachew rather than extending its
-freshness window.
+force an origin refresh; `no-store` bypasses reuse and storage. Cookies, ranges,
+and conditional requests bypass reuse/storage. Failed, incomplete, oversized,
+private, `no-store`, `no-cache`, cookie-bearing, unsupported media-type, and
+unsupported `Vary` responses are not retained. Conditional requests continue to
+reach the origin; this is not ETag-based revalidation.
+
+Forced refresh discards the old representation before fetching, including on an
+origin error. Final 401, 403, 404, 410, and 451 responses, including bypassed reads,
+invalidate representations of that resource and prevent older concurrent fills
+from republishing it. Stale data is never served as a fallback. Downstream cached
+metadata is marked `private, no-cache` so clients return to Cachew rather than
+extending its freshness window.
 
 Concurrent equivalent requests share a complete response when its policy permits,
-including errors and successful responses too large to retain. Errors are never
-stored for later requests. Private, cookie-bearing, and otherwise unshareable
-responses remain isolated. Each caller has a one-minute total wait budget across
-fills; exhausting it returns 504. Canceling a waiter does not cancel the
-service-owned fill, which has its own one-minute deadline and the existing origin
-idle/header limits.
+including errors and successful responses too large to retain. Private and
+otherwise unshareable responses remain isolated. Each caller has a one-minute
+total wait budget across fills; exhausting it returns 504. Canceling a waiter does
+not cancel the service-owned fill, which has its own one-minute deadline and the
+existing origin idle/header limits. Saturated fill capacity returns 503 with
+`Retry-After: 1`.
 
-The existing 64 MiB decoded-input limit protects JSON rewriting. Valid metadata
-that grows beyond 64 MiB during rewriting is still delivered; the retained byte
-budget determines whether it can be cached. Non-success response bodies captured
-for waiting callers are capped at 64 MiB. Filling a different key beyond
-`max-concurrent` returns 503 with `Retry-After: 1`. Active JSON transformations and
-client writes require memory in addition to the retained byte budget; size pod
-memory accordingly.
+Captures above 1 MiB spool to private temporary files. Eligible bodies within the
+retained budget are loaded into memory; larger bodies are delivered without
+retention. Temporary files are closed and removed after their last waiter exits,
+including when all waiters cancel. Incomplete origin streams become 502 responses
+and cannot populate the cache. Spooling requires writable temporary storage;
+active files, JSON transformations, and client writes consume resources beyond
+the retained-byte budget. The existing 64 MiB decoded-input guard still applies
+to JSON rewriting, but valid metadata that expands beyond it during rewriting is
+still delivered. PyPI indexes and Cargo sparse indexes retain their existing
+byte-preserving behavior and are not subject to that JSON parsing limit.
 
-Metadata requests use `cache_mode=npm_metadata` on
+Metadata requests use `cache_mode=metadata` on
 `cachew.codeartifact.requests_total`. Filter
-`cachew.codeartifact.cache_operations_total` by `tier=npm_metadata` for `hit`,
-`miss` (a new fill), `coalesced` (joining a fill), `stored`, `not_cacheable`,
-`evicted` (capacity eviction), `bypass`, `capacity_rejected`, and `wait_timeout`
-events. A retry joining another fill records another miss or coalesced event;
-these are operation counts, not unique request counts. Labels contain no package
-names or URLs.
+`cachew.codeartifact.cache_operations_total` by `tier=metadata` for `hit`, `miss`
+(a new fill), `coalesced` (joining a fill), `stored`, `not_cacheable`, `evicted`
+(capacity eviction), `bypass`, `capacity_rejected`, and `wait_timeout`. A retry
+joining another fill records another operation; these are not unique request
+counts. Labels contain no package names or URLs.
 
-Enabling this policy can delay visibility of new versions, tag changes, removals,
-and origin permission changes by the configured interval. It is an explicit local
-freshness policy, not ETag revalidation: sampled CodeArtifact npm metadata did not
-supply usable validators. No validator-based savings are claimed.
+Enabling this policy can delay visibility of new versions, tag changes, yanks,
+removals, or origin permission changes by the configured interval. It is an
+explicit local freshness policy. Sampled CodeArtifact metadata lacked usable
+validators; no validator-based savings are claimed.
 
 ### Host
 
