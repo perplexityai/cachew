@@ -34,7 +34,7 @@ func TestClientEvaluatesOrganizationPolicy(t *testing.T) {
 			reasons:  []string{"malware"},
 		},
 		{
-			name:     "waits for pending analysis",
+			name:     "preserves pending analysis",
 			response: `{"type":"npm","name":"new-package","version":"1.0.0","alerts":[{"type":"pendingScan","action":"ignore"}]}`,
 			verdict:  VerdictPending,
 			reasons:  []string{"pendingScan"},
@@ -62,7 +62,7 @@ func TestClientEvaluatesOrganizationPolicy(t *testing.T) {
 				assert.Equal(t, "Bearer "+testToken, r.Header.Get("Authorization"))
 				assert.Equal(t, "true", r.URL.Query().Get("alerts"))
 				assert.Equal(t, "true", r.URL.Query().Get("compact"))
-				assert.Equal(t, "true", r.URL.Query().Get("poll"))
+				assert.Equal(t, "false", r.URL.Query().Get("poll"))
 				assert.Equal(t, "false", r.URL.Query().Get("purlErrors"))
 				assert.Equal(t, "30", r.URL.Query().Get("timeoutSec"))
 				assert.False(t, r.URL.Query().Has("labels"))
@@ -91,6 +91,14 @@ func TestClientEvaluatesOrganizationPolicy(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, test.verdict, decision.Verdict)
 			assert.Equal(t, test.reasons, decision.Reasons)
+			if test.verdict == VerdictPending {
+				assert.False(t, Cacheable(decision, nil))
+				closed := failClosedEvaluator{Evaluator: client}
+				decision, err = closed.Evaluate(t.Context(), testPURL)
+				assert.NoError(t, err)
+				assert.Equal(t, VerdictDeny, decision.Verdict)
+				assert.Equal(t, test.reasons, decision.Reasons)
+			}
 		})
 	}
 }
@@ -257,6 +265,7 @@ func TestSocketQueueTimeoutValidation(t *testing.T) {
 func TestClientPreservesDenialAtResponseLimit(t *testing.T) {
 	client, err := newSocketEvaluator(SocketConfig{
 		APIURL: "https://socket.example.com", Organization: testOrganization, Token: testToken,
+		Timeout: 5 * time.Second,
 	}, false)
 	assert.NoError(t, err)
 	client.httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {

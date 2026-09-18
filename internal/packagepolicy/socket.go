@@ -256,7 +256,7 @@ func (c *socketEvaluator) evaluateProvider(ctx context.Context, purl string) (De
 	query := endpoint.Query()
 	query.Set("alerts", "true")
 	query.Set("compact", "true")
-	query.Set("poll", "true")
+	query.Set("poll", "false")
 	query.Set("purlErrors", "false")
 	query.Set("timeoutSec", strconv.Itoa(c.timeoutSec))
 	if c.label != "" {
