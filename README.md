@@ -267,6 +267,55 @@ Recognized npm bodies that cannot be mapped are also denied in `enforce` mode,
 independent of `on-failure`. Audit records these denials without enforcing them.
 CodeArtifact `HEAD` requests are never evaluated and never admit a body to the cache.
 
+#### Package audit files
+
+An optional top-level block emits one structured NDJSON record for each npm
+artifact `GET` handled by an enabled CodeArtifact package policy:
+
+```hcl
+package-audit {
+  directory = "/var/log/cachew-package-audit"
+}
+```
+
+The directory must be private (`0700`), dedicated to one Cachew process, and
+absolute. Files are `0600`; run a separate collector under the same UID. Omitting
+the block disables collection. This does not send logs to any external service.
+Use a collector such as Fluent Bit to tail `package-audit-*.ndjson` and batch them
+to your approved destination with a persistent checkpoint and upload buffer.
+
+Records include a unique event ID, completion timestamp, PURL, policy mode and
+verdict, classified error, actual policy action, verdict-cache hit, response
+source, HTTP status, and policy/request durations. Audit denials have action
+`allow`; pending or failed-open results are not reported as Socket approvals.
+`verdict_cache_hit = false` does not prove this request made a Socket call:
+requests can share an evaluation, hit a breaker, or be excluded. Response source
+`origin` means the origin-handling path, including credential and upstream errors.
+An HTTP `200` does not prove a complete download or package installation.
+
+Excluded packages and unmappable paths have no PURL. Records never include raw
+URLs, queries, headers, provider response text, or asserted caller names. The
+actor is explicitly `unknown`: this proxy cannot authenticate an individual from
+caller-supplied headers. Other private packages still need exclusion before
+external delivery. Go modules, non-npm formats, metadata, `HEAD`, disabled policy,
+generic object API calls, and requests satisfied by a client's local cache are
+not included in this initial audit stream.
+
+Delivery is bounded and best-effort, not a lossless security ledger. Request
+handlers do not wait for disk, S3, or the SIEM. The queue holds 4,096 records;
+records over 8 KiB are dropped. At most sixteen 16 MiB segments are retained,
+and old files can be removed before a stalled collector reads them. Node loss
+can lose local records and upload buffers; downstream retries may duplicate
+records, so deduplicate on `event_id`. Graceful shutdown drains accepted records;
+abrupt termination can lose queued or unsynced records.
+
+Monitor `cachew.package_audit.events_total` by `result` for writes and drops,
+`cachew.package_audit.retention_evictions_total` for files evicted with delivery
+unknown, `cachew.package_audit.sync_errors_total` for disk-sync errors, and the
+aggregated warning logs. A local write or collector success
+counter is not proof of SIEM ingestion: verify S3 arrivals, buffer disk use, and
+SIEM ingestion lag separately before relying on coverage.
+
 #### Verdict reuse and overload
 
 Every eligible `GET`, including an artifact-cache hit, consults the verdict

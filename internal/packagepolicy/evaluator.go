@@ -47,6 +47,10 @@ const (
 type Decision struct {
 	Verdict Verdict
 	Reasons []string
+	// OriginalVerdict preserves the result before local fail-closed or cancellation handling.
+	OriginalVerdict Verdict
+	// VerdictCacheHit describes this request, not whether a provider call was coalesced.
+	VerdictCacheHit bool
 	// Audit reports the enforcement outcome without changing artifact serving or caching.
 	Audit bool
 }
@@ -121,10 +125,13 @@ func (e failClosedEvaluator) Evaluate(ctx context.Context, purl string) (Decisio
 		return decision, err //nolint:wrapcheck // Local overload must keep its distinct response and reason.
 	}
 	if err != nil {
-		return Decision{Verdict: VerdictDeny, Reasons: []string{outcomeUnavailable}}, errors.Wrap(err, "package policy: fail closed")
+		decision.Verdict = VerdictDeny
+		decision.Reasons = []string{outcomeUnavailable}
+		return decision, errors.Wrap(err, "package policy: fail closed")
 	}
 	if decision.Verdict == VerdictPending {
-		return Decision{Verdict: VerdictDeny, Reasons: decision.Reasons}, nil
+		decision.OriginalVerdict = decision.Verdict
+		decision.Verdict = VerdictDeny
 	}
 	return decision, nil
 }
