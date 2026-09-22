@@ -134,7 +134,11 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision Decision, err error) {
 	defer func() {
 		if cause := context.Cause(ctx); cause != nil {
-			decision = Decision{Verdict: VerdictDeny, Reasons: []string{"requestCanceled"}}
+			if decision.OriginalVerdict == "" {
+				decision.OriginalVerdict = decision.Verdict
+			}
+			decision.Verdict = VerdictDeny
+			decision.Reasons = []string{"requestCanceled"}
 			err = errors.Wrap(cause, "socket policy: request ended before evaluation completed")
 		}
 	}()

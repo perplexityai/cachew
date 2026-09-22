@@ -35,7 +35,13 @@ type metricsEvaluator struct {
 func (e *metricsEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
 	decision, err := e.Evaluator.Evaluate(ctx, purl)
 	if cause := context.Cause(ctx); cause != nil {
-		return Decision{Verdict: VerdictDeny, Reasons: []string{"requestCanceled"}, Audit: e.audit}, errors.Wrap(cause, "package policy: request ended before evaluation completed")
+		if decision.OriginalVerdict == "" && (err == nil || errors.Is(err, ErrOverloaded)) {
+			decision.OriginalVerdict = decision.Verdict
+		}
+		decision.Verdict = VerdictDeny
+		decision.Reasons = []string{"requestCanceled"}
+		decision.Audit = e.audit
+		return decision, errors.Wrap(cause, "package policy: request ended before evaluation completed")
 	}
 	decision.Audit = e.audit
 	e.metrics.recordOutcome(context.WithoutCancel(ctx), decision, err)

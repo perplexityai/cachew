@@ -47,6 +47,10 @@ const (
 type Decision struct {
 	Verdict Verdict
 	Reasons []string
+	// OriginalVerdict preserves the result before local fail-closed or cancellation handling.
+	OriginalVerdict Verdict
+	// VerdictCacheHit describes this request, not whether a provider call was coalesced.
+	VerdictCacheHit bool
 	// Audit reports the enforcement outcome without changing artifact serving or caching.
 	Audit bool
 }
@@ -71,18 +75,9 @@ func New(config Config) (Evaluator, error) {
 	if config.Socket == nil {
 		return nil, errors.New("package policy: provider is required")
 	}
-	patterns := make([]string, 0, len(config.ExcludePURLs))
-	for _, pattern := range config.ExcludePURLs {
-		if !strings.HasPrefix(pattern, "pkg:npm/") {
-			return nil, errors.New("package policy: exclude-purls supports only npm PURLs")
-		}
-		// Cachew emits npm scopes as %40; accept the natural @scope spelling so a private scope is not
-		// silently sent to the provider because of an encoding mismatch.
-		pattern = strings.Replace(pattern, "pkg:npm/@", "pkg:npm/%40", 1)
-		if _, err := path.Match(pattern, ""); err != nil {
-			return nil, errors.Wrap(err, "package policy: invalid exclude-purls pattern")
-		}
-		patterns = append(patterns, pattern)
+	patterns, err := NewExclusions(config.ExcludePURLs)
+	if err != nil {
+		return nil, err
 	}
 	if config.OnFailure != string(VerdictAllow) && config.OnFailure != string(VerdictDeny) {
 		return nil, errors.Errorf("package policy: on-failure must be allow or deny, got %q", config.OnFailure)
@@ -104,7 +99,7 @@ func New(config Config) (Evaluator, error) {
 	if config.OnFailure == string(VerdictDeny) {
 		evaluator = failClosedEvaluator{Evaluator: evaluator}
 	}
-	if len(patterns) > 0 {
+	if len(config.ExcludePURLs) > 0 {
 		evaluator = &excludingEvaluator{Evaluator: evaluator, patterns: patterns}
 	}
 	return &metricsEvaluator{Evaluator: evaluator, metrics: socket.metrics, audit: config.Mode == ModeAudit}, nil
@@ -121,28 +116,57 @@ func (e failClosedEvaluator) Evaluate(ctx context.Context, purl string) (Decisio
 		return decision, err //nolint:wrapcheck // Local overload must keep its distinct response and reason.
 	}
 	if err != nil {
-		return Decision{Verdict: VerdictDeny, Reasons: []string{outcomeUnavailable}}, errors.Wrap(err, "package policy: fail closed")
+		decision.Verdict = VerdictDeny
+		decision.Reasons = []string{outcomeUnavailable}
+		return decision, errors.Wrap(err, "package policy: fail closed")
 	}
 	if decision.Verdict == VerdictPending {
-		return Decision{Verdict: VerdictDeny, Reasons: decision.Reasons}, nil
+		decision.OriginalVerdict = decision.Verdict
+		decision.Verdict = VerdictDeny
 	}
 	return decision, nil
 }
 
 type excludingEvaluator struct {
 	Evaluator
-	patterns []string
+	patterns Exclusions
 }
 
 func (e *excludingEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
-	for _, pattern := range e.patterns {
-		matched, err := path.Match(pattern, purl)
-		if err != nil {
-			return Decision{}, errors.Wrap(err, "package policy: match exclude-purls pattern")
-		}
-		if matched {
-			return Decision{Verdict: VerdictNotApplicable}, nil
-		}
+	if e.patterns.Matches(purl) {
+		return Decision{Verdict: VerdictNotApplicable}, nil
 	}
 	return e.Evaluator.Evaluate(ctx, purl) //nolint:wrapcheck // The inner decorators already prefix the error.
+}
+
+// Exclusions matches validated npm privacy patterns without constructing a provider.
+type Exclusions struct {
+	patterns []string
+}
+
+// NewExclusions validates npm PURL globs and normalizes natural @scope spelling to emitted %40 scopes.
+func NewExclusions(patterns []string) (Exclusions, error) {
+	exclusions := Exclusions{}
+	for _, pattern := range patterns {
+		if !strings.HasPrefix(pattern, "pkg:npm/") {
+			return Exclusions{}, errors.New("exclude-purls supports only npm PURLs")
+		}
+		pattern = strings.Replace(pattern, "pkg:npm/@", "pkg:npm/%40", 1)
+		if _, err := path.Match(pattern, ""); err != nil {
+			return Exclusions{}, errors.Wrap(err, "invalid exclude-purls pattern")
+		}
+		exclusions.patterns = append(exclusions.patterns, pattern)
+	}
+	return exclusions, nil
+}
+
+// Matches reports whether a coordinate is excluded. The zero value excludes nothing.
+func (e Exclusions) Matches(purl string) bool {
+	for _, pattern := range e.patterns {
+		matched, err := path.Match(pattern, purl)
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
 }
