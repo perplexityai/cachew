@@ -393,7 +393,7 @@ func (c *CodeArtifact) evaluatePackage(r *http.Request) (string, packagepolicy.D
 		c.packagePolicy.ObserveNotApplicable(r.Context())
 		return "", packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil
 	case err != nil:
-		reason := "unmappable_package"
+		reason := codeArtifactUnmappablePackage
 		if errors.Is(err, packagepolicy.ErrEncodedSeparator) {
 			reason = "encoded_separator"
 		}

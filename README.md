@@ -283,13 +283,16 @@ absolute. Files are `0600`; run a separate collector under the same UID. Omittin
 the block disables collection. This does not send logs to any external service.
 Use a collector such as Fluent Bit to tail `package-audit-*.ndjson` and batch them
 to your approved destination with a persistent checkpoint and upload buffer.
+Mount the audit directory read-only in the collector. Collectors must never
+delete, rename, or truncate files, including after upload: any segment may still
+be open for writing. Cachew alone owns rotation and deletion.
 
 Records include a schema version, unique event ID, completion timestamp, PURL,
 policy mode and verdict, classified error, actual policy action, verdict-cache
 hit, response source, HTTP status, and policy/request durations. Audit denials
-have action `allow`; pending or failed-open results are not reported as Socket
+have action `allow`; pending or failed-open results are not reported as provider
 approvals.
-`verdict_cache_hit = false` does not prove this request made a Socket call:
+`verdict_cache_hit = false` does not prove this request made a provider call:
 requests can share an evaluation, hit a breaker, or be excluded. Response source
 `origin` means the origin-handling path, including credential and upstream errors.
 An HTTP `200` does not prove a complete download or package installation.
@@ -297,7 +300,7 @@ An HTTP `200` does not prove a complete download or package installation.
 Excluded packages have `package_redacted = true`; unmappable paths have no PURL
 but are not privacy-redacted. Local mapping failures and overload are `deny`,
 not provider unavailability. Canceled requests preserve a known original verdict;
-without one they are `not_evaluated`, not a Socket denial or approval.
+without one they are `not_evaluated`, not a provider denial or approval.
 Records never include raw
 URLs, queries, headers, provider response text, or asserted caller names. The
 actor is explicitly `unknown`: this proxy cannot authenticate an individual from
@@ -322,7 +325,9 @@ reconstructed. Old files can be removed before a stalled collector reads them.
 Node loss can lose local records and upload buffers; downstream retries may
 duplicate records, so deduplicate on `event_id`. Graceful shutdown reserves up
 to five seconds inside `shutdown-timeout` (at most half a shorter budget) for
-audit drain, after HTTP shutdown. Once its deadline expires, queued records are
+audit drain, after HTTP shutdown. If HTTP draining exceeds its initial budget,
+handlers may use the remaining shutdown budget before the sink closes. At the
+overall deadline, remaining connections are closed and queued records are
 abandoned. A blocked disk syscall cannot be forcibly interrupted: cleanup,
 directory lock release, and `dropped_shutdown_timeout` accounting wait for the
 worker to resume or the process to exit. The caller still returns by its

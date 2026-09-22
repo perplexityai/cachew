@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	codeArtifactAuditOrigin      = "origin"
-	codeArtifactAuditUnavailable = "unavailable"
+	codeArtifactAuditOrigin       = "origin"
+	codeArtifactAuditUnavailable  = "unavailable"
+	codeArtifactUnmappablePackage = "unmappable_package"
 )
 
 func codeArtifactAuditEvent(purl string, decision packagepolicy.Decision, err error) packageaudit.Event {
@@ -51,7 +52,7 @@ func codeArtifactAuditEvent(purl string, decision packagepolicy.Decision, err er
 		event.PolicyError = "overloaded"
 		event.PolicyVerdict = string(packagepolicy.VerdictDeny)
 	case errors.Is(err, packagepolicy.ErrEncodedSeparator), errors.Is(err, packagepolicy.ErrUnmappablePackage):
-		event.PolicyError = "unmappable_package"
+		event.PolicyError = codeArtifactUnmappablePackage
 		event.PolicyVerdict = string(packagepolicy.VerdictDeny)
 	case errors.Is(err, packagepolicy.ErrCircuitOpen):
 		event.PolicyError = "circuit_open"

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"slices"
 	"strconv"
@@ -67,7 +66,7 @@ type Sink struct {
 	stop             chan struct{}
 	stopOnce         sync.Once
 	closeErr         error
-	logger           *slog.Logger
+	warn             func(string, ...any)
 	root             *os.Root
 	lock             *os.File
 	file             *os.File
@@ -104,7 +103,8 @@ func FromContext(ctx context.Context) *Sink {
 }
 
 // New opens a private, bounded spool without making any network requests.
-func New(config Config, logger *slog.Logger) (*Sink, error) {
+// If non-nil, warn reports delivery problems from the background worker using message and key/value arguments.
+func New(config Config, warn func(string, ...any)) (*Sink, error) {
 	root, err := openAuditRoot(config.Directory)
 	if err != nil {
 		return nil, errors.Errorf("open package audit directory: %w", err)
@@ -121,7 +121,7 @@ func New(config Config, logger *slog.Logger) (*Sink, error) {
 	}
 	meter := otel.Meter("cachew.package_audit")
 	sink := &Sink{
-		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}), logger: logger,
+		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}), warn: warn,
 		root: root, lock: lock, fileSize: maxFileSize, fileLimit: maxFiles,
 		events: metrics.NewMetric[metric.Int64Counter](meter, "cachew.package_audit.events_total", "{events}",
 			"Audit events written locally or dropped; local writes do not confirm collector delivery"),
@@ -432,8 +432,8 @@ func (s *Sink) report(force bool) {
 	}
 	s.lastWarn = time.Now()
 	dropped, evicted, unsynced, unpruned := s.dropped.Swap(0), s.evicted.Swap(0), s.unsynced.Swap(0), s.unpruned.Swap(0)
-	if dropped != 0 || evicted != 0 || unsynced != 0 || unpruned != 0 {
-		s.logger.Warn("Package audit delivery incomplete or uncertain", "dropped_events", dropped,
+	if s.warn != nil && (dropped != 0 || evicted != 0 || unsynced != 0 || unpruned != 0) {
+		s.warn("Package audit delivery incomplete or uncertain", "dropped_events", dropped,
 			"retention_evictions_delivery_unknown", evicted, "sync_errors", unsynced, "retention_errors", unpruned)
 	}
 }

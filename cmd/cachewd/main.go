@@ -152,7 +152,7 @@ func main() { //nolint:funlen // Keep startup and shutdown ordering together.
 	}()
 
 	if globalConfig.PackageAudit != nil {
-		auditSink, err := packageaudit.New(*globalConfig.PackageAudit, logger)
+		auditSink, err := packageaudit.New(*globalConfig.PackageAudit, logger.Warn)
 		fatalIfError(ctx, logger, err, "Failed to start package audit writer")
 		ctx = packageaudit.ContextWithSink(ctx, auditSink)
 	}
@@ -229,6 +229,13 @@ func gracefulShutdown(
 	httpCtx, cancelHTTP := context.WithTimeout(shutdownCtx, httpTimeout)
 	err := server.Shutdown(httpCtx)
 	cancelHTTP()
+	if err != nil && auditSink != nil {
+		// The reserved audit budget must not close the sink underneath live handlers.
+		err = server.Shutdown(shutdownCtx)
+		if err != nil {
+			_ = server.Close()
+		}
+	}
 	if err != nil {
 		logger.ErrorContext(shutdownCtx, "Server shutdown error", "error", err)
 	} else {

@@ -29,7 +29,7 @@ func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 		_, _ = io.WriteString(w, testCodeArtifactBody)
 	}))
 	directory := filepath.Join(t.TempDir(), "audit")
-	sink, err := packageaudit.New(packageaudit.Config{Directory: directory}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sink, err := packageaudit.New(packageaudit.Config{Directory: directory}, slog.New(slog.NewTextHandler(io.Discard, nil)).Warn)
 	assert.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, sink.Close(context.Background())) })
 	strategy.packageAudit = sink

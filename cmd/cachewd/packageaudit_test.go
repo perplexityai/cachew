@@ -49,10 +49,16 @@ func TestPackageAuditConfigIsOptIn(t *testing.T) {
 }
 
 func TestGracefulShutdownDrainsAuditAfterHTTP(t *testing.T) {
+	for _, delay := range []time.Duration{0, 650 * time.Millisecond} {
+		t.Run(delay.String(), func(t *testing.T) { testGracefulShutdownDrainsAuditAfterHTTP(t, delay) })
+	}
+}
+
+func testGracefulShutdownDrainsAuditAfterHTTP(t *testing.T, delay time.Duration) {
 	const purl = "pkg:npm/shutdown-test@1.0.0"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	directory := filepath.Join(t.TempDir(), "audit")
-	sink, err := packageaudit.New(packageaudit.Config{Directory: directory}, logger)
+	sink, err := packageaudit.New(packageaudit.Config{Directory: directory}, logger.Warn)
 	assert.NoError(t, err)
 	ctx, cancel := context.WithCancel(packageaudit.ContextWithSink(t.Context(), sink))
 	cancel()
@@ -69,13 +75,15 @@ func TestGracefulShutdownDrainsAuditAfterHTTP(t *testing.T) {
 	requestDone := startAuditShutdownRequest(t, server.URL)
 	<-entered
 	shutdownStarted, shutdownDone := make(chan struct{}), make(chan struct{})
-	server.Config.RegisterOnShutdown(func() { close(shutdownStarted) })
+	var shutdownOnce sync.Once
+	server.Config.RegisterOnShutdown(func() { shutdownOnce.Do(func() { close(shutdownStarted) }) })
 	var shuttingDown atomic.Bool
 	go func() {
 		gracefulShutdown(ctx, logger, server.Config, &shuttingDown, 0, time.Second)
 		close(shutdownDone)
 	}()
 	<-shutdownStarted
+	time.Sleep(delay)
 	releaseOnce.Do(func() { close(release) })
 	<-shutdownDone
 	assert.NoError(t, <-requestDone)
@@ -88,21 +96,20 @@ func TestGracefulShutdownDrainsAuditAfterHTTP(t *testing.T) {
 	var event packageaudit.Event
 	assert.NoError(t, json.Unmarshal(data, &event))
 	assert.Equal(t, purl, event.PURL)
-	reopened, err := packageaudit.New(packageaudit.Config{Directory: directory}, logger)
+	reopened, err := packageaudit.New(packageaudit.Config{Directory: directory}, logger.Warn)
 	assert.NoError(t, err)
 	assert.NoError(t, reopened.Close(t.Context()))
 }
 
-func TestGracefulShutdownReservesAuditBudgetOnlyWhenEnabled(t *testing.T) {
+func TestGracefulShutdownBoundsBlockedHandlers(t *testing.T) {
 	const shutdownTimeout = time.Second
 	for _, enabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("audit=%t", enabled), func(t *testing.T) {
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			ctx := t.Context()
 			if enabled {
-				sink, err := packageaudit.New(packageaudit.Config{Directory: filepath.Join(t.TempDir(), "audit")}, logger)
+				sink, err := packageaudit.New(packageaudit.Config{Directory: filepath.Join(t.TempDir(), "audit")}, logger.Warn)
 				assert.NoError(t, err)
-				assert.NoError(t, sink.Close(t.Context()))
 				ctx = packageaudit.ContextWithSink(ctx, sink)
 			}
 			entered, release := make(chan struct{}), make(chan struct{})
@@ -121,12 +128,8 @@ func TestGracefulShutdownReservesAuditBudgetOnlyWhenEnabled(t *testing.T) {
 			start := time.Now()
 			gracefulShutdown(ctx, logger, server.Config, &shuttingDown, 0, shutdownTimeout)
 			elapsed := time.Since(start)
-			if enabled {
-				assert.True(t, elapsed >= shutdownTimeout/2)
-				assert.True(t, elapsed < shutdownTimeout*9/10)
-			} else {
-				assert.True(t, elapsed >= shutdownTimeout)
-			}
+			assert.True(t, elapsed >= shutdownTimeout)
+			assert.True(t, elapsed < 2*shutdownTimeout)
 		})
 	}
 }

@@ -27,10 +27,10 @@ const testPURL = "pkg:npm/example@1.2.3"
 func TestWriterDrainsRedactsAndLocks(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "audit")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	sink, err := New(Config{Directory: directory}, logger)
+	sink, err := New(Config{Directory: directory}, logger.Warn)
 	assert.NoError(t, err)
 	defer sink.Close(context.Background())
-	_, err = New(Config{Directory: directory}, logger)
+	_, err = New(Config{Directory: directory}, logger.Warn)
 	assert.Error(t, err)
 	assert.Equal(t, sink, FromContext(ContextWithSink(t.Context(), sink)))
 	assert.Equal(t, (*Sink)(nil), FromContext(t.Context()))
@@ -76,7 +76,7 @@ func TestWriterDrainsRedactsAndLocks(t *testing.T) {
 	}
 	assert.NoError(t, scanner.Err())
 	assert.Equal(t, 800, len(seen))
-	reopened, err := New(Config{Directory: directory}, logger)
+	reopened, err := New(Config{Directory: directory}, logger.Warn)
 	assert.NoError(t, err)
 	assert.NoError(t, reopened.Close(context.Background()))
 }
@@ -84,16 +84,16 @@ func TestWriterDrainsRedactsAndLocks(t *testing.T) {
 func TestWriterRejectsUnsafeDirectory(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for _, directory := range []string{"", "relative"} {
-		_, err := New(Config{Directory: directory}, logger)
+		_, err := New(Config{Directory: directory}, logger.Warn)
 		assert.Error(t, err)
 	}
 	directory := t.TempDir()
 	assert.NoError(t, os.Chmod(directory, 0755))
-	_, err := New(Config{Directory: directory}, logger)
+	_, err := New(Config{Directory: directory}, logger.Warn)
 	assert.Error(t, err)
 	link := filepath.Join(t.TempDir(), "symlink")
 	assert.NoError(t, os.Symlink(directory, link))
-	_, err = New(Config{Directory: link}, logger)
+	_, err = New(Config{Directory: link}, logger.Warn)
 	assert.Error(t, err)
 }
 
@@ -104,7 +104,7 @@ func TestWriterOverflowIsNonblockingAndReported(t *testing.T) {
 	counter, err := provider.Meter("test").Int64Counter("events")
 	assert.NoError(t, err)
 	var logs bytes.Buffer
-	sink := &Sink{queue: make(chan []byte, 1), events: counter, logger: slog.New(slog.NewTextHandler(&logs, nil))}
+	sink := &Sink{queue: make(chan []byte, 1), events: counter, warn: slog.New(slog.NewTextHandler(&logs, nil)).Warn}
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -156,7 +156,7 @@ func testWriter(t *testing.T, limit int) (*Sink, *sdkmetric.ManualReader) {
 	sink := &Sink{root: root, lock: lock, fileSize: 20, fileLimit: limit,
 		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}),
 		events: events, evictions: evictions, syncErrors: syncErrors, retentionErrors: retentionErrors,
-		shutdownTimeouts: shutdownTimeouts, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		shutdownTimeouts: shutdownTimeouts, warn: slog.New(slog.NewTextHandler(io.Discard, nil)).Warn}
 	t.Cleanup(func() {
 		_ = sink.closeFile()
 		_ = lock.Close()
@@ -382,7 +382,7 @@ func TestSyncFailureAndNonRegularSegment(t *testing.T) {
 }
 
 func TestRecordRacesCloseSafely(t *testing.T) {
-	sink, err := New(Config{Directory: filepath.Join(t.TempDir(), "audit")}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sink, err := New(Config{Directory: filepath.Join(t.TempDir(), "audit")}, slog.New(slog.NewTextHandler(io.Discard, nil)).Warn)
 	assert.NoError(t, err)
 	var workers sync.WaitGroup
 	for range 8 {
