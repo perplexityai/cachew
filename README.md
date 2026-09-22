@@ -270,11 +270,12 @@ CodeArtifact `HEAD` requests are never evaluated and never admit a body to the c
 #### Package audit files
 
 An optional top-level block emits one structured NDJSON record for each npm
-artifact `GET` handled by an enabled CodeArtifact package policy:
+artifact `GET` handled by CodeArtifact, whether package policy is enabled or not:
 
 ```hcl
 package-audit {
   directory = "/var/log/cachew-package-audit"
+  exclude-purls = ["pkg:npm/@private/*"]
 }
 ```
 
@@ -287,6 +288,15 @@ Mount the audit directory read-only in the collector. Collectors must never
 delete, rename, or truncate files, including after upload: any segment may still
 be open for writing. Cachew alone owns rotation and deletion.
 
+No policy provider or token is required for collection. With package policy
+omitted or disabled, records have `policy_mode = "disabled"`,
+`policy_verdict = "not_evaluated"`, `policy_action = "allow"`, and zero policy
+duration. Identification errors are recorded without changing serving or caching.
+Audit `exclude-purls` redacts coordinates independently of provider evaluation;
+it does not change a known verdict or exclude the package from policy checks.
+Configured package-policy exclusions also redact coordinates when that policy
+is disabled. Both settings accept npm PURL globs with `@scope` or `%40scope`.
+
 Records include a schema version, unique event ID, completion timestamp, PURL,
 policy mode and verdict, classified error, actual policy action, verdict-cache
 hit, response source, HTTP status, and policy/request durations. Audit denials
@@ -298,7 +308,7 @@ requests can share an evaluation, hit a breaker, or be excluded. Response source
 An HTTP `200` does not prove a complete download or package installation.
 
 Excluded packages have `package_redacted = true`; unmappable paths have no PURL
-but are not privacy-redacted. Local mapping failures and overload are `deny`,
+but are not privacy-redacted. With policy enabled, local mapping failures and overload are `deny`,
 not provider unavailability. Canceled requests preserve a known original verdict;
 without one they are `not_evaluated`, not a provider denial or approval.
 Records never include raw
@@ -307,7 +317,7 @@ actor is explicitly `unknown`: this proxy cannot authenticate an individual from
 caller-supplied headers. PURLs are untrusted request-derived coordinates, not
 validated public package metadata; their text can contain caller-chosen data.
 Other private packages still need exclusion before
-external delivery. Go modules, non-npm formats, metadata, `HEAD`, disabled policy,
+external delivery. Go modules, non-npm formats, metadata, `HEAD`,
 generic object API calls, and requests satisfied by a client's local cache are
 not included in this initial audit stream.
 

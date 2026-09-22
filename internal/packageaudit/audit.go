@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/block/cachew/internal/metrics"
+	"github.com/block/cachew/internal/packagepolicy"
 )
 
 const (
@@ -35,7 +36,8 @@ const (
 
 // Config enables local audit delivery; the directory must be dedicated to one Cachew process and its collector.
 type Config struct {
-	Directory string `hcl:"directory,optional" help:"Required when enabled: private directory for bounded package audit NDJSON files."`
+	Directory    string   `hcl:"directory,optional" help:"Required when enabled: private directory for bounded package audit NDJSON files."`
+	ExcludePURLs []string `hcl:"exclude-purls,optional" help:"npm PURL globs to redact from audit records, independently of package policy."`
 }
 
 // Event deliberately excludes unverified identity, request headers, URLs, and provider response bodies.
@@ -59,6 +61,7 @@ type Event struct {
 
 // Sink keeps disk and collector latency off request handlers. Close it after HTTP handlers have drained.
 type Sink struct {
+	exclusions       packagepolicy.Exclusions
 	mu               sync.RWMutex
 	closed           bool
 	queue            chan []byte
@@ -105,6 +108,10 @@ func FromContext(ctx context.Context) *Sink {
 // New opens a private, bounded spool without making any network requests.
 // If non-nil, warn reports delivery problems from the background worker using message and key/value arguments.
 func New(config Config, warn func(string, ...any)) (*Sink, error) {
+	exclusions, err := packagepolicy.NewExclusions(config.ExcludePURLs)
+	if err != nil {
+		return nil, errors.Wrap(err, "package audit")
+	}
 	root, err := openAuditRoot(config.Directory)
 	if err != nil {
 		return nil, errors.Errorf("open package audit directory: %w", err)
@@ -121,7 +128,8 @@ func New(config Config, warn func(string, ...any)) (*Sink, error) {
 	}
 	meter := otel.Meter("cachew.package_audit")
 	sink := &Sink{
-		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}), warn: warn,
+		exclusions: exclusions,
+		queue:      make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}), warn: warn,
 		root: root, lock: lock, fileSize: maxFileSize, fileLimit: maxFiles,
 		events: metrics.NewMetric[metric.Int64Counter](meter, "cachew.package_audit.events_total", "{events}",
 			"Audit events written locally or dropped; local writes do not confirm collector delivery"),
@@ -153,6 +161,7 @@ func (s *Sink) Record(event Event) {
 	if s == nil {
 		return
 	}
+	event.PackageRedacted = event.PackageRedacted || s.exclusions.Matches(event.PURL)
 	if event.PackageRedacted {
 		event.PURL = ""
 	}

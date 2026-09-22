@@ -58,6 +58,7 @@ type CodeArtifact struct {
 	packagePolicy         packagepolicy.Evaluator
 	policyAudit           bool
 	packageAudit          *packageaudit.Sink
+	auditExclusions       packagepolicy.Exclusions
 	fills                 singleflight.Group
 	originReadIdleTimeout time.Duration
 }
@@ -132,6 +133,12 @@ func newCodeArtifact(
 		originReadIdleTimeout: config.OriginReadIdleTimeout,
 		immutableFallbackTTL:  config.ImmutableFallbackTTL,
 		packageAudit:          packageaudit.FromContext(ctx),
+	}
+	if c.packageAudit != nil && config.PackagePolicy != nil {
+		c.auditExclusions, err = packagepolicy.NewExclusions(config.PackagePolicy.ExcludePURLs)
+		if err != nil {
+			return nil, errors.Wrap(err, "create audit exclusions")
+		}
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
@@ -232,7 +239,8 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		c.logger.Log(r.Context(), packagepolicy.LogLevel(err), "Package policy evaluation failed", "error", err)
 	}
-	if c.packageAudit == nil || (purl == "" && err == nil) {
+	event, audit := c.packageAuditEvent(r, purl, decision, err)
+	if !audit {
 		c.servePackage(w, r, decision, err)
 		return
 	}
@@ -240,10 +248,12 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	response := httpsnoop.CaptureMetricsFn(w, func(w http.ResponseWriter) {
 		source = c.servePackage(w, r, decision, err)
 	})
-	event := codeArtifactAuditEvent(purl, decision, err)
 	event.ResponseSource = source
 	event.HTTPStatus = response.Code
 	event.PolicyDurationMS = float64(policyDuration) / float64(time.Millisecond)
+	if c.packagePolicy == nil {
+		event.PolicyDurationMS = 0
+	}
 	event.RequestDurationMS = float64(time.Since(started)) / float64(time.Millisecond)
 	if c.policyAudit {
 		event.PolicyMode = packagepolicy.ModeAudit

@@ -3,6 +3,7 @@ package strategy //nolint:testpackage // Exercises the real HTTP path with a loc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,13 +12,96 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
 
+	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/packageaudit"
 	"github.com/block/cachew/internal/packagepolicy"
 )
+
+func TestCodeArtifactAuditWithoutProvider(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disabled=%t", disabled), func(t *testing.T) {
+			_, origin, tokens, _, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", testCodeArtifactCacheControl)
+				_, _ = io.WriteString(w, testCodeArtifactBody)
+			}))
+			directory := filepath.Join(t.TempDir(), "audit")
+			sink, err := packageaudit.New(packageaudit.Config{Directory: directory, ExcludePURLs: []string{"pkg:npm/@private/*"}}, nil)
+			assert.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, sink.Close(context.Background())) })
+			ctx = packageaudit.ContextWithSink(ctx, sink)
+			config := testCodeArtifactConfig(origin.URL)
+			if disabled {
+				config.PackagePolicy = &packagepolicy.Config{Mode: packagepolicy.ModeDisabled, ExcludePURLs: []string{"pkg:npm/@policy-private/*"}}
+			}
+			memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+			assert.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, memory.Close()) })
+			mux := http.NewServeMux()
+			strategy, err := newCodeArtifact(ctx, config, mux, tokens.tokenManager(time.Now), memory, true)
+			assert.NoError(t, err)
+			if disabled {
+				strategy.packagePolicy, err = packagepolicy.New(*config.PackagePolicy)
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, nil, strategy.packagePolicy)
+			paths := []string{
+				"/npm/repository/package/-/package-1.0.0.tgz",
+				"/npm/repository/package/-/package-1.0.0.tgz",
+				"/npm/repository/@private/name/-/name-1.0.0.tgz",
+				"/npm/repository/@policy-private/name/-/name-1.0.0.tgz",
+				"/npm/repository/package/-/different-1.0.0.tgz",
+			}
+			for _, path := range paths {
+				response := httptest.NewRecorder()
+				mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, path), nil).WithContext(ctx))
+				assert.Equal(t, http.StatusOK, response.Code)
+				assert.Equal(t, "", response.Header().Get("X-Cachew-Package-Policy"))
+			}
+			for _, path := range []string{"/npm/repository/package", "/pypi/repository/simple/package", "/cargo/repository/config.json"} {
+				mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, codeArtifactPath(origin, path), nil).WithContext(ctx))
+			}
+			mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodHead, codeArtifactPath(origin, paths[0]), nil).WithContext(ctx))
+			assert.NoError(t, sink.Close(context.Background()))
+			files, err := filepath.Glob(filepath.Join(directory, "*.ndjson"))
+			assert.NoError(t, err)
+			assert.Equal(t, 1, len(files))
+			data, err := os.ReadFile(files[0])
+			assert.NoError(t, err)
+			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+			assert.Equal(t, len(paths), len(lines))
+			for i, line := range lines {
+				var event packageaudit.Event
+				assert.NoError(t, json.Unmarshal([]byte(line), &event))
+				assert.Equal(t, packagepolicy.ModeDisabled, event.PolicyMode)
+				assert.Equal(t, "not_evaluated", event.PolicyVerdict)
+				assert.Equal(t, "allow", event.PolicyAction)
+				assert.Equal(t, float64(0), event.PolicyDurationMS)
+				assert.False(t, event.VerdictCacheHit)
+				assert.Equal(t, i == 2 || (i == 3 && disabled), event.PackageRedacted)
+				if event.PackageRedacted || i == 4 {
+					assert.Equal(t, "", event.PURL)
+				} else {
+					assert.NotZero(t, event.PURL)
+				}
+				if i == 1 {
+					assert.Equal(t, "cache", event.ResponseSource)
+				} else {
+					assert.Equal(t, "origin", event.ResponseSource)
+				}
+				if i == 4 {
+					assert.Equal(t, codeArtifactUnmappablePackage, event.PolicyError)
+				} else {
+					assert.Equal(t, "", event.PolicyError)
+				}
+			}
+		})
+	}
+}
 
 func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 	const packagePath = "/npm/repository/package/-/package-1.0.0.tgz"
@@ -29,7 +113,7 @@ func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 		_, _ = io.WriteString(w, testCodeArtifactBody)
 	}))
 	directory := filepath.Join(t.TempDir(), "audit")
-	sink, err := packageaudit.New(packageaudit.Config{Directory: directory}, slog.New(slog.NewTextHandler(io.Discard, nil)).Warn)
+	sink, err := packageaudit.New(packageaudit.Config{Directory: directory, ExcludePURLs: []string{"pkg:npm/@private/*"}}, slog.New(slog.NewTextHandler(io.Discard, nil)).Warn)
 	assert.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, sink.Close(context.Background())) })
 	strategy.packageAudit = sink
@@ -52,6 +136,7 @@ func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 		{packagePath, http.MethodGet, "pending", "", "deny", "policy", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, OriginalVerdict: packagepolicy.VerdictPending}, nil, 403, false},
 		{packagePath, http.MethodGet, "deny", "overloaded", "deny", "policy", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, packagepolicy.ErrOverloaded, 503, false},
 		{privatePath, http.MethodGet, "not_applicable", "", "allow", "origin", packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil, 200, true},
+		{privatePath, http.MethodGet, "allow", "", "allow", "cache", packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow}, nil, 200, true},
 		{"/npm/repository/package/-/different-1.0.0.tgz", http.MethodGet, "deny", "unmappable_package", "deny", "policy", packagepolicy.Decision{}, nil, 403, false},
 	}
 	for _, test := range tests {

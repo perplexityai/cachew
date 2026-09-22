@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"context"
+	"net/http"
 	"slices"
 
 	"github.com/alecthomas/errors"
@@ -9,6 +10,28 @@ import (
 	"github.com/block/cachew/internal/packageaudit"
 	"github.com/block/cachew/internal/packagepolicy"
 )
+
+func (c *CodeArtifact) packageAuditEvent(r *http.Request, purl string, decision packagepolicy.Decision, err error) (packageaudit.Event, bool) {
+	if c.packageAudit == nil || r.Method != http.MethodGet {
+		return packageaudit.Event{}, false
+	}
+	if c.packagePolicy != nil {
+		return codeArtifactAuditEvent(purl, decision, err), purl != "" || err != nil
+	}
+	origin := c.originURL(r)
+	purl, err = packagepolicy.PackageURLForCodeArtifact(&origin)
+	if errors.Is(err, packagepolicy.ErrNotApplicable) {
+		return packageaudit.Event{}, false
+	}
+	event := packageaudit.Event{
+		PURL: purl, PackageRedacted: c.auditExclusions.Matches(purl),
+		PolicyMode: packagepolicy.ModeDisabled, PolicyVerdict: "not_evaluated", PolicyAction: "allow",
+	}
+	if err != nil {
+		event.PolicyError = codeArtifactUnmappablePackage
+	}
+	return event, true
+}
 
 const (
 	codeArtifactAuditOrigin       = "origin"

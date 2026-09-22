@@ -31,6 +31,7 @@ func TestPackageAuditConfigIsOptIn(t *testing.T) {
 	}{
 		{},
 		{input: `package-audit { directory = "/var/log/cachew/audit" }`, enabled: true},
+		{input: `package-audit { directory = "/var/log/cachew/audit" exclude-purls = ["pkg:npm/@private/*"] }`, enabled: true},
 		{input: `package-audit {}`, invalid: true},
 		{input: `package-audit { directory = "" }`, invalid: true},
 	} {
@@ -112,10 +113,15 @@ func TestGracefulShutdownBoundsBlockedHandlers(t *testing.T) {
 				assert.NoError(t, err)
 				ctx = packageaudit.ContextWithSink(ctx, sink)
 			}
-			entered, release := make(chan struct{}), make(chan struct{})
-			server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+			entered, release, canceled := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 				close(entered)
-				<-release
+				select {
+				case <-r.Context().Done():
+					close(canceled)
+					<-release
+				case <-release:
+				}
 			}))
 			t.Cleanup(server.Close)
 			requestDone := startAuditShutdownRequest(t, server.URL)
@@ -130,6 +136,13 @@ func TestGracefulShutdownBoundsBlockedHandlers(t *testing.T) {
 			elapsed := time.Since(start)
 			assert.True(t, elapsed >= shutdownTimeout)
 			assert.True(t, elapsed < 2*shutdownTimeout)
+			if enabled {
+				select {
+				case <-canceled:
+				case <-time.After(time.Second):
+					t.Fatal("shutdown did not cancel the blocked request before handler release")
+				}
+			}
 		})
 	}
 }

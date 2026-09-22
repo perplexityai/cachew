@@ -24,6 +24,16 @@ import (
 
 const testPURL = "pkg:npm/example@1.2.3"
 
+func TestAuditRejectsInvalidPrivacyPatterns(t *testing.T) {
+	for _, pattern := range []string{"pkg:pypi/private*", "pkg:npm/["} {
+		directory := filepath.Join(t.TempDir(), "audit")
+		_, err := New(Config{Directory: directory, ExcludePURLs: []string{pattern}}, nil)
+		assert.Error(t, err)
+		_, err = os.Stat(directory)
+		assert.True(t, os.IsNotExist(err))
+	}
+}
+
 func TestWriterDrainsRedactsAndLocks(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "audit")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
