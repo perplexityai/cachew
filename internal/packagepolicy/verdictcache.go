@@ -49,6 +49,7 @@ func (c *cachingEvaluator) Evaluate(ctx context.Context, purl string) (Decision,
 		c.metrics.recordCacheLookup(context.WithoutCancel(ctx), hit)
 	}
 	if hit {
+		entry.decision.VerdictCacheHit = true
 		return entry.decision, entry.err
 	}
 	decision, err := c.Evaluator.Evaluate(ctx, purl)
