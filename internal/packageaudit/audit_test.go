@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/alecthomas/assert/v2"
+	"github.com/alecthomas/errors"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -29,7 +29,7 @@ func TestWriterDrainsRedactsAndLocks(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sink, err := New(Config{Directory: directory}, logger)
 	assert.NoError(t, err)
-	defer sink.Close()
+	defer sink.Close(context.Background())
 	_, err = New(Config{Directory: directory}, logger)
 	assert.Error(t, err)
 	assert.Equal(t, sink, FromContext(ContextWithSink(t.Context(), sink)))
@@ -45,8 +45,8 @@ func TestWriterDrainsRedactsAndLocks(t *testing.T) {
 		})
 	}
 	workers.Wait()
-	assert.NoError(t, sink.Close())
-	assert.NoError(t, sink.Close())
+	assert.NoError(t, sink.Close(context.Background()))
+	assert.NoError(t, sink.Close(context.Background()))
 	files, err := filepath.Glob(filepath.Join(directory, "*.ndjson"))
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(files))
@@ -78,7 +78,7 @@ func TestWriterDrainsRedactsAndLocks(t *testing.T) {
 	assert.Equal(t, 800, len(seen))
 	reopened, err := New(Config{Directory: directory}, logger)
 	assert.NoError(t, err)
-	assert.NoError(t, reopened.Close())
+	assert.NoError(t, reopened.Close(context.Background()))
 }
 
 func TestWriterRejectsUnsafeDirectory(t *testing.T) {
@@ -134,35 +134,251 @@ func TestWriterOverflowIsNonblockingAndReported(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(logs.String(), "Package audit delivery"))
 }
 
-func TestWriterRotationRetentionAndWriteFailure(t *testing.T) {
+func testWriter(t *testing.T, limit int) (*Sink, *sdkmetric.ManualReader) {
+	t.Helper()
 	root, err := os.OpenRoot(t.TempDir())
 	assert.NoError(t, err)
-	defer root.Close()
-	meter := otel.Meter("test")
-	events, err := meter.Int64Counter("package_audit_test_events")
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	meter := provider.Meter("test")
+	events, err := meter.Int64Counter("events")
 	assert.NoError(t, err)
-	evictions, err := meter.Int64Counter("package_audit_test_evictions")
+	evictions, err := meter.Int64Counter("evictions")
 	assert.NoError(t, err)
-	sink := &Sink{root: root, fileSize: 20, fileLimit: 2, events: events, evictions: evictions, syncErrors: events}
+	syncErrors, err := meter.Int64Counter("sync_errors")
+	assert.NoError(t, err)
+	retentionErrors, err := meter.Int64Counter("retention_errors")
+	assert.NoError(t, err)
+	shutdownTimeouts, err := meter.Int64Counter("shutdown_timeouts")
+	assert.NoError(t, err)
+	lock, err := root.OpenFile(".lock", os.O_CREATE|os.O_RDWR, 0600)
+	assert.NoError(t, err)
+	sink := &Sink{root: root, lock: lock, fileSize: 20, fileLimit: limit,
+		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}),
+		events: events, evictions: evictions, syncErrors: syncErrors, retentionErrors: retentionErrors,
+		shutdownTimeouts: shutdownTimeouts, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	t.Cleanup(func() {
+		_ = sink.closeFile()
+		_ = lock.Close()
+		_ = root.Close()
+		assert.NoError(t, provider.Shutdown(context.Background()))
+	})
+	return sink, reader
+}
+
+func metricCounts(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var data metricdata.ResourceMetrics
+	assert.NoError(t, reader.Collect(t.Context(), &data))
+	counts := map[string]int64{}
+	for _, scope := range data.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			for _, point := range metric.Data.(metricdata.Sum[int64]).DataPoints {
+				key := metric.Name
+				if attrs := point.Attributes.ToSlice(); len(attrs) != 0 {
+					key += ":" + attrs[0].Value.AsString()
+				}
+				counts[key] += point.Value
+			}
+		}
+	}
+	return counts
+}
+
+const testRecord = "{\"test\":1}\n"
+
+func TestWriterRotationRetentionAndWriteFailure(t *testing.T) {
+	sink, _ := testWriter(t, 2)
 	assert.NoError(t, sink.rotate())
-	firstName := sink.files[0]
+	firstName := sink.name
 	for range 5 {
-		assert.NoError(t, sink.write([]byte("{\"test\":1}\n")))
+		assert.NoError(t, sink.write([]byte(testRecord)))
 	}
 	assert.NoError(t, sink.closeFile())
 	assert.Equal(t, int64(3), sink.evicted.Load())
 	assert.Equal(t, 2, len(sink.files))
-	_, err = root.Stat(firstName)
+	_, err := sink.root.Stat(firstName)
 	assert.True(t, os.IsNotExist(err))
 	for _, name := range sink.files {
-		info, err := root.Stat(name)
+		info, err := sink.root.Stat(name)
 		assert.NoError(t, err)
 		assert.True(t, info.Size() <= sink.fileSize)
 	}
+}
+
+func TestPersistentWriteFailurePreservesRetainedHistory(t *testing.T) {
+	sink, _ := testWriter(t, 3)
+	for range 3 {
+		assert.NoError(t, sink.write([]byte(testRecord)))
+	}
+	healthy := append([]string(nil), sink.files...)
 	assert.NoError(t, sink.rotate())
 	assert.NoError(t, sink.file.Close())
-	assert.Error(t, sink.write([]byte("{\"test\":2}\n")))
-	assert.Equal(t, (*os.File)(nil), sink.file)
+	var err error
+	sink.file, err = sink.root.Open(sink.name)
+	assert.NoError(t, err)
+	failedFile := sink.file
+	for range 6 {
+		assert.Error(t, sink.write([]byte(testRecord)))
+	}
+	assert.Equal(t, healthy, sink.files)
+	assert.True(t, failedFile == sink.file)
+	assert.Equal(t, int64(0), sink.evicted.Load())
+	for _, name := range healthy {
+		data, err := sink.root.ReadFile(name)
+		assert.NoError(t, err)
+		assert.Equal(t, testRecord, string(data))
+	}
+	assert.NoError(t, sink.file.Close())
+	sink.file, err = sink.root.OpenFile(sink.name, os.O_RDWR, 0600)
+	assert.NoError(t, err)
+	_, err = sink.file.WriteAt([]byte("partial abandoned record with a longer tail"), 0)
+	assert.NoError(t, err)
+	assert.NoError(t, sink.write([]byte(testRecord)))
+	assert.Equal(t, int64(1), sink.evicted.Load())
+	data, err := sink.root.ReadFile(sink.name)
+	assert.NoError(t, err)
+	assert.Equal(t, testRecord, string(data))
+}
+
+func TestRetentionFailureBlocksGrowthUntilRecovery(t *testing.T) {
+	sink, reader := testWriter(t, 1)
+	assert.NoError(t, sink.write([]byte(testRecord)))
+	oldest := sink.name
+	assert.NoError(t, sink.closeFile())
+	assert.NoError(t, sink.root.Rename(oldest, "retained-record"))
+	assert.NoError(t, sink.root.Mkdir(oldest, 0700))
+	assert.NoError(t, sink.root.WriteFile(filepath.Join(oldest, "block-removal"), []byte(testRecord), 0600))
+	assert.NoError(t, sink.write([]byte(testRecord)))
+	assert.Equal(t, 2, len(sink.files))
+	assert.Error(t, sink.write([]byte(testRecord)))
+	assert.Equal(t, uint64(2), sink.sequence)
+	assert.Equal(t, int64(2), metricCounts(t, reader)["retention_errors"])
+	assert.NoError(t, sink.root.Remove(filepath.Join(oldest, "block-removal")))
+	assert.NoError(t, sink.root.Remove(oldest))
+	assert.NoError(t, sink.root.Rename("retained-record", oldest))
+	assert.NoError(t, sink.write([]byte(testRecord)))
+	assert.Equal(t, 1, len(sink.files))
+	data, err := sink.root.ReadFile(sink.name)
+	assert.NoError(t, err)
+	assert.Equal(t, testRecord, string(data))
+}
+
+func TestRestartOrderingAndMissingFiles(t *testing.T) {
+	sink, reader := testWriter(t, 3)
+	for range 3 {
+		assert.NoError(t, sink.write([]byte(testRecord)))
+	}
+	healthy := append([]string(nil), sink.files...)
+	assert.NoError(t, sink.closeFile())
+	// File timestamps deliberately run backwards; sequence order survives restart independently of the clock.
+	for i, name := range healthy {
+		stamp := time.Unix(int64(100-i), 0)
+		assert.NoError(t, sink.root.Chtimes(name, stamp, stamp))
+	}
+	sink.files, sink.sequence = nil, 0
+	assert.NoError(t, sink.loadFiles())
+	assert.Equal(t, healthy, sink.files)
+	assert.Equal(t, uint64(3), sink.sequence)
+	assert.NoError(t, sink.write([]byte(testRecord)))
+	assert.Equal(t, uint64(4), sink.sequence)
+	_, err := sink.root.Stat(healthy[0])
+	assert.True(t, os.IsNotExist(err))
+	assert.NoError(t, sink.root.Remove(sink.files[1]))
+	assert.NoError(t, sink.write([]byte(testRecord)))
+	assert.Equal(t, int64(1), metricCounts(t, reader)["evictions"])
+	_, err = sink.root.Stat(healthy[1])
+	assert.NoError(t, err)
+}
+
+func TestCloseDeadlineStopsDelayedWorkerAndCountsDrops(t *testing.T) {
+	sink, reader := testWriter(t, 3)
+	for range queueCapacity {
+		sink.Record(Event{PURL: testPURL})
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- sink.Close(ctx) }()
+	select {
+	case err := <-closed:
+		assert.True(t, errors.Is(err, context.DeadlineExceeded))
+	case <-time.After(time.Second):
+		t.Fatal("Close exceeded its deadline waiting for a stalled worker")
+	}
+	sink.Record(Event{PURL: testPURL})
+	// The worker resumes only after Close has returned, modeling a disk syscall that outlives its caller.
+	go sink.run()
+	select {
+	case <-sink.done:
+	case <-time.After(time.Second):
+		t.Fatal("worker drained abandoned records instead of stopping")
+	}
+	assert.Equal(t, map[string]int64{"shutdown_timeouts": 1, "events:dropped_closed": 1,
+		"events:dropped_shutdown_timeout": queueCapacity}, metricCounts(t, reader))
+	assert.Error(t, sink.Close(context.Background()))
+}
+
+func TestRestartRemovesOnlyEmptySegments(t *testing.T) {
+	sink, reader := testWriter(t, 3)
+	assert.NoError(t, sink.write([]byte(testRecord)))
+	healthy := sink.name
+	assert.NoError(t, sink.rotate())
+	empty := sink.name
+	assert.NoError(t, sink.file.Close())
+	sink.file = nil // Simulate a crash leaving the just-created empty segment behind.
+	sink.files, sink.sequence = nil, 0
+	assert.NoError(t, sink.loadFiles())
+	assert.Equal(t, []string{healthy}, sink.files)
+	assert.Equal(t, uint64(2), sink.sequence)
+	_, err := sink.root.Stat(empty)
+	assert.True(t, os.IsNotExist(err))
+	data, err := sink.root.ReadFile(healthy)
+	assert.NoError(t, err)
+	assert.Equal(t, testRecord, string(data))
+	assert.Equal(t, int64(0), metricCounts(t, reader)["evictions"])
+}
+
+func TestWriteFailureBackoffIsInterruptible(t *testing.T) {
+	sink, reader := testWriter(t, 3)
+	assert.NoError(t, sink.rotate())
+	assert.NoError(t, sink.file.Close())
+	var err error
+	sink.file, err = sink.root.Open(sink.name)
+	assert.NoError(t, err)
+	for range 3 {
+		sink.queue <- []byte(testRecord)
+	}
+	go sink.run()
+	deadline := time.After(time.Second)
+	for len(sink.queue) == 3 {
+		select {
+		case <-deadline:
+			t.Fatal("worker never attempted its first write")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	assert.True(t, errors.Is(sink.Close(ctx), context.DeadlineExceeded))
+	select {
+	case <-sink.done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not interrupt disk-failure backoff")
+	}
+	counts := metricCounts(t, reader)
+	assert.Equal(t, int64(1), counts["events:dropped_write_error"])
+	assert.Equal(t, int64(2), counts["events:dropped_shutdown_timeout"])
+}
+
+func TestSyncFailureAndNonRegularSegment(t *testing.T) {
+	sink, reader := testWriter(t, 3)
+	assert.NoError(t, sink.rotate())
+	assert.NoError(t, sink.file.Close())
+	assert.Error(t, sink.syncFile())
+	assert.Equal(t, int64(1), metricCounts(t, reader)["sync_errors"])
+	assert.NoError(t, sink.root.Mkdir(filePrefix+"unexpected.ndjson", 0700))
+	assert.Error(t, sink.loadFiles())
 }
 
 func TestRecordRacesCloseSafely(t *testing.T) {
@@ -176,7 +392,7 @@ func TestRecordRacesCloseSafely(t *testing.T) {
 			}
 		})
 	}
-	workers.Go(func() { assert.NoError(t, sink.Close()) })
+	workers.Go(func() { assert.NoError(t, sink.Close(context.Background())) })
 	workers.Wait()
-	assert.NoError(t, sink.Close())
+	assert.NoError(t, sink.Close(context.Background()))
 }

@@ -35,7 +35,7 @@ type metricsEvaluator struct {
 func (e *metricsEvaluator) Evaluate(ctx context.Context, purl string) (Decision, error) {
 	decision, err := e.Evaluator.Evaluate(ctx, purl)
 	if cause := context.Cause(ctx); cause != nil {
-		if decision.OriginalVerdict == "" {
+		if decision.OriginalVerdict == "" && (err == nil || errors.Is(err, ErrOverloaded)) {
 			decision.OriginalVerdict = decision.Verdict
 		}
 		decision.Verdict = VerdictDeny

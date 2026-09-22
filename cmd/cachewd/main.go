@@ -51,7 +51,7 @@ type GlobalConfig struct {
 	ShutdownReadinessDelay time.Duration `hcl:"shutdown-readiness-delay,optional" default:"5s" help:"Delay between flipping readiness to 503 on SIGTERM and starting graceful shutdown."`
 	// ShutdownTimeout must be less than the pod's terminationGracePeriodSeconds
 	// (minus ShutdownReadinessDelay) or the kubelet will SIGKILL before Shutdown returns.
-	ShutdownTimeout  time.Duration        `hcl:"shutdown-timeout,optional" default:"150s" help:"Maximum time to wait for in-flight requests to drain on graceful shutdown."`
+	ShutdownTimeout  time.Duration        `hcl:"shutdown-timeout,optional" default:"150s" help:"Total graceful-shutdown budget for HTTP requests and local audit drain; audit reserves up to 5s inside this budget."`
 	RequestAdmission admission.Config     `hcl:"request-admission,block,optional"`
 	SchedulerConfig  jobscheduler.Config  `hcl:"scheduler,block"`
 	LoggingConfig    logging.Config       `hcl:"log,block"`
@@ -155,11 +155,6 @@ func main() { //nolint:funlen // Keep startup and shutdown ordering together.
 		auditSink, err := packageaudit.New(*globalConfig.PackageAudit, logger)
 		fatalIfError(ctx, logger, err, "Failed to start package audit writer")
 		ctx = packageaudit.ContextWithSink(ctx, auditSink)
-		defer func() {
-			if err := auditSink.Close(); err != nil {
-				logger.ErrorContext(context.WithoutCancel(ctx), "Failed to close package audit writer", "error", err)
-			}
-		}()
 	}
 
 	mux, err := newMux(ctx, &shuttingDown, cr, mr, sr, providersConfigHCL, envars)
@@ -207,8 +202,8 @@ func main() { //nolint:funlen // Keep startup and shutdown ordering together.
 	drainScheduler(ctx, logger, schedulerProvider)
 }
 
-// gracefulShutdown fails readiness, waits readinessDelay for load balancers
-// to drain, then runs http.Server.Shutdown bounded by shutdownTimeout.
+// gracefulShutdown keeps audit drain inside shutdownTimeout rather than adding an unbounded delay after HTTP shutdown.
+// Audit reserves up to five seconds, or half a shorter budget, while disabled audit preserves the full HTTP budget.
 func gracefulShutdown(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -226,10 +221,25 @@ func gracefulShutdown(
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	auditSink := packageaudit.FromContext(ctx)
+	httpTimeout := shutdownTimeout
+	if auditSink != nil {
+		httpTimeout -= min(5*time.Second, shutdownTimeout/2)
+	}
+	httpCtx, cancelHTTP := context.WithTimeout(shutdownCtx, httpTimeout)
+	err := server.Shutdown(httpCtx)
+	cancelHTTP()
+	if err != nil {
 		logger.ErrorContext(shutdownCtx, "Server shutdown error", "error", err)
 	} else {
 		logger.InfoContext(shutdownCtx, "Server shut down cleanly")
+	}
+	if auditSink != nil {
+		auditCtx, cancelAudit := context.WithTimeout(shutdownCtx, 5*time.Second)
+		defer cancelAudit()
+		if err := auditSink.Close(auditCtx); err != nil {
+			logger.ErrorContext(shutdownCtx, "Package audit shutdown incomplete", "error", err)
+		}
 	}
 }
 

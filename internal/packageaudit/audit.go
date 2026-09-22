@@ -4,10 +4,12 @@ package packageaudit
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,26 +60,34 @@ type Event struct {
 
 // Sink keeps disk and collector latency off request handlers. Close it after HTTP handlers have drained.
 type Sink struct {
-	mu         sync.RWMutex
-	closed     bool
-	queue      chan []byte
-	done       chan struct{}
-	closeErr   error
-	logger     *slog.Logger
-	root       *os.Root
-	lock       *os.File
-	file       *os.File
-	size       int64
-	files      []string
-	fileSize   int64
-	fileLimit  int
-	events     metric.Int64Counter
-	evictions  metric.Int64Counter
-	syncErrors metric.Int64Counter
-	dropped    atomic.Int64
-	evicted    atomic.Int64
-	unsynced   atomic.Int64
-	lastWarn   time.Time
+	mu               sync.RWMutex
+	closed           bool
+	queue            chan []byte
+	done             chan struct{}
+	stop             chan struct{}
+	stopOnce         sync.Once
+	closeErr         error
+	logger           *slog.Logger
+	root             *os.Root
+	lock             *os.File
+	file             *os.File
+	name             string
+	sequence         uint64
+	rollback         bool
+	size             int64
+	files            []string
+	fileSize         int64
+	fileLimit        int
+	events           metric.Int64Counter
+	evictions        metric.Int64Counter
+	syncErrors       metric.Int64Counter
+	retentionErrors  metric.Int64Counter
+	shutdownTimeouts metric.Int64Counter
+	dropped          atomic.Int64
+	evicted          atomic.Int64
+	unsynced         atomic.Int64
+	unpruned         atomic.Int64
+	lastWarn         time.Time
 }
 
 type contextKey struct{}
@@ -95,20 +105,7 @@ func FromContext(ctx context.Context) *Sink {
 
 // New opens a private, bounded spool without making any network requests.
 func New(config Config, logger *slog.Logger) (*Sink, error) {
-	if config.Directory == "" || !filepath.IsAbs(config.Directory) {
-		return nil, errors.Errorf("package audit directory must be a nonempty absolute path")
-	}
-	if err := os.MkdirAll(config.Directory, 0700); err != nil {
-		return nil, errors.Errorf("create package audit directory: %w", err)
-	}
-	info, err := os.Lstat(config.Directory)
-	if err != nil {
-		return nil, errors.Errorf("inspect package audit directory: %w", err)
-	}
-	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return nil, errors.Errorf("package audit directory must be a private directory (0700)")
-	}
-	root, err := os.OpenRoot(config.Directory)
+	root, err := openAuditRoot(config.Directory)
 	if err != nil {
 		return nil, errors.Errorf("open package audit directory: %w", err)
 	}
@@ -124,7 +121,7 @@ func New(config Config, logger *slog.Logger) (*Sink, error) {
 	}
 	meter := otel.Meter("cachew.package_audit")
 	sink := &Sink{
-		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), logger: logger,
+		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}), logger: logger,
 		root: root, lock: lock, fileSize: maxFileSize, fileLimit: maxFiles,
 		events: metrics.NewMetric[metric.Int64Counter](meter, "cachew.package_audit.events_total", "{events}",
 			"Audit events written locally or dropped; local writes do not confirm collector delivery"),
@@ -132,6 +129,10 @@ func New(config Config, logger *slog.Logger) (*Sink, error) {
 			"Audit files removed at the spool limit, with collector delivery unknown"),
 		syncErrors: metrics.NewMetric[metric.Int64Counter](meter, "cachew.package_audit.sync_errors_total", "{errors}",
 			"Audit file sync failures; previously written records may not be durable"),
+		retentionErrors: metrics.NewMetric[metric.Int64Counter](meter, "cachew.package_audit.retention_errors_total", "{errors}",
+			"Audit retention failures; further writes pause until pruning succeeds"),
+		shutdownTimeouts: metrics.NewMetric[metric.Int64Counter](meter, "cachew.package_audit.shutdown_timeouts_total", "{timeouts}",
+			"Audit drains abandoned at the caller deadline; delivery is uncertain"),
 	}
 	if err := sink.loadFiles(); err != nil {
 		_ = lock.Close()
@@ -181,8 +182,9 @@ func (s *Sink) Record(event Event) {
 	}
 }
 
-// Close drains accepted records, syncs the last file, and releases the directory lock. It is safe to call more than once.
-func (s *Sink) Close() error {
+// Close drains and syncs until ctx expires. A deadline abandons queued records; an in-progress disk syscall can outlive
+// Close, retaining the directory lock until it returns or the process exits. It is safe to call more than once.
+func (s *Sink) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
@@ -192,30 +194,55 @@ func (s *Sink) Close() error {
 		close(s.queue)
 	}
 	s.mu.Unlock()
-	<-s.done
-	return s.closeErr
+	select {
+	case <-s.done:
+		return s.closeErr
+	default:
+	}
+	select {
+	case <-s.done:
+		return s.closeErr
+	case <-ctx.Done():
+		s.stopOnce.Do(func() {
+			close(s.stop)
+			s.shutdownTimeouts.Add(context.Background(), 1)
+		})
+		return errors.Wrap(ctx.Err(), "package audit shutdown incomplete")
+	}
 }
 
 func (s *Sink) run() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	defer close(s.done)
+	defer func() {
+		s.closeErr = errors.Join(s.closeErr, s.closeFile(), s.lock.Close(), s.root.Close())
+		s.report(true)
+	}()
 	for {
 		select {
+		case <-s.stop:
+			for range s.queue {
+				s.drop("shutdown_timeout")
+			}
+			s.closeErr = context.Canceled
+			return
+		default:
+		}
+		select {
+		case <-s.stop:
+			continue
 		case data, ok := <-s.queue:
 			if !ok {
-				s.closeErr = s.closeFile()
-				if err := s.lock.Close(); s.closeErr == nil {
-					s.closeErr = err
-				}
-				if err := s.root.Close(); s.closeErr == nil {
-					s.closeErr = err
-				}
-				s.report(true)
 				return
 			}
 			if err := s.write(data); err != nil {
 				s.drop("write_error")
+				// Disk faults must not consume the entire queue in a tight loop. Request admission stays nonblocking.
+				select {
+				case <-time.After(time.Second):
+				case <-s.stop:
+				}
 			} else {
 				s.events.Add(context.Background(), 1, metric.WithAttributes(attribute.String("result", "written")))
 			}
@@ -231,17 +258,42 @@ func (s *Sink) run() {
 }
 
 func (s *Sink) write(data []byte) error {
+	if len(s.files) > s.fileLimit {
+		if err := s.prune(); err != nil {
+			return err
+		}
+	}
+	if s.rollback {
+		if err := s.file.Truncate(s.size); err != nil {
+			return errors.Errorf("repair partial package audit record: %w", err)
+		}
+		s.rollback = false
+	}
 	if s.file == nil || s.size+int64(len(data)) > s.fileSize {
 		if err := s.rotate(); err != nil {
 			return err
 		}
 	}
-	if _, err := s.file.Write(data); err != nil {
-		rollbackErr := s.file.Truncate(s.size)
-		closeErr := s.closeFile()
-		return errors.Errorf("write package audit record: %w", errors.Join(err, rollbackErr, closeErr))
+	n, err := s.file.WriteAt(data, s.size)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
 	}
+	if err != nil {
+		s.rollback = true
+		rollbackErr := s.file.Truncate(s.size)
+		s.rollback = rollbackErr != nil
+		return errors.Errorf("write package audit record: %w", errors.Join(err, rollbackErr))
+	}
+	first := s.size == 0
 	s.size += int64(len(data))
+	if first {
+		s.files = append(s.files, s.name)
+		// A failed first write must never evict retained history. A failed eviction leaves at most one extra segment;
+		// the next write cannot proceed until pruning succeeds. The successful record is still counted as written.
+		if err := s.prune(); err != nil {
+			s.report(false)
+		}
+	}
 	return nil
 }
 
@@ -252,6 +304,9 @@ func (s *Sink) closeFile() error {
 	err := s.syncFile()
 	closeErr := s.file.Close()
 	s.file = nil
+	if s.size == 0 {
+		closeErr = errors.Join(closeErr, s.root.Remove(s.name))
+	}
 	if err != nil {
 		return err
 	}
@@ -274,25 +329,49 @@ func (s *Sink) rotate() error {
 	if err := s.closeFile(); err != nil {
 		return err
 	}
-	name := filePrefix + time.Now().UTC().Format("20060102T150405.000000000") + "-" + uuid.NewString() + ".ndjson"
+	if s.sequence == ^uint64(0) {
+		return errors.New("package audit segment sequence exhausted")
+	}
+	s.sequence++
+	name := fmt.Sprintf("%s%020d-%s.ndjson", filePrefix, s.sequence, uuid.NewString())
 	file, err := s.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return errors.Errorf("create package audit file: %w", err)
 	}
-	// ponytail: a bounded local spool cannot know whether the collector delivered an old file. Evictions are visible;
-	// use an acknowledged durable transport if retaining every record through an unbounded collector outage is required.
-	for len(s.files) >= s.fileLimit {
-		if err := s.root.Remove(s.files[0]); err != nil && !os.IsNotExist(err) {
-			closeErr := file.Close()
-			removeErr := s.root.Remove(name)
-			return errors.Errorf("remove expired package audit file: %w", errors.Join(err, closeErr, removeErr))
+	s.file, s.name, s.size, s.rollback = file, name, 0, false
+	return nil
+}
+
+func (s *Sink) prune() (err error) {
+	defer func() {
+		if err != nil {
+			s.retentionErrors.Add(context.Background(), 1)
+			s.unpruned.Add(1)
+		}
+	}()
+	// Refresh all missing entries first: a collector removing a newer file must not cause an unnecessary old eviction.
+	for i := 0; i < len(s.files); {
+		if _, err := s.root.Stat(s.files[i]); os.IsNotExist(err) {
+			s.files = slices.Delete(s.files, i, i+1)
+		} else if err != nil {
+			return errors.Errorf("inspect retained package audit file: %w", err)
+		} else {
+			i++
+		}
+	}
+	// ponytail: a bounded local spool cannot confirm collector delivery. Use acknowledged durable transport if every
+	// record must survive an unbounded collector outage; report only files this process actually removes as evictions.
+	for len(s.files) > s.fileLimit {
+		err := s.root.Remove(s.files[0])
+		if err != nil && !os.IsNotExist(err) {
+			return errors.Errorf("remove expired package audit file: %w", err)
 		}
 		s.files = s.files[1:]
-		s.evictions.Add(context.Background(), 1)
-		s.evicted.Add(1)
+		if err == nil {
+			s.evictions.Add(context.Background(), 1)
+			s.evicted.Add(1)
+		}
 	}
-	s.file, s.size = file, 0
-	s.files = append(s.files, name)
 	return nil
 }
 
@@ -306,15 +385,39 @@ func (s *Sink) loadFiles() error {
 	if err != nil {
 		return errors.Errorf("list package audit files: %w", err)
 	}
+	var legacy []string
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), filePrefix) && strings.HasSuffix(entry.Name(), ".ndjson") {
 			if !entry.Type().IsRegular() {
 				return errors.Errorf("package audit spool contains a non-regular audit file")
 			}
-			s.files = append(s.files, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				return errors.Errorf("inspect retained package audit file: %w", err)
+			}
+			prefix, _, _ := strings.Cut(strings.TrimPrefix(entry.Name(), filePrefix), "-")
+			sequence, err := strconv.ParseUint(prefix, 10, 64)
+			if err == nil && len(prefix) == 20 {
+				s.sequence = max(s.sequence, sequence)
+				if info.Size() != 0 {
+					s.files = append(s.files, entry.Name())
+				}
+			} else if info.Size() != 0 {
+				// Preserve pre-sequence spool files, ordering them before all new writes. Their historical wall-clock
+				// order cannot be reconstructed, but clock changes can no longer reorder new segments after restart.
+				legacy = append(legacy, entry.Name())
+			}
+			if info.Size() == 0 {
+				// A crash before the first write must not accumulate untracked empty segments on each restart.
+				if err := s.root.Remove(entry.Name()); err != nil && !os.IsNotExist(err) {
+					return errors.Errorf("remove empty package audit segment: %w", err)
+				}
+			}
 		}
 	}
 	slices.Sort(s.files)
+	slices.Sort(legacy)
+	s.files = append(legacy, s.files...)
 	return nil
 }
 
@@ -328,9 +431,9 @@ func (s *Sink) report(force bool) {
 		return
 	}
 	s.lastWarn = time.Now()
-	dropped, evicted, unsynced := s.dropped.Swap(0), s.evicted.Swap(0), s.unsynced.Swap(0)
-	if dropped != 0 || evicted != 0 || unsynced != 0 {
+	dropped, evicted, unsynced, unpruned := s.dropped.Swap(0), s.evicted.Swap(0), s.unsynced.Swap(0), s.unpruned.Swap(0)
+	if dropped != 0 || evicted != 0 || unsynced != 0 || unpruned != 0 {
 		s.logger.Warn("Package audit delivery incomplete or uncertain", "dropped_events", dropped,
-			"retention_evictions_delivery_unknown", evicted, "sync_errors", unsynced)
+			"retention_evictions_delivery_unknown", evicted, "sync_errors", unsynced, "retention_errors", unpruned)
 	}
 }

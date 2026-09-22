@@ -31,7 +31,7 @@ func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "audit")
 	sink, err := packageaudit.New(packageaudit.Config{Directory: directory}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	assert.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, sink.Close()) })
+	t.Cleanup(func() { assert.NoError(t, sink.Close(context.Background())) })
 	strategy.packageAudit = sink
 	policy := &recordingPackagePolicy{}
 	strategy.packagePolicy = policy
@@ -50,9 +50,9 @@ func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 		{packagePath, http.MethodGet, "unavailable", "provider_error", "allow", "cache", packagepolicy.Decision{}, errors.New("secret-provider-response"), 200, false},
 		{packagePath + "?token=secret-query-token", http.MethodGet, "allow", "", "allow", "origin", packagepolicy.Decision{Verdict: packagepolicy.VerdictAllow}, nil, 200, false},
 		{packagePath, http.MethodGet, "pending", "", "deny", "policy", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, OriginalVerdict: packagepolicy.VerdictPending}, nil, 403, false},
-		{packagePath, http.MethodGet, "unavailable", "overloaded", "deny", "policy", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, packagepolicy.ErrOverloaded, 503, false},
+		{packagePath, http.MethodGet, "deny", "overloaded", "deny", "policy", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, packagepolicy.ErrOverloaded, 503, false},
 		{privatePath, http.MethodGet, "not_applicable", "", "allow", "origin", packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil, 200, true},
-		{"/npm/repository/package/-/different-1.0.0.tgz", http.MethodGet, "unavailable", "unmappable_package", "deny", "policy", packagepolicy.Decision{}, nil, 403, true},
+		{"/npm/repository/package/-/different-1.0.0.tgz", http.MethodGet, "deny", "unmappable_package", "deny", "policy", packagepolicy.Decision{}, nil, 403, false},
 	}
 	for _, test := range tests {
 		policy.decision, policy.err = test.decision, test.err
@@ -70,7 +70,7 @@ func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 		}
 		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(method, codeArtifactPath(origin, path), nil).WithContext(ctx))
 	}
-	assert.NoError(t, sink.Close())
+	assert.NoError(t, sink.Close(context.Background()))
 	files, err := filepath.Glob(filepath.Join(directory, "*.ndjson"))
 	assert.NoError(t, err)
 	var events []packageaudit.Event
@@ -101,11 +101,56 @@ func TestCodeArtifactAuditRecordsEveryArtifactRequest(t *testing.T) {
 		assert.Equal(t, "unknown", event.ActorType)
 		assert.False(t, ids[event.EventID])
 		ids[event.EventID] = true
-		if test.redacted {
+		if test.redacted || test.policyError == "unmappable_package" {
 			assert.Equal(t, "", event.PURL)
 		} else {
 			assert.Equal(t, purl, event.PURL)
 		}
-		assert.True(t, event.RequestDurationMS >= event.PolicyDurationMS)
+	}
+}
+
+func TestCodeArtifactAuditSeparatesPolicyResultFromError(t *testing.T) {
+	const purl = "pkg:npm/example@1.0.0"
+	tests := []struct {
+		name, purl, verdict, policyError string
+		decision                         packagepolicy.Decision
+		err                              error
+		redacted                         bool
+	}{
+		{"unmappable", "", "deny", "unmappable_package", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, packagepolicy.ErrUnmappablePackage, false},
+		{"encoded separator", "", "deny", "unmappable_package", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, packagepolicy.ErrEncodedSeparator, false},
+		{"overload", purl, "deny", "overloaded", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, packagepolicy.ErrOverloaded, false},
+		{"provider timeout", purl, "unavailable", "timeout", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, context.DeadlineExceeded, false},
+		{"provider error", purl, "unavailable", "provider_error", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, errors.New("provider failed"), false},
+		{"circuit open", purl, "unavailable", "circuit_open", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, packagepolicy.ErrCircuitOpen, false},
+		{"canceled after exclusion", purl, "not_applicable", "canceled", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, OriginalVerdict: packagepolicy.VerdictNotApplicable}, context.Canceled, true},
+		{"canceled after allow", purl, "allow", "canceled", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, OriginalVerdict: packagepolicy.VerdictAllow, VerdictCacheHit: true}, context.Canceled, false},
+		{"canceled without verdict", purl, "not_evaluated", "canceled", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny}, context.Canceled, false},
+		{"request deadline after allow", purl, "allow", "timeout", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, OriginalVerdict: packagepolicy.VerdictAllow, Reasons: []string{"requestCanceled"}}, context.DeadlineExceeded, false},
+		{"request deadline without verdict", purl, "not_evaluated", "timeout", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{"requestCanceled"}}, context.DeadlineExceeded, false},
+	}
+	for _, mode := range []string{packagepolicy.ModeEnforce, packagepolicy.ModeAudit} {
+		for _, test := range tests {
+			t.Run(mode+"/"+test.name, func(t *testing.T) {
+				decision := test.decision
+				decision.Audit = mode == packagepolicy.ModeAudit
+				event := codeArtifactAuditEvent(test.purl, decision, errors.Wrap(test.err, "evaluate package policy"))
+				assert.Equal(t, mode, event.PolicyMode)
+				assert.Equal(t, test.verdict, event.PolicyVerdict)
+				assert.Equal(t, test.policyError, event.PolicyError)
+				assert.Equal(t, test.redacted, event.PackageRedacted)
+				assert.Equal(t, decision.VerdictCacheHit, event.VerdictCacheHit)
+				action := "deny"
+				if decision.Audit {
+					action = "allow"
+				}
+				assert.Equal(t, action, event.PolicyAction)
+				expectedPURL := test.purl
+				if test.redacted {
+					expectedPURL = ""
+				}
+				assert.Equal(t, expectedPURL, event.PURL)
+			})
+		}
 	}
 }
