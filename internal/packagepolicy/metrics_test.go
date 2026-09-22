@@ -155,10 +155,20 @@ func TestNewIgnoresCanceledRequestMetrics(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(t.Context())
 	cause := errors.New("package request abandoned")
 	cancel(cause)
-	for _, purl := range []string{testPURL, "pkg:npm/%40private/package@1.0.0", "pkg:npm/uncached@1.0.0"} {
-		decision, err = evaluator.Evaluate(ctx, purl)
+	for _, test := range []struct {
+		purl            string
+		originalVerdict Verdict
+		cacheHit        bool
+	}{
+		{testPURL, VerdictAllow, true},
+		{"pkg:npm/%40private/package@1.0.0", VerdictNotApplicable, false},
+		{"pkg:npm/uncached@1.0.0", "", false},
+	} {
+		decision, err = evaluator.Evaluate(ctx, test.purl)
 		assert.IsError(t, err, cause)
 		assert.Equal(t, VerdictDeny, decision.Verdict)
+		assert.Equal(t, test.originalVerdict, decision.OriginalVerdict)
+		assert.Equal(t, test.cacheHit, decision.VerdictCacheHit)
 		assert.False(t, AllowRequest(httptest.NewRecorder(), decision, err))
 	}
 	evaluator.ObserveNotApplicable(ctx)

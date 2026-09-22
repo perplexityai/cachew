@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -34,6 +35,7 @@ import (
 	metadatas3 "github.com/block/cachew/internal/metadatadb/s3"
 	"github.com/block/cachew/internal/metrics"
 	"github.com/block/cachew/internal/opa"
+	"github.com/block/cachew/internal/packageaudit"
 	"github.com/block/cachew/internal/reaper"
 	"github.com/block/cachew/internal/s3client"
 	"github.com/block/cachew/internal/strategy"
@@ -49,15 +51,16 @@ type GlobalConfig struct {
 	ShutdownReadinessDelay time.Duration `hcl:"shutdown-readiness-delay,optional" default:"5s" help:"Delay between flipping readiness to 503 on SIGTERM and starting graceful shutdown."`
 	// ShutdownTimeout must be less than the pod's terminationGracePeriodSeconds
 	// (minus ShutdownReadinessDelay) or the kubelet will SIGKILL before Shutdown returns.
-	ShutdownTimeout  time.Duration       `hcl:"shutdown-timeout,optional" default:"150s" help:"Maximum time to wait for in-flight requests to drain on graceful shutdown."`
-	RequestAdmission admission.Config    `hcl:"request-admission,block,optional"`
-	SchedulerConfig  jobscheduler.Config `hcl:"scheduler,block"`
-	LoggingConfig    logging.Config      `hcl:"log,block"`
-	MetricsConfig    metrics.Config      `hcl:"metrics,block"`
-	GitCloneConfig   gitclone.Config     `hcl:"git-clone,block"`
-	S3Config         s3client.Config     `hcl:"s3,block,optional"`
-	GithubAppConfigs []githubapp.Config  `hcl:"github-app,block,optional"`
-	OPAConfig        opa.Config          `hcl:"opa,block"`
+	ShutdownTimeout  time.Duration        `hcl:"shutdown-timeout,optional" default:"150s" help:"Total graceful-shutdown budget for HTTP requests and local audit drain; audit reserves up to 5s inside this budget."`
+	RequestAdmission admission.Config     `hcl:"request-admission,block,optional"`
+	SchedulerConfig  jobscheduler.Config  `hcl:"scheduler,block"`
+	LoggingConfig    logging.Config       `hcl:"log,block"`
+	MetricsConfig    metrics.Config       `hcl:"metrics,block"`
+	GitCloneConfig   gitclone.Config      `hcl:"git-clone,block"`
+	S3Config         s3client.Config      `hcl:"s3,block,optional"`
+	GithubAppConfigs []githubapp.Config   `hcl:"github-app,block,optional"`
+	OPAConfig        opa.Config           `hcl:"opa,block"`
+	PackageAudit     *packageaudit.Config `hcl:"package-audit,block,optional"`
 }
 
 // Populated via -ldflags at build time.
@@ -82,7 +85,7 @@ type CLI struct {
 	MutexProfileFraction int `help:"Mutex contention profile sample rate (1/N events). 0 disables mutex profiling." env:"MUTEX_PROFILE_FRACTION" default:"100"`
 }
 
-func main() {
+func main() { //nolint:funlen // Keep startup and shutdown ordering together.
 	var cli CLI
 	kctx := kong.Parse(&cli, kong.DefaultEnvars("CACHEW"),
 		kong.Vars{"version": fmt.Sprintf("%s (%s)", version, gitCommit)})
@@ -140,9 +143,6 @@ func main() {
 		return
 	}
 
-	mux, err := newMux(ctx, &shuttingDown, cr, mr, sr, providersConfigHCL, envars)
-	fatalIfError(ctx, logger, err, "Failed to load config")
-
 	metricsClient, err := metrics.New(ctx, globalConfig.MetricsConfig)
 	fatalIfError(ctx, logger, err, "Failed to create metrics client")
 	defer func() {
@@ -150,6 +150,15 @@ func main() {
 			logger.ErrorContext(ctx, "Failed to close metrics client", "error", err)
 		}
 	}()
+
+	if globalConfig.PackageAudit != nil {
+		auditSink, err := packageaudit.New(*globalConfig.PackageAudit, logger.Warn)
+		fatalIfError(ctx, logger, err, "Failed to start package audit writer")
+		ctx = packageaudit.ContextWithSink(ctx, auditSink)
+	}
+
+	mux, err := newMux(ctx, &shuttingDown, cr, mr, sr, providersConfigHCL, envars)
+	fatalIfError(ctx, logger, err, "Failed to load config")
 
 	if err := metricsClient.ServeMetrics(ctx); err != nil {
 		fatalIfError(ctx, logger, err, "Failed to start metrics server")
@@ -193,8 +202,8 @@ func main() {
 	drainScheduler(ctx, logger, schedulerProvider)
 }
 
-// gracefulShutdown fails readiness, waits readinessDelay for load balancers
-// to drain, then runs http.Server.Shutdown bounded by shutdownTimeout.
+// gracefulShutdown keeps audit drain inside shutdownTimeout rather than adding an unbounded delay after HTTP shutdown.
+// Audit reserves up to five seconds, or half a shorter budget, while disabled audit preserves the full HTTP budget.
 func gracefulShutdown(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -212,10 +221,32 @@ func gracefulShutdown(
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	auditSink := packageaudit.FromContext(ctx)
+	httpTimeout := shutdownTimeout
+	if auditSink != nil {
+		httpTimeout -= min(5*time.Second, shutdownTimeout/2)
+	}
+	httpCtx, cancelHTTP := context.WithTimeout(shutdownCtx, httpTimeout)
+	err := server.Shutdown(httpCtx)
+	cancelHTTP()
+	if err != nil && auditSink != nil {
+		// The reserved audit budget must not close the sink underneath live handlers.
+		err = server.Shutdown(shutdownCtx)
+		if err != nil {
+			_ = server.Close()
+		}
+	}
+	if err != nil {
 		logger.ErrorContext(shutdownCtx, "Server shutdown error", "error", err)
 	} else {
 		logger.InfoContext(shutdownCtx, "Server shut down cleanly")
+	}
+	if auditSink != nil {
+		auditCtx, cancelAudit := context.WithTimeout(shutdownCtx, 5*time.Second)
+		defer cancelAudit()
+		if err := auditSink.Close(auditCtx); err != nil {
+			logger.ErrorContext(shutdownCtx, "Package audit shutdown incomplete", "error", err)
+		}
 	}
 }
 
@@ -473,6 +504,11 @@ func loadGlobalConfig(ast *hcl.AST) (GlobalConfig, map[string]string, error) {
 	})
 	if err := hcl.UnmarshalAST(ast, &cfg, hcl.HydratedImplicitBlocks(true), expanding); err != nil {
 		return cfg, nil, errors.Errorf("load global config: %w", err)
+	}
+	if !slices.ContainsFunc(ast.Entries, func(entry hcl.Entry) bool { return entry.EntryKey() == "package-audit" }) {
+		cfg.PackageAudit = nil
+	} else if cfg.PackageAudit.Directory == "" {
+		return cfg, nil, errors.New("package-audit requires a nonempty directory")
 	}
 
 	return cfg, envars, nil

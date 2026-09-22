@@ -267,6 +267,96 @@ Recognized npm bodies that cannot be mapped are also denied in `enforce` mode,
 independent of `on-failure`. Audit records these denials without enforcing them.
 CodeArtifact `HEAD` requests are never evaluated and never admit a body to the cache.
 
+#### Package audit files
+
+An optional top-level block emits one structured NDJSON record for each npm
+artifact `GET` handled by CodeArtifact, whether package policy is enabled or not:
+
+```hcl
+package-audit {
+  directory = "/var/log/cachew-package-audit"
+  exclude-purls = ["pkg:npm/@private/*"]
+}
+```
+
+The directory must be private (`0700`), dedicated to one Cachew process, and
+absolute. Files are `0600`; run a separate collector under the same UID. Omitting
+the block disables collection. This does not send logs to any external service.
+Use a collector such as Fluent Bit to tail `package-audit-*.ndjson` and batch them
+to your approved destination with a persistent checkpoint and upload buffer.
+Mount the audit directory read-only in the collector. Collectors must never
+delete, rename, or truncate files, including after upload: any segment may still
+be open for writing. Cachew alone owns rotation and deletion.
+
+No policy provider or token is required for collection. With package policy
+omitted or disabled, records have `policy_mode = "disabled"`,
+`policy_verdict = "not_evaluated"`, `policy_action = "allow"`, and zero policy
+duration. Identification errors are recorded without changing serving or caching.
+Audit `exclude-purls` redacts coordinates independently of provider evaluation;
+it does not change a known verdict or exclude the package from policy checks.
+Configured package-policy exclusions also redact coordinates when that policy
+is disabled. Both settings accept npm PURL globs with `@scope` or `%40scope`.
+
+Records include a schema version, unique event ID, completion timestamp, PURL,
+policy mode and verdict, classified error, actual policy action, verdict-cache
+hit, response source, HTTP status, and policy/request durations. Audit denials
+have action `allow`; pending or failed-open results are not reported as provider
+approvals.
+`verdict_cache_hit = false` does not prove this request made a provider call:
+requests can share an evaluation, hit a breaker, or be excluded. Response source
+`origin` means the origin-handling path, including credential and upstream errors.
+An HTTP `200` does not prove a complete download or package installation.
+
+Excluded packages have `package_redacted = true`; unmappable paths have no PURL
+but are not privacy-redacted. With policy enabled, local mapping failures and overload are `deny`,
+not provider unavailability. Canceled requests preserve a known original verdict;
+without one they are `not_evaluated`, not a provider denial or approval.
+Records never include raw
+URLs, queries, headers, provider response text, or asserted caller names. The
+actor is explicitly `unknown`: this proxy cannot authenticate an individual from
+caller-supplied headers. PURLs are untrusted request-derived coordinates, not
+validated public package metadata; their text can contain caller-chosen data.
+Other private packages still need exclusion before
+external delivery. Go modules, non-npm formats, metadata, `HEAD`,
+generic object API calls, and requests satisfied by a client's local cache are
+not included in this initial audit stream.
+
+Delivery is bounded and best-effort, not a lossless security ledger. Request
+handlers do not wait for disk, S3, or the SIEM. The queue holds 4,096 records;
+records whose PURL and policy fields exceed 4 KiB, or whose encoded line exceeds
+8 KiB, are dropped as invalid. Normally at most sixteen 16 MiB nonempty segments
+are retained. A pending segment does not evict history until its first
+successful write. Disk write failures retain the same file and back off for one
+second. If eviction fails, at most one extra segment remains and further writes
+pause until pruning succeeds. New filenames use increasing sequences,
+independent of wall-clock changes across restarts. Older timestamp-named files
+are preserved ahead of new segments, but their historical order cannot be
+reconstructed. Old files can be removed before a stalled collector reads them.
+Node loss can lose local records and upload buffers; downstream retries may
+duplicate records, so deduplicate on `event_id`. Graceful shutdown reserves up
+to five seconds inside `shutdown-timeout` (at most half a shorter budget) for
+audit drain, after HTTP shutdown. If HTTP draining exceeds its initial budget,
+handlers may use the remaining shutdown budget before the sink closes. At the
+overall deadline, remaining connections are closed and queued records are
+abandoned. A blocked disk syscall cannot be forcibly interrupted: cleanup,
+directory lock release, and `dropped_shutdown_timeout` accounting wait for the
+worker to resume or the process to exit. The caller still returns by its
+deadline. Abrupt termination can lose queued or unsynced records.
+
+The audit directory must be owned by the daemon's effective user with mode 0700.
+Ancestors must be owned by root or that user, and must not be group/world writable
+unless sticky. Leaf symlinks are rejected; trusted relative descendant aliases
+(such as macOS `/tmp`) are supported, but absolute or `..` aliases are not.
+
+Monitor `cachew.package_audit.events_total` by `result` for writes and drops,
+`cachew.package_audit.retention_evictions_total` for files evicted with delivery
+unknown, `cachew.package_audit.sync_errors_total` for disk-sync errors,
+`cachew.package_audit.retention_errors_total` for failed pruning,
+`cachew.package_audit.shutdown_timeouts_total` for abandoned drains, and the
+aggregated warning logs. A local write or collector success
+counter is not proof of SIEM ingestion: verify S3 arrivals, buffer disk use, and
+SIEM ingestion lag separately before relying on coverage.
+
 #### Verdict reuse and overload
 
 Every eligible `GET`, including an artifact-cache hit, consults the verdict

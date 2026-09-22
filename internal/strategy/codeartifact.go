@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	"github.com/felixge/httpsnoop"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/packageaudit"
 	"github.com/block/cachew/internal/packagepolicy"
 )
 
@@ -55,6 +57,8 @@ type CodeArtifact struct {
 	metric                codeArtifactMetricRecorder
 	packagePolicy         packagepolicy.Evaluator
 	policyAudit           bool
+	packageAudit          *packageaudit.Sink
+	auditExclusions       packagepolicy.Exclusions
 	fills                 singleflight.Group
 	originReadIdleTimeout time.Duration
 }
@@ -128,6 +132,13 @@ func newCodeArtifact(
 		metric:                newCodeArtifactMetrics(),
 		originReadIdleTimeout: config.OriginReadIdleTimeout,
 		immutableFallbackTTL:  config.ImmutableFallbackTTL,
+		packageAudit:          packageaudit.FromContext(ctx),
+	}
+	if c.packageAudit != nil && config.PackagePolicy != nil {
+		c.auditExclusions, err = packagepolicy.NewExclusions(config.PackagePolicy.ExcludePURLs)
+		if err != nil {
+			return nil, errors.Wrap(err, "create audit exclusions")
+		}
 	}
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
@@ -221,24 +232,49 @@ func parseCodeArtifactOrigin(name, value string, allowHTTP bool) (*url.URL, erro
 func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host }
 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	mode := classifyCodeArtifactRequest(r)
-	c.metric.recordRequest(r.Context(), mode)
-	decision, err := c.evaluatePackage(r)
+	started := time.Now()
+	c.metric.recordRequest(r.Context(), classifyCodeArtifactRequest(r))
+	purl, decision, err := c.evaluatePackage(r)
+	policyDuration := time.Since(started)
 	if err != nil {
 		c.logger.Log(r.Context(), packagepolicy.LogLevel(err), "Package policy evaluation failed", "error", err)
 	}
-	if !packagepolicy.AllowRequest(w, decision, err) {
+	event, audit := c.packageAuditEvent(r, purl, decision, err)
+	if !audit {
+		c.servePackage(w, r, decision, err)
 		return
 	}
+	var source string
+	response := httpsnoop.CaptureMetricsFn(w, func(w http.ResponseWriter) {
+		source = c.servePackage(w, r, decision, err)
+	})
+	event.ResponseSource = source
+	event.HTTPStatus = response.Code
+	event.PolicyDurationMS = float64(policyDuration) / float64(time.Millisecond)
+	if c.packagePolicy == nil {
+		event.PolicyDurationMS = 0
+	}
+	event.RequestDurationMS = float64(time.Since(started)) / float64(time.Millisecond)
+	if c.policyAudit {
+		event.PolicyMode = packagepolicy.ModeAudit
+	}
+	c.packageAudit.Record(event)
+}
+
+func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, decision packagepolicy.Decision, err error) string {
+	mode := classifyCodeArtifactRequest(r)
+	if !packagepolicy.AllowRequest(w, decision, err) {
+		return "policy"
+	}
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
-		return
+		return "cache"
 	}
 	if !packagepolicy.Cacheable(decision, err) {
 		mode = codeArtifactCachePassthrough
 	}
 	if mode != codeArtifactCacheLookup {
 		c.serveOrigin(w, r, mode)
-		return
+		return codeArtifactAuditOrigin
 	}
 
 	key := c.cacheKey(r)
@@ -249,12 +285,13 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return true, nil
 	})
 	if servedByThisRequest {
-		return
+		return codeArtifactAuditOrigin
 	}
 	if c.serveCached(w, r) {
-		return
+		return "cache"
 	}
 	c.serveOrigin(w, r, mode)
+	return codeArtifactAuditOrigin
 }
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
@@ -355,28 +392,28 @@ func (c *CodeArtifact) authorizationToken(ctx context.Context) (codeArtifactToke
 	return token, nil
 }
 
-func (c *CodeArtifact) evaluatePackage(r *http.Request) (packagepolicy.Decision, error) {
+func (c *CodeArtifact) evaluatePackage(r *http.Request) (string, packagepolicy.Decision, error) {
 	if c.packagePolicy == nil || r.Method != http.MethodGet {
-		return packagepolicy.Decision{}, nil
+		return "", packagepolicy.Decision{}, nil
 	}
 	origin := c.originURL(r)
 	purl, err := packagepolicy.PackageURLForCodeArtifact(&origin)
 	switch {
 	case errors.Is(err, packagepolicy.ErrNotApplicable):
 		c.packagePolicy.ObserveNotApplicable(r.Context())
-		return packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil
+		return "", packagepolicy.Decision{Verdict: packagepolicy.VerdictNotApplicable}, nil
 	case err != nil:
-		reason := "unmappable_package"
+		reason := codeArtifactUnmappablePackage
 		if errors.Is(err, packagepolicy.ErrEncodedSeparator) {
 			reason = "encoded_separator"
 		}
-		return packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{reason}, Audit: c.policyAudit}, errors.Wrap(err, "evaluate package policy")
+		return "", packagepolicy.Decision{Verdict: packagepolicy.VerdictDeny, Reasons: []string{reason}, Audit: c.policyAudit}, errors.Wrap(err, "evaluate package policy")
 	}
 	decision, err := c.packagePolicy.Evaluate(r.Context(), purl)
 	if err != nil {
-		return decision, errors.Wrap(err, "evaluate package policy")
+		return purl, decision, errors.Wrap(err, "evaluate package policy")
 	}
-	return decision, nil
+	return purl, decision, nil
 }
 
 func (c *CodeArtifact) rewriteOriginMetadata(

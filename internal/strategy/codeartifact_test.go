@@ -257,7 +257,7 @@ func TestCodeArtifactRecordsNotApplicablePolicyRequests(t *testing.T) {
 			strategy := &CodeArtifact{target: target, prefix: "/codeartifact.example.com", packagePolicy: policy}
 			request := httptest.NewRequest(http.MethodGet, "/codeartifact.example.com"+path, nil)
 
-			decision, err := strategy.evaluatePackage(request)
+			_, decision, err := strategy.evaluatePackage(request)
 			assert.NoError(t, err)
 			assert.Equal(t, packagepolicy.VerdictNotApplicable, decision.Verdict)
 			assert.Equal(t, 1, policy.notApplicable)
@@ -278,7 +278,7 @@ func TestCodeArtifactEvaluatesEncodedScopeSeparatorAsScopedPackage(t *testing.T)
 			strategy := &CodeArtifact{target: target, prefix: "/" + test.host, packagePolicy: policy}
 			request := httptest.NewRequest(http.MethodGet, "/"+test.host+test.path, nil)
 
-			decision, err := strategy.evaluatePackage(request)
+			_, decision, err := strategy.evaluatePackage(request)
 			assert.NoError(t, err)
 			assert.Equal(t, packagepolicy.VerdictDeny, decision.Verdict)
 			assert.Equal(t, []string{"pkg:npm/%40ctrl/tinycolor@4.1.1"}, policy.purls)
@@ -301,9 +301,17 @@ func TestCodeArtifactPrivateLinkPreservesPolicyExclusions(t *testing.T) {
 	strategy := &CodeArtifact{target: target, prefix: "/" + host, packagePolicy: policy}
 	request := httptest.NewRequest(http.MethodGet, "/"+host+"/npm/d/example-123456789012/repository/@private/agents/-/agents-1.0.0.tgz", nil)
 
-	decision, err := strategy.evaluatePackage(request)
+	_, decision, err := strategy.evaluatePackage(request)
 	assert.NoError(t, err)
 	assert.Equal(t, packagepolicy.VerdictNotApplicable, decision.Verdict)
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	purl, decision, err := strategy.evaluatePackage(request.WithContext(canceled))
+	assert.IsError(t, err, context.Canceled)
+	event := codeArtifactAuditEvent(purl, decision, err)
+	assert.True(t, event.PackageRedacted)
+	assert.Equal(t, "", event.PURL)
 }
 
 func TestCodeArtifactDeniesUnmappableBodiesBeforeOrigin(t *testing.T) {

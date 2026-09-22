@@ -90,6 +90,7 @@ func TestClientCancelsProviderAfterOnlyCallerCancels(t *testing.T) {
 	got := <-result
 	assert.True(t, errors.Is(got.err, context.Canceled))
 	assert.Equal(t, VerdictDeny, got.decision.Verdict)
+	assert.Equal(t, Verdict(""), got.decision.OriginalVerdict)
 	w := httptest.NewRecorder()
 	assert.False(t, AllowRequest(w, got.decision, got.err))
 	assert.Equal(t, http.StatusForbidden, w.Code)
@@ -361,6 +362,7 @@ func TestClientCanceledQueueDoesNotFailOpen(t *testing.T) {
 				case got := <-results:
 					assert.True(t, errors.Is(got.err, cause))
 					assert.Equal(t, VerdictDeny, got.decision.Verdict)
+					assert.Equal(t, Verdict(""), got.decision.OriginalVerdict)
 					w := httptest.NewRecorder()
 					assert.False(t, AllowRequest(w, got.decision, got.err))
 					assert.Equal(t, http.StatusForbidden, w.Code)

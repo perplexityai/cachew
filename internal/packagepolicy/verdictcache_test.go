@@ -39,10 +39,10 @@ func TestCachingEvaluatorReusesDefinitiveVerdictsUntilTTL(t *testing.T) {
 	now := time.Now()
 	cache.now = func() time.Time { return now }
 
-	for range 3 {
+	for i := range 3 {
 		decision, err := evaluator.Evaluate(t.Context(), testPURL)
 		assert.NoError(t, err)
-		assert.Equal(t, Decision{Verdict: VerdictDeny, Reasons: []string{"malware"}}, decision)
+		assert.Equal(t, Decision{Verdict: VerdictDeny, Reasons: []string{"malware"}, VerdictCacheHit: i > 0}, decision)
 	}
 	assert.Equal(t, 1, inner.calls)
 	assert.Equal(t, int32(3), metrics.outcomes.Load())
@@ -84,9 +84,10 @@ func TestCachingEvaluatorBrieflyReusesPendingAndProviderErrors(t *testing.T) {
 		cache := newCachingEvaluator(inner, time.Minute, 15*time.Second, metrics)
 		now := time.Now()
 		cache.now = func() time.Time { return now }
-		for range 3 {
+		for i := range 3 {
 			decision, err := cache.Evaluate(t.Context(), testPURL)
 			assert.Equal(t, VerdictPending, decision.Verdict)
+			assert.Equal(t, i > 0, decision.VerdictCacheHit)
 			assert.IsError(t, err, providerErr)
 			assert.False(t, Cacheable(decision, err))
 		}
@@ -146,7 +147,7 @@ func TestFailClosedEvaluatorDeniesFailuresAndPending(t *testing.T) {
 	assert.Equal(t, Decision{Verdict: VerdictDeny, Reasons: []string{outcomeUnavailable}}, decision)
 	decision, err = evaluator.Evaluate(t.Context(), testPURL)
 	assert.NoError(t, err)
-	assert.Equal(t, Decision{Verdict: VerdictDeny, Reasons: []string{"notFound"}}, decision)
+	assert.Equal(t, Decision{Verdict: VerdictDeny, OriginalVerdict: VerdictPending, Reasons: []string{"notFound"}}, decision)
 	decision, err = evaluator.Evaluate(t.Context(), testPURL)
 	assert.NoError(t, err)
 	assert.Equal(t, VerdictAllow, decision.Verdict)
