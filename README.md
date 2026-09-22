@@ -284,10 +284,11 @@ the block disables collection. This does not send logs to any external service.
 Use a collector such as Fluent Bit to tail `package-audit-*.ndjson` and batch them
 to your approved destination with a persistent checkpoint and upload buffer.
 
-Records include a unique event ID, completion timestamp, PURL, policy mode and
-verdict, classified error, actual policy action, verdict-cache hit, response
-source, HTTP status, and policy/request durations. Audit denials have action
-`allow`; pending or failed-open results are not reported as Socket approvals.
+Records include a schema version, unique event ID, completion timestamp, PURL,
+policy mode and verdict, classified error, actual policy action, verdict-cache
+hit, response source, HTTP status, and policy/request durations. Audit denials
+have action `allow`; pending or failed-open results are not reported as Socket
+approvals.
 `verdict_cache_hit = false` does not prove this request made a Socket call:
 requests can share an evaluation, hit a breaker, or be excluded. Response source
 `origin` means the origin-handling path, including credential and upstream errors.
@@ -309,22 +310,23 @@ not included in this initial audit stream.
 
 Delivery is bounded and best-effort, not a lossless security ledger. Request
 handlers do not wait for disk, S3, or the SIEM. The queue holds 4,096 records;
-records over 8 KiB are dropped. Normally at most sixteen 16 MiB nonempty segments
-are retained. A pending segment does not evict history until its first successful
-write. Disk write failures retain the same file and back off for one second.
-If eviction fails, at most one extra segment remains and further writes pause
-until pruning succeeds. New filenames use increasing sequences, independent of
-wall-clock changes across restarts. Older timestamp-named files are preserved
-ahead of new segments, but their historical order cannot be reconstructed.
-Old files can be removed before a stalled collector reads them. Node loss
-can lose local records and upload buffers; downstream retries may duplicate
-records, so deduplicate on `event_id`. Graceful shutdown reserves up to five
-seconds inside `shutdown-timeout` (at most half a shorter budget) for audit drain,
-after HTTP shutdown. Once its deadline expires, queued records are abandoned.
-A blocked disk syscall cannot be forcibly interrupted: cleanup, directory lock
-release, and `dropped_shutdown_timeout` accounting wait for the worker to resume
-or the process to exit. The caller still returns by its deadline. Abrupt
-termination can lose queued or unsynced records.
+records whose PURL and policy fields exceed 4 KiB, or whose encoded line exceeds
+8 KiB, are dropped as invalid. Normally at most sixteen 16 MiB nonempty segments
+are retained. A pending segment does not evict history until its first
+successful write. Disk write failures retain the same file and back off for one
+second. If eviction fails, at most one extra segment remains and further writes
+pause until pruning succeeds. New filenames use increasing sequences,
+independent of wall-clock changes across restarts. Older timestamp-named files
+are preserved ahead of new segments, but their historical order cannot be
+reconstructed. Old files can be removed before a stalled collector reads them.
+Node loss can lose local records and upload buffers; downstream retries may
+duplicate records, so deduplicate on `event_id`. Graceful shutdown reserves up
+to five seconds inside `shutdown-timeout` (at most half a shorter budget) for
+audit drain, after HTTP shutdown. Once its deadline expires, queued records are
+abandoned. A blocked disk syscall cannot be forcibly interrupted: cleanup,
+directory lock release, and `dropped_shutdown_timeout` accounting wait for the
+worker to resume or the process to exit. The caller still returns by its
+deadline. Abrupt termination can lose queued or unsynced records.
 
 The audit directory must be owned by the daemon's effective user with mode 0700.
 Ancestors must be owned by root or that user, and must not be group/world writable

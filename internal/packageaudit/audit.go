@@ -359,8 +359,8 @@ func (s *Sink) prune() (err error) {
 			i++
 		}
 	}
-	// ponytail: a bounded local spool cannot confirm collector delivery. Use acknowledged durable transport if every
-	// record must survive an unbounded collector outage; report only files this process actually removes as evictions.
+	// A bounded local spool cannot confirm collector delivery, so only files this process actually removes count as
+	// evictions. Surviving an unbounded collector outage would need an acknowledged durable transport instead.
 	for len(s.files) > s.fileLimit {
 		err := s.root.Remove(s.files[0])
 		if err != nil && !os.IsNotExist(err) {
