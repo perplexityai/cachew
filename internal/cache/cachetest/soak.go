@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log/slog"
 	mrand "math/rand/v2"
 	"os"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 	"github.com/alecthomas/errors"
 
 	"github.com/block/cachew/internal/cache"
+	"github.com/block/cachew/internal/logging"
 )
 
 // SoakConfig configures the soak test parameters.
@@ -88,7 +90,8 @@ type SoakResult struct {
 func Soak(t *testing.T, c cache.Cache, config SoakConfig) SoakResult {
 	config.setDefaults()
 
-	ctx, cancel := context.WithTimeout(t.Context(), config.Duration+time.Minute)
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	ctx, cancel := context.WithTimeout(ctx, config.Duration+time.Minute)
 	defer cancel()
 
 	var result SoakResult
