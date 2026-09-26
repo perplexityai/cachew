@@ -12,11 +12,13 @@ import (
 	"github.com/alecthomas/errors"
 )
 
+const codeArtifactGzipEncoding = "gzip"
+
 func decodeCodeArtifactMetadata(resp *http.Response, headers http.Header, method string) error {
 	switch strings.ToLower(strings.TrimSpace(strings.Join(headers.Values("Content-Encoding"), ","))) {
 	case "", "identity":
 		return nil
-	case "gzip":
+	case codeArtifactGzipEncoding:
 		if method != http.MethodHead && resp.StatusCode != http.StatusNotModified && resp.StatusCode != http.StatusNoContent {
 			reader, err := gzip.NewReader(resp.Body)
 			if err != nil {
@@ -62,7 +64,7 @@ func codeArtifactGzipAccepted(headers http.Header) bool {
 			coding, _, _ := strings.Cut(strings.TrimSpace(entry), ";")
 			quality := codeArtifactEncodingQuality(entry)
 			switch strings.ToLower(strings.TrimSpace(coding)) {
-			case "gzip":
+			case codeArtifactGzipEncoding:
 				gzipQuality = quality
 			case "*":
 				wildcardQuality = quality
