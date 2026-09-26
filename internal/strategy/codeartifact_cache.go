@@ -110,7 +110,9 @@ func (c *CodeArtifact) streamAndCache(
 		return
 	}
 
-	writer, err := c.cache.Create(r.Context(), c.cacheKey(r), cacheHeaders, ttl, createOptions...)
+	fillCtx, cancelFill := httputil.CacheFillContext(r.Context())
+	defer cancelFill()
+	writer, err := c.cache.Create(fillCtx, c.cacheKey(r), cacheHeaders, ttl, createOptions...)
 	if err != nil {
 		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
 		c.logger.ErrorContext(r.Context(), "Failed to create CodeArtifact cache entry", "error", err)

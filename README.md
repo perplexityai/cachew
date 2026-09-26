@@ -2,6 +2,10 @@
 
 Cachew (pronounced "cashew") is a tiered, protocol-aware, caching HTTP proxy for software engineering infrastructure. It understands higher-level protocols (Git, Docker, Go modules, etc.) and makes smarter caching decisions than a naive HTTP proxy.
 
+Cache writes for CodeArtifact and the generic download handler may finish for up to
+30 seconds after a client disconnects. Incomplete response bodies are still aborted;
+the grace period allows a fully delivered artifact to finish reaching shared storage.
+
 ## Strategies
 
 ### Git
