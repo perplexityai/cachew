@@ -54,7 +54,7 @@ func normalizeCodeArtifactMetadataRequestHeaders(headers http.Header, path strin
 		headers.Del(name)
 	}
 	if codeArtifactPackageFormat(path) != codeArtifactSwiftFormat {
-		headers.Set("Accept-Encoding", "gzip")
+		headers.Set("Accept-Encoding", codeArtifactGzipEncoding)
 	}
 	if codeArtifactPackageFormat(path) == codeArtifactCargoFormat {
 		headers.Set("Accept", "application/json")
@@ -93,7 +93,7 @@ func (c *CodeArtifact) rewriteMetadataResponse(
 	rewrittenHeaders := codeArtifactRewrittenMetadataHeaders(headers)
 	gzipAccepted := codeArtifactGzipAccepted(request.Header)
 	if gzipAccepted {
-		rewrittenHeaders.Set("Content-Encoding", "gzip")
+		rewrittenHeaders.Set("Content-Encoding", codeArtifactGzipEncoding)
 	}
 	if request.Method == http.MethodHead {
 		return rewrittenHeaders, nil
