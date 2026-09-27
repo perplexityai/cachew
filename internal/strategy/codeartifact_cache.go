@@ -93,6 +93,56 @@ func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool 
 	return false
 }
 
+func (c *CodeArtifact) serveCacheFill(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode, epoch uint64) string {
+	if r.Context().Err() != nil {
+		return "canceled"
+	}
+	wait, finish, changed := c.claimCacheFill(c.cacheKey(r), epoch)
+	if finish != nil {
+		defer finish()
+		if changed && c.serveCached(w, r) {
+			return "cache"
+		}
+		c.serveOrigin(w, r, mode)
+		return codeArtifactAuditOrigin
+	}
+	select {
+	case <-r.Context().Done():
+		return "canceled"
+	case <-wait:
+	}
+	if r.Context().Err() != nil {
+		return "canceled"
+	}
+	if c.serveCached(w, r) {
+		return "cache"
+	}
+	// A failed fill must not turn its waiting requests into concurrent S3
+	// retries, or serialize downloads behind repeated failures during an outage.
+	c.serveOrigin(w, r, codeArtifactCachePassthrough)
+	return codeArtifactAuditOrigin
+}
+
+func (c *CodeArtifact) claimCacheFill(key cache.Key, epoch uint64) (<-chan struct{}, func(), bool) {
+	c.fillMu.Lock()
+	defer c.fillMu.Unlock()
+	if pending := c.fills[key]; pending != nil {
+		return pending, nil, false
+	}
+	if c.fills == nil {
+		c.fills = make(map[cache.Key]chan struct{})
+	}
+	done := make(chan struct{})
+	c.fills[key] = done
+	return nil, func() {
+		c.fillMu.Lock()
+		defer c.fillMu.Unlock()
+		c.fillEpoch.Add(1)
+		delete(c.fills, key)
+		close(done)
+	}, epoch != c.fillEpoch.Load()
+}
+
 func (c *CodeArtifact) streamAndCache(
 	w http.ResponseWriter,
 	r *http.Request,

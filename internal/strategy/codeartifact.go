@@ -7,11 +7,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alecthomas/errors"
 	"github.com/felixge/httpsnoop"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
@@ -59,7 +60,9 @@ type CodeArtifact struct {
 	policyAudit           bool
 	packageAudit          *packageaudit.Sink
 	auditExclusions       packagepolicy.Exclusions
-	fills                 singleflight.Group
+	fillMu                sync.Mutex
+	fillEpoch             atomic.Uint64
+	fills                 map[cache.Key]chan struct{}
 	originReadIdleTimeout time.Duration
 }
 
@@ -266,6 +269,9 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 	if !packagepolicy.AllowRequest(w, decision, err) {
 		return "policy"
 	}
+	// Detect a fill finishing between this lookup and claiming the next fill,
+	// without doubling cache lookups on uncontended misses.
+	epoch := c.fillEpoch.Load()
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return "cache"
 	}
@@ -277,21 +283,7 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 		return codeArtifactAuditOrigin
 	}
 
-	key := c.cacheKey(r)
-	servedByThisRequest := false
-	_, _, _ = c.fills.Do(key.String(), func() (any, error) { //nolint:errcheck // The callback reports failures through its response writer.
-		servedByThisRequest = true
-		c.serveOrigin(w, r, mode)
-		return true, nil
-	})
-	if servedByThisRequest {
-		return codeArtifactAuditOrigin
-	}
-	if c.serveCached(w, r) {
-		return "cache"
-	}
-	c.serveOrigin(w, r, mode)
-	return codeArtifactAuditOrigin
+	return c.serveCacheFill(w, r, mode, epoch)
 }
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {

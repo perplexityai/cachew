@@ -125,6 +125,9 @@ artifactory "example.jfrog.io" {
 Proxies read-only package requests to an AWS CodeArtifact repository. Cachew
 assumes the configured IAM role and refreshes CodeArtifact authorization tokens
 without exposing them to clients. Requests use host-based routing.
+Concurrent cacheable requests for the same artifact share a fill within each process.
+Waiting clients can cancel independently; separate processes can still upload the
+same artifact concurrently. Responses that cannot be cached remain parallel.
 
 CodeArtifact deployments may opt into `immutable-fallback-ttl = "1h"` (allowed:
 1 second through 24 hours; default `0`, disabled). This supplies a local freshness
