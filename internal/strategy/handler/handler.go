@@ -244,7 +244,9 @@ func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cac
 	responseHeaders.Del(CacheResultHeader)
 	maps.Copy(w.Header(), responseHeaders)
 	w.Header().Set(CacheResultHeader, "miss")
-	cw, err := h.cache.Create(r.Context(), key, responseHeaders, ttl)
+	fillCtx, cancelFill := httputil.CacheFillContext(r.Context())
+	defer cancelFill()
+	cw, err := h.cache.Create(fillCtx, key, responseHeaders, ttl)
 	if err != nil {
 		_, copyErr := io.Copy(w, resp.Body)
 		return errors.Join(errors.Wrap(err, "create cache entry"), errors.Wrap(copyErr, "stream response"))
