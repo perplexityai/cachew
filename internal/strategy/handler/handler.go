@@ -238,7 +238,9 @@ func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cac
 	ttl := h.ttlFunc(r)
 	responseHeaders := maps.Clone(resp.Header)
 	responseHeaders.Del(CacheResultHeader)
-	cw, err := h.cache.Create(r.Context(), key, responseHeaders, ttl)
+	fillCtx, cancelFill := httputil.CacheFillContext(r.Context())
+	defer cancelFill()
+	cw, err := h.cache.Create(fillCtx, key, responseHeaders, ttl)
 	if err != nil {
 		h.errorHandler(httputil.Errorf(http.StatusInternalServerError, "failed to create cache entry: %w", err), w, r)
 		return nil
