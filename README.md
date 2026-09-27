@@ -2,6 +2,10 @@
 
 Cachew (pronounced "cashew") is a tiered, protocol-aware, caching HTTP proxy for software engineering infrastructure. It understands higher-level protocols (Git, Docker, Go modules, etc.) and makes smarter caching decisions than a naive HTTP proxy.
 
+Cache writes for CodeArtifact and the generic download handler may finish for up to
+30 seconds after a client disconnects. Incomplete response bodies are still aborted;
+the grace period allows a fully delivered artifact to finish reaching shared storage.
+
 ## Strategies
 
 ### Git
@@ -121,6 +125,9 @@ artifactory "example.jfrog.io" {
 Proxies read-only package requests to an AWS CodeArtifact repository. Cachew
 assumes the configured IAM role and refreshes CodeArtifact authorization tokens
 without exposing them to clients. Requests use host-based routing.
+Concurrent cacheable requests for the same artifact share a fill within each process.
+Waiting clients can cancel independently; separate processes can still upload the
+same artifact concurrently. Responses that cannot be cached remain parallel.
 
 CodeArtifact deployments may opt into `immutable-fallback-ttl = "1h"` (allowed:
 1 second through 24 hours; default `0`, disabled). This supplies a local freshness

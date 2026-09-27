@@ -727,7 +727,9 @@ func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cac
 		defer func() { metrics.RecordCacheFill(r.Context(), result) }()
 	}
 
-	cw, err := h.cache.Create(r.Context(), key, h.cacheHeaders(resp), h.ttlFunc(r))
+	fillCtx, cancelFill := httputil.CacheFillContext(r.Context())
+	defer cancelFill()
+	cw, err := h.cache.Create(fillCtx, key, h.cacheHeaders(resp), h.ttlFunc(r))
 	if err != nil {
 		result = fillCreateError
 		_, copyErr := io.Copy(w, resp.Body)
@@ -766,6 +768,8 @@ func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cac
 	switch {
 	case tee.err != nil:
 		result = fillWriteError
+	case copyErr == nil && closeErr == nil && cacheErr == nil:
+		// The fill context outlives a client that disconnects after the last byte.
 	case r.Context().Err() != nil:
 		result = fillCanceled
 	case copyErr != nil || closeErr != nil:
