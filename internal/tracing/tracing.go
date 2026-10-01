@@ -13,6 +13,7 @@ import (
 	"github.com/alecthomas/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/trace"
 )
@@ -34,7 +35,19 @@ func New(ctx context.Context, cfg Config) (stop func(), err error) {
 		return func() {}, nil
 	}
 
-	exporter, err := otlptracegrpc.New(ctx)
+	protocol := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+	if protocol == "" {
+		protocol = os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")
+	}
+	var exporter trace.SpanExporter
+	switch protocol {
+	case "", "grpc":
+		exporter, err = otlptracegrpc.New(ctx)
+	case "http/protobuf":
+		exporter, err = otlptracehttp.New(ctx)
+	default:
+		return nil, errors.Errorf("unsupported OTLP traces protocol %q", protocol)
+	}
 	if err != nil {
 		return nil, errors.Errorf("creating trace exporter: %w", err)
 	}
