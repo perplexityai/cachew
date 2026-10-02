@@ -22,6 +22,7 @@ import (
 
 const (
 	githubObjectsTreeSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	githubReferenceSHA   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	githubObjectsToken   = "Bearer test-token"
 )
 
@@ -32,6 +33,56 @@ type githubObjectsResponse struct {
 type githubObjectResponse struct {
 	Path string  `json:"path"`
 	OID  *string `json:"oid"`
+}
+
+type githubResolvedReference struct {
+	SHA string `json:"sha"`
+}
+
+func TestGitHubReferenceResolutionIsUncached(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		assert.Equal(t, "/repos/ppl-ai/agi/git/ref/heads/main", r.URL.Path)
+		assert.Equal(t, githubObjectsToken, r.Header.Get("Authorization"))
+		w.Header().Set("X-Ratelimit-Remaining", "4999")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": map[string]string{"sha": githubReferenceSHA},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+	mux, ctx := newGitHubObjectsTestMux(t, upstream.URL)
+
+	for range 2 {
+		request := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api.github.com/repos/ppl-ai/agi/git/ref/heads/main", nil)
+		request.Header.Set("Authorization", githubObjectsToken)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+
+		assert.Equal(t, http.StatusOK, response.Code)
+		assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+		assert.Equal(t, "4999", response.Header().Get("X-Ratelimit-Remaining"))
+		var decoded githubResolvedReference
+		assert.NoError(t, json.NewDecoder(response.Body).Decode(&decoded))
+		assert.Equal(t, githubResolvedReference{SHA: githubReferenceSHA}, decoded)
+	}
+	assert.Equal(t, 2, requestCount)
+}
+
+func TestGitHubReferenceResolutionRejectsMalformedObjectID(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": map[string]string{"sha": "main"},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+	mux, ctx := newGitHubObjectsTestMux(t, upstream.URL)
+	request := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api.github.com/repos/ppl-ai/agi/git/ref/heads/main", nil)
+	response := httptest.NewRecorder()
+
+	mux.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusBadGateway, response.Code)
 }
 
 func TestGitHubObjectsCachesFoundAndMissingPathsIndependently(t *testing.T) {

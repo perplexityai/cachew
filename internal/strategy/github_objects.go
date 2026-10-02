@@ -40,10 +40,11 @@ type GitHubObjectsConfig struct {
 
 // GitHubObjects resolves immutable repository paths through batched GitHub GraphQL requests.
 type GitHubObjects struct {
-	target  string
-	cache   cache.Cache
-	client  *http.Client
-	metrics *githubObjectsMetrics
+	target          string
+	referenceTarget string
+	cache           cache.Cache
+	client          *http.Client
+	metrics         *githubObjectsMetrics
 }
 
 type githubObjectsRequest struct {
@@ -58,6 +59,16 @@ type githubObject struct {
 
 type githubObjectsResponse struct {
 	Objects []githubObject `json:"objects"`
+}
+
+type githubReferenceResponse struct {
+	Object struct {
+		SHA string `json:"sha"`
+	} `json:"object"`
+}
+
+type githubResolvedReference struct {
+	SHA string `json:"sha"`
 }
 
 type githubObjectsBatchResult struct {
@@ -102,12 +113,14 @@ func NewGitHubObjects(_ context.Context, config GitHubObjectsConfig, objectCache
 		target = githubObjectsDefaultTarget
 	}
 	strategy := &GitHubObjects{
-		target:  target,
-		cache:   objectCache,
-		client:  &http.Client{Timeout: githubObjectsUpstreamTimeout},
-		metrics: newGitHubObjectsMetrics(),
+		target:          target,
+		referenceTarget: strings.TrimSuffix(strings.TrimSuffix(target, "/"), "/graphql"),
+		cache:           objectCache,
+		client:          &http.Client{Timeout: githubObjectsUpstreamTimeout},
+		metrics:         newGitHubObjectsMetrics(),
 	}
 	mux.Handle("POST /api.github.com/repos/{owner}/{repo}/git/objects:batch", http.HandlerFunc(strategy.handle))
+	mux.Handle("GET /api.github.com/repos/{owner}/{repo}/git/ref/{namespace}/{ref}", http.HandlerFunc(strategy.handleReference))
 	return strategy, nil
 }
 
@@ -130,6 +143,95 @@ func (g *GitHubObjects) handle(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		httputil.ErrorResponse(w, r, http.StatusInternalServerError, "encode GitHub objects response")
 	}
+}
+
+func (g *GitHubObjects) handleReference(w http.ResponseWriter, r *http.Request) {
+	response, header, err := g.resolveReference(r)
+	if err != nil {
+		if responder, ok := errors.AsType[httputil.HTTPResponder](err); ok {
+			responder.WriteHTTP(w, r)
+			return
+		}
+		httputil.ErrorResponse(w, r, http.StatusInternalServerError, err.Error())
+		return
+	}
+	copyGitHubRateLimitHeaders(w.Header(), header)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		httputil.ErrorResponse(w, r, http.StatusInternalServerError, "encode GitHub reference response")
+	}
+}
+
+func (g *GitHubObjects) resolveReference(r *http.Request) (githubResolvedReference, http.Header, error) {
+	owner := r.PathValue("owner")
+	repo := r.PathValue("repo")
+	namespace := r.PathValue("namespace")
+	ref := r.PathValue("ref")
+	for _, segment := range []string{owner, repo, namespace, ref} {
+		if !isGitHubReferenceSegment(segment) {
+			return githubResolvedReference{}, nil, httputil.Errorf(http.StatusBadRequest, "invalid GitHub reference path")
+		}
+	}
+
+	startedAt := time.Now()
+	result := "success"
+	defer func() { g.metrics.recordOrigin(context.WithoutCancel(r.Context()), result, startedAt) }()
+	upstreamURL := fmt.Sprintf(
+		"%s/repos/%s/%s/git/ref/%s/%s",
+		g.referenceTarget,
+		owner,
+		repo,
+		namespace,
+		ref,
+	)
+	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodGet, upstreamURL, nil)
+	if err != nil {
+		result = "request_error"
+		return githubResolvedReference{}, nil, errors.Wrap(err, "create GitHub reference request")
+	}
+	upstream.Header.Set("Accept", "application/vnd.github+json")
+	upstream.Header.Set("X-Github-Api-Version", "2022-11-28")
+	upstream.Header.Set("Authorization", r.Header.Get("Authorization"))
+	response, err := g.client.Do(upstream)
+	if err != nil {
+		result = "transport_error"
+		return githubResolvedReference{}, nil, httputil.Errorf(http.StatusBadGateway, "GitHub reference request failed: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		result = fmt.Sprintf("http_%d", response.StatusCode)
+		return githubResolvedReference{}, response.Header.Clone(), githubObjectsUpstreamError{
+			status:     response.StatusCode,
+			statusText: response.Status,
+			header:     response.Header,
+		}
+	}
+	var payload githubReferenceResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, githubObjectsMaxBodyBytes)).Decode(&payload); err != nil {
+		result = githubObjectsResponseError
+		return githubResolvedReference{}, nil, httputil.Errorf(http.StatusBadGateway, "decode GitHub reference response: %v", err)
+	}
+	if !isGitHubOID(payload.Object.SHA) {
+		result = githubObjectsResponseError
+		return githubResolvedReference{}, nil, httputil.Errorf(http.StatusBadGateway, "GitHub returned an invalid reference object ID")
+	}
+	return githubResolvedReference{SHA: payload.Object.SHA}, response.Header.Clone(), nil
+}
+
+func isGitHubReferenceSegment(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') &&
+			(character < 'A' || character > 'Z') &&
+			(character < 'a' || character > 'z') &&
+			character != '-' && character != '_' && character != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func (g *GitHubObjects) resolve(r *http.Request) (githubObjectsResponse, http.Header, error) {
