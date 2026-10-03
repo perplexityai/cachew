@@ -577,7 +577,21 @@ host "https://ghcr.io" {
 }
 
 host "https://w3.org" {}
+
+host "https://api.github.com" {
+  origin-header-timeout   = "10s"
+  http2-read-idle-timeout = "10s"
+  http2-ping-timeout      = "5s"
+}
 ```
+
+Host transport limits are opt-in and scoped to each host. `origin-header-timeout`
+bounds the wait for response headers, without imposing a deadline on streamed
+artifact bodies. HTTP/2 health checks close unresponsive connections so later
+requests can reconnect. With these settings omitted, header waits remain
+unbounded and HTTP/2 health checks remain disabled. A header timeout returns 502
+and is not cached; the caller controls retries. These settings do not affect the
+separate `github-objects` batching strategy.
 
 ### HTTP Proxy
 
