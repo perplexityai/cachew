@@ -558,12 +558,11 @@ func (t Tiered) healTier0(reqCtx context.Context, key Key, source Cache, servedE
 
 func (t Tiered) backfillTier0FromSource(ctx context.Context, key Key, source Cache, wantETag, rawETag string) {
 	logger := logging.FromContext(ctx)
-	r, headers, err := source.Open(ctx, key, IfMatch(wantETag))
+	headers, err := source.Stat(ctx, key, IfMatch(wantETag))
 	if err != nil {
-		logger.WarnContext(ctx, "Tiered: ranged heal source read failed", "key", key, "etag", wantETag, "error", err)
+		logger.WarnContext(ctx, "Tiered: ranged heal source stat failed", "key", key, "etag", wantETag, "error", err)
 		return
 	}
-	defer discardTieredReader(ctx, key, r)
 	if headers.Get(ETagKey) != wantETag {
 		return
 	}
@@ -572,6 +571,21 @@ func (t Tiered) backfillTier0FromSource(ctx context.Context, key Key, source Cac
 	w, err := t.caches[0].Create(ctx, key, headers, ttl, WithETag(rawETag))
 	if err != nil {
 		logger.WarnContext(ctx, "Tiered: ranged heal writer create failed", "key", key, "error", err)
+		return
+	}
+	if _, declined := w.(*noOpWriter); declined {
+		return
+	}
+	r, openedHeaders, err := source.Open(ctx, key, IfMatch(wantETag))
+	if err != nil {
+		logger.WarnContext(ctx, "Tiered: ranged heal source read failed", "key", key, "error", errors.Join(err, w.Abort(err)))
+		return
+	}
+	defer discardTieredReader(ctx, key, r)
+	if openedHeaders.Get(ETagKey) != wantETag {
+		if err := w.Abort(errHealSuperseded); err != nil {
+			logger.WarnContext(ctx, "Tiered: ranged heal abort failed", "key", key, "error", err)
+		}
 		return
 	}
 	if _, err := io.Copy(w, r); err != nil {
