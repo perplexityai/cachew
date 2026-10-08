@@ -145,6 +145,8 @@ func (s *streamBuffer) closeWrite(err error) {
 func (s *streamBuffer) Close() error {
 	s.mu.Lock()
 	s.rclosed = true
+	s.pages = nil
+	s.pending = nil
 	s.cond.Broadcast()
 	s.mu.Unlock()
 	return nil

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 
 	"github.com/alecthomas/errors"
 	"github.com/minio/minio-go/v7"
@@ -24,9 +25,15 @@ func (s *S3) parallelGetReader(ctx context.Context, bucket, objectName string, s
 	chunkSize := int64(s.config.DownloadPartSizeMB) << 20                                      // #nosec G115 -- DownloadPartSizeMB is a small operator-supplied tuning value.
 	if concurrency := int(s.config.DownloadConcurrency); size > chunkSize && concurrency > 1 { // #nosec G115 -- DownloadConcurrency is a small operator-supplied tuning value.
 		window := &s3ObjectWindow{s3: s, bucket: bucket, objectName: objectName, start: 0, length: size, etag: etag}
-		return client.ParallelGetReader(ctx, window, Key{}, chunkSize, concurrency) //nolint:wrapcheck
+		return s.bufferedGetReader(ctx, window, chunkSize, concurrency)
 	}
-	obj, err := s.client.GetObject(ctx, bucket, objectName, minio.GetObjectOptions{})
+	opts := minio.GetObjectOptions{}
+	if etag != "" {
+		if err := opts.SetMatchETag(etag); err != nil {
+			return nil, errors.Errorf("set etag %s: %w", etag, err)
+		}
+	}
+	obj, err := s.client.GetObject(ctx, bucket, objectName, opts)
 	if err != nil {
 		return nil, errors.Errorf("failed to get object: %w", err)
 	}
@@ -44,10 +51,38 @@ func (s *S3) rangedGetReader(ctx context.Context, bucket, objectName string, sta
 	if length < 2*minRangePartSize || concurrency <= 1 {
 		return s.rangeGetReader(ctx, bucket, objectName, start, length, etag)
 	}
-	chunkSize := (length + concurrency - 1) / concurrency
+	chunkSize := 1 + (length-1)/concurrency
 	chunkSize = min(max(chunkSize, minRangePartSize), int64(s.config.DownloadPartSizeMB)<<20) // #nosec G115 -- DownloadPartSizeMB is a small operator-supplied tuning value.
 	window := &s3ObjectWindow{s3: s, bucket: bucket, objectName: objectName, start: start, length: length, etag: etag}
-	return client.ParallelGetReader(ctx, window, Key{}, chunkSize, int(concurrency)) //nolint:wrapcheck
+	return s.bufferedGetReader(ctx, window, chunkSize, int(concurrency))
+}
+
+func (s *S3) bufferedGetReader(ctx context.Context, window *s3ObjectWindow, chunkSize int64, concurrency int) (io.ReadCloser, error) {
+	pages := min(2*int64(concurrency), 1+(window.length-1)/chunkSize)
+	if pages > (s.config.DownloadBufferLimitMB<<20)/chunkSize || !s.downloadBuffers.TryAcquire(pages*chunkSize) {
+		return s.rangeGetReader(ctx, window.bucket, window.objectName, window.start, window.length, window.etag)
+	}
+	reader, err := client.ParallelGetReader(ctx, window, Key{}, chunkSize, concurrency)
+	if err != nil {
+		s.downloadBuffers.Release(pages * chunkSize)
+		return nil, errors.WithStack(err)
+	}
+	return &budgetedDownloadReader{ReadCloser: reader, release: func() { s.downloadBuffers.Release(pages * chunkSize) }}, nil
+}
+
+type budgetedDownloadReader struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+	err     error
+}
+
+func (r *budgetedDownloadReader) Close() error {
+	r.once.Do(func() {
+		r.err = r.ReadCloser.Close()
+		r.release()
+	})
+	return r.err
 }
 
 // rangeGetReader returns an io.ReadCloser for a single byte range of an S3
