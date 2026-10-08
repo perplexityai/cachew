@@ -696,6 +696,15 @@ disk {
 
 S3-compatible object storage (AWS S3, MinIO, etc.).
 
+The `cache s3` block accepts `download-buffer-limit-mb` (default 1024 MiB).
+This budget is shared by parallel downloads across all namespaces of that S3
+cache instance. Each reader reserves its maximum reordering buffer before
+starting workers. When the budget is exhausted, new readers use a single
+ETag-pinned S3 stream without the reordering buffer; downloads are not queued
+behind slow consumers. Close readers promptly to release their reservation.
+The budget covers parallel-download pages, not the memory cache, uploads,
+HTTP buffers, or total process RSS. Multiple S3 cache blocks have separate budgets.
+
 ```hcl
 s3 {
   bucket   = "my-cache-bucket"

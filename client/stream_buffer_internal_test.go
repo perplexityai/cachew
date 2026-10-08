@@ -160,6 +160,9 @@ func TestStreamBufferCloseUnblocksWriter(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not unblock the writer")
 	}
+	assert.Equal(t, 0, len(buf.pages), "closed readers must stop retaining their buffer reservation")
+	_, err = buf.WriteAt([]byte{1}, 0)
+	assert.IsError(t, err, io.ErrClosedPipe)
 }
 
 // rangedReader serves correct byte ranges with an ETag, optionally delaying
