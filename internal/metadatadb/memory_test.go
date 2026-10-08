@@ -36,3 +36,23 @@ func TestMemoryBackendConcurrentQueryOfMissingNamespaces(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestMemoryBackendConcurrentFirstRead(t *testing.T) {
+	backend := metadatadb.NewMemoryBackend()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() {
+			<-start
+			var result struct {
+				Value string
+				OK    bool
+			}
+			err := backend.Query(t.Context(), "new-namespace", metadatadb.MapGet{Key: "entries", MapKey: "missing"}, &result)
+			assert.NoError(t, err)
+			assert.False(t, result.OK)
+		})
+	}
+	close(start)
+	wg.Wait()
+}
