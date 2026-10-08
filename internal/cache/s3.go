@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/alecthomas/errors"
 	"github.com/minio/minio-go/v7"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
@@ -42,20 +44,22 @@ func RegisterS3(r *Registry, clientProvider s3client.ClientProvider) {
 // (endpoint, region, SSL, credentials) are provided by the global
 // s3client.Config block and shared via the s3client.ClientProvider.
 type S3Config struct {
-	Bucket              string        `hcl:"bucket" help:"S3 bucket name."`
-	MaxTTL              time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the S3 cache (defaults to 1 hour)." default:"1h"`
-	UploadConcurrency   uint          `hcl:"upload-concurrency,optional" help:"Number of concurrent workers for multi-part uploads (0 = use all CPU cores, defaults to 1)." default:"1"`
-	UploadPartSizeMB    uint          `hcl:"upload-part-size-mb,optional" help:"Size of each part for multi-part uploads in megabytes (defaults to 16MB, minimum 5MB)." default:"16"`
-	DownloadConcurrency uint          `hcl:"download-concurrency,optional" help:"Number of concurrent range-GET workers for downloads (defaults to 8)." default:"8"`
-	DownloadPartSizeMB  uint          `hcl:"download-part-size-mb,optional" help:"Size of each parallel range-GET request in megabytes (defaults to 32MB)." default:"32"`
+	Bucket                string        `hcl:"bucket" help:"S3 bucket name."`
+	MaxTTL                time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the S3 cache (defaults to 1 hour)." default:"1h"`
+	UploadConcurrency     uint          `hcl:"upload-concurrency,optional" help:"Number of concurrent workers for multi-part uploads (0 = use all CPU cores, defaults to 1)." default:"1"`
+	UploadPartSizeMB      uint          `hcl:"upload-part-size-mb,optional" help:"Size of each part for multi-part uploads in megabytes (defaults to 16MB, minimum 5MB)." default:"16"`
+	DownloadConcurrency   uint          `hcl:"download-concurrency,optional" help:"Number of concurrent range-GET workers for downloads (defaults to 8)." default:"8"`
+	DownloadPartSizeMB    uint          `hcl:"download-part-size-mb,optional" help:"Size of each parallel range-GET request in megabytes (defaults to 32MB)." default:"32"`
+	DownloadBufferLimitMB int64         `hcl:"download-buffer-limit-mb,optional" help:"Shared parallel download buffer budget in MiB across namespaces; exhausted readers stream directly (defaults to 1024)." default:"1024"`
 }
 
 type S3 struct {
-	logger         *slog.Logger
-	config         S3Config
-	namespace      Namespace
-	client         *minio.Client
-	companionGrace time.Duration
+	logger          *slog.Logger
+	config          S3Config
+	namespace       Namespace
+	client          *minio.Client
+	companionGrace  time.Duration
+	downloadBuffers *semaphore.Weighted
 }
 
 // s3CompanionGrace generously bounds the gap between a data object landing
@@ -124,6 +128,15 @@ func NewS3(ctx context.Context, config S3Config, clientProvider s3client.ClientP
 	if config.DownloadPartSizeMB == 0 {
 		config.DownloadPartSizeMB = 32
 	}
+	if config.DownloadConcurrency > 1024 || config.DownloadPartSizeMB > math.MaxInt64>>20 {
+		return nil, errors.New("S3 download concurrency or part size exceeds the supported range")
+	}
+	if config.DownloadBufferLimitMB == 0 {
+		config.DownloadBufferLimitMB = 1024
+	}
+	if config.DownloadBufferLimitMB < 0 || config.DownloadBufferLimitMB > math.MaxInt64>>20 {
+		return nil, errors.New("download-buffer-limit-mb must be positive and fit in an int64 byte count")
+	}
 
 	client, err := clientProvider()
 	if err != nil {
@@ -134,7 +147,8 @@ func NewS3(ctx context.Context, config S3Config, clientProvider s3client.ClientP
 		"endpoint", client.EndpointURL(), "bucket", config.Bucket,
 		"max-ttl", config.MaxTTL,
 		"upload-concurrency", config.UploadConcurrency, "upload-part-size-mb", config.UploadPartSizeMB,
-		"download-concurrency", config.DownloadConcurrency, "download-part-size-mb", config.DownloadPartSizeMB)
+		"download-concurrency", config.DownloadConcurrency, "download-part-size-mb", config.DownloadPartSizeMB,
+		"download-buffer-limit-mb", config.DownloadBufferLimitMB)
 
 	// Verify bucket exists
 	exists, err := client.BucketExists(ctx, config.Bucket)
@@ -146,10 +160,11 @@ func NewS3(ctx context.Context, config S3Config, clientProvider s3client.ClientP
 	}
 
 	return &S3{
-		logger:         logging.FromContext(ctx),
-		config:         config,
-		client:         client,
-		companionGrace: s3CompanionGrace,
+		logger:          logging.FromContext(ctx),
+		config:          config,
+		client:          client,
+		companionGrace:  s3CompanionGrace,
+		downloadBuffers: semaphore.NewWeighted(config.DownloadBufferLimitMB << 20),
 	}, nil
 }
 
