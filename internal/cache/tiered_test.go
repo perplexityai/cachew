@@ -1116,6 +1116,58 @@ func TestTieredRangedReadHealsDivergentTier0(t *testing.T) {
 	}
 }
 
+type fullReadCountingCache struct {
+	cache.Cache
+	opens atomic.Int32
+}
+
+func (c *fullReadCountingCache) Open(ctx context.Context, key cache.Key, opts ...cache.Option) (io.ReadCloser, http.Header, error) {
+	if cache.NewRequestOptions(opts...).Range == "" {
+		c.opens.Add(1)
+	}
+	return c.Cache.Open(ctx, key, opts...)
+}
+
+func TestTieredRangedReadSkipsDeclinedMemoryFill(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 4, InflightLimitMB: 1, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 8, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	observed := &fullReadCountingCache{Cache: lower}
+	admitted := make(chan struct{}, 1)
+	trackedMemory := createFuncCache{Cache: memory, create: func(ctx context.Context, key cache.Key, headers http.Header, ttl time.Duration, opts ...cache.Option) (cache.Writer, error) {
+		w, err := memory.Create(ctx, key, headers, ttl, opts...)
+		admitted <- struct{}{}
+		return w, err
+	}}
+	tiered := newTiered(ctx, trackedMemory, observed)
+	t.Cleanup(func() { assert.NoError(t, tiered.Close()) })
+	key := cache.NewKey("oversized-snapshot")
+	seedTier(ctx, t, tiered, key, []byte{1})
+	<-admitted
+	content := bytes.Repeat([]byte{42}, 2<<20)
+	writer, err := tiered.Create(ctx, key, http.Header{"Content-Length": {strconv.Itoa(len(content))}}, time.Hour)
+	assert.NoError(t, err)
+	_, err = writer.Write(content)
+	assert.NoError(t, err)
+	assert.NoError(t, writer.Close())
+	<-admitted
+
+	reader, _, err := tiered.Open(ctx, key, cache.Range(0, 16<<10))
+	assert.NoError(t, err)
+	assert.Equal(t, content[:16<<10], readAllAndClose(t, reader))
+	select {
+	case <-admitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background fill did not attempt memory admission")
+	}
+	_, _, err = memory.Open(ctx, key)
+	assert.IsError(t, err, os.ErrNotExist)
+	assert.NoError(t, tiered.Close())
+	assert.Equal(t, int32(0), observed.opens.Load(), "declined fills must not start eager source downloads")
+}
+
 func TestTieredRangedReadKeepsNewerTier0(t *testing.T) {
 	newer := []byte("abcdefghij")
 	lagging := []byte("0123456789")
