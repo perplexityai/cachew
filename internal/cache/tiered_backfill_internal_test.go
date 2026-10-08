@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +22,33 @@ func backfillTestContext(t *testing.T) context.Context {
 	t.Helper()
 	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
 	return ctx
+}
+
+type missingHealSource struct{ Cache }
+
+func (s missingHealSource) Open(context.Context, Key, ...Option) (io.ReadCloser, http.Header, error) {
+	return nil, nil, os.ErrNotExist
+}
+
+func TestTieredRangedHealReleasesAdmissionWhenSourceDisappears(t *testing.T) {
+	ctx := backfillTestContext(t)
+	memory, err := NewMemory(ctx, MemoryConfig{LimitMB: 4, InflightLimitMB: 1})
+	assert.NoError(t, err)
+	defer memory.Close()
+	lower, err := NewMemory(ctx, MemoryConfig{LimitMB: 4})
+	assert.NoError(t, err)
+	defer lower.Close()
+	key := NewKey("removed-before-heal-open")
+	w, err := lower.Create(ctx, key, nil, time.Hour, WithETag("v1"))
+	assert.NoError(t, err)
+	_, err = w.Write([]byte("payload"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+	tiered := Tiered{caches: []Cache{memory}}
+	tiered.backfillTier0FromSource(ctx, key, missingHealSource{Cache: lower}, `"v1"`, "v1")
+	assert.Equal(t, int64(0), memory.state.inflightCharge.Load(), "failed source opens must release the admitted writer")
+	_, _, err = memory.Open(ctx, key)
+	assert.IsError(t, err, os.ErrNotExist)
 }
 
 func TestTieredBackfillLeasesAreVersionAwareAndConcurrencyBounded(t *testing.T) {
