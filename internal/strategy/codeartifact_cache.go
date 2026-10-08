@@ -95,27 +95,27 @@ func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool 
 
 func (c *CodeArtifact) serveCacheFill(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode, epoch uint64) string {
 	if r.Context().Err() != nil {
-		return "canceled"
+		return codeArtifactAuditCanceled
 	}
 	wait, finish, changed := c.claimCacheFill(c.cacheKey(r), epoch)
 	if finish != nil {
 		defer finish()
 		if changed && c.serveCached(w, r) {
-			return "cache"
+			return codeArtifactAuditCache
 		}
 		c.serveOrigin(w, r, mode)
 		return codeArtifactAuditOrigin
 	}
 	select {
 	case <-r.Context().Done():
-		return "canceled"
+		return codeArtifactAuditCanceled
 	case <-wait:
 	}
 	if r.Context().Err() != nil {
-		return "canceled"
+		return codeArtifactAuditCanceled
 	}
 	if c.serveCached(w, r) {
-		return "cache"
+		return codeArtifactAuditCache
 	}
 	// A failed fill must not turn its waiting requests into concurrent S3
 	// retries, or serialize downloads behind repeated failures during an outage.

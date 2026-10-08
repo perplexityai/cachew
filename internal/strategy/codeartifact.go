@@ -273,7 +273,7 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 	// without doubling cache lookups on uncontended misses.
 	epoch := c.fillEpoch.Load()
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
-		return "cache"
+		return codeArtifactAuditCache
 	}
 	if !packagepolicy.Cacheable(decision, err) {
 		mode = codeArtifactCachePassthrough

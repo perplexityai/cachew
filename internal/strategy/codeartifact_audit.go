@@ -34,6 +34,8 @@ func (c *CodeArtifact) packageAuditEvent(r *http.Request, purl string, decision 
 }
 
 const (
+	codeArtifactAuditCache        = "cache"
+	codeArtifactAuditCanceled     = "canceled"
 	codeArtifactAuditOrigin       = "origin"
 	codeArtifactAuditUnavailable  = "unavailable"
 	codeArtifactUnmappablePackage = "unmappable_package"
@@ -64,7 +66,7 @@ func codeArtifactAuditEvent(purl string, decision packagepolicy.Decision, err er
 	switch {
 	case err == nil:
 	case errors.Is(err, context.Canceled), slices.Contains(decision.Reasons, "requestCanceled"):
-		event.PolicyError = "canceled"
+		event.PolicyError = codeArtifactAuditCanceled
 		if errors.Is(err, context.DeadlineExceeded) {
 			event.PolicyError = "timeout"
 		}

@@ -7,8 +7,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/block/cachew/internal/tracing"
 	"go.opentelemetry.io/otel"
+
+	"github.com/block/cachew/internal/tracing"
 )
 
 // New is a no-op when disabled and must return a non-nil stop function.
