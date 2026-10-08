@@ -30,7 +30,7 @@ import (
 type delayedUploadTransport struct {
 	http.RoundTripper
 	release    <-chan struct{}
-	failFirst  *atomic.Bool
+	failUpload *atomic.Bool
 	pauseMiss  *atomic.Bool
 	missed     chan struct{}
 	resumeMiss <-chan struct{}
@@ -43,7 +43,7 @@ func (d delayedUploadTransport) RoundTrip(r *http.Request) (*http.Response, erro
 		case <-r.Context().Done():
 			return nil, r.Context().Err()
 		}
-		if d.failFirst != nil && d.failFirst.Swap(false) {
+		if d.failUpload != nil && d.failUpload.Load() {
 			return &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("<Error><Code>AccessDenied</Code><Message>injected upload failure</Message></Error>")), Request: r}, nil
 		}
 	}
@@ -72,6 +72,7 @@ type cacheFillHarness struct {
 	pauseMiss      atomic.Bool
 	missed         chan struct{}
 	resumeMiss     func()
+	failUpload     atomic.Bool
 }
 
 func newCacheFillHarness(t *testing.T, bucket, strategyName, scenario string) *cacheFillHarness {
@@ -85,8 +86,7 @@ func newCacheFillHarness(t *testing.T, bucket, strategyName, scenario string) *c
 	h.missed = make(chan struct{}, 1)
 	h.resumeMiss = sync.OnceFunc(func() { close(resumeMiss) })
 	t.Cleanup(h.resumeMiss)
-	failFirst := &atomic.Bool{}
-	failFirst.Store(scenario == "upload-failure")
+	h.failUpload.Store(scenario == "upload-failure")
 	transport, err := minio.DefaultTransport(false)
 	assert.NoError(t, err)
 	t.Cleanup(transport.CloseIdleConnections)
@@ -94,7 +94,7 @@ func newCacheFillHarness(t *testing.T, bucket, strategyName, scenario string) *c
 		Creds:           credentials.NewStaticV4(s3clienttest.Username, s3clienttest.Password, ""),
 		Region:          "us-east-1",
 		TrailingHeaders: true,
-		Transport:       delayedUploadTransport{RoundTripper: transport, release: release, failFirst: failFirst, pauseMiss: &h.pauseMiss, missed: h.missed, resumeMiss: resumeMiss},
+		Transport:       delayedUploadTransport{RoundTripper: transport, release: release, failUpload: &h.failUpload, pauseMiss: &h.pauseMiss, missed: h.missed, resumeMiss: resumeMiss},
 	})
 	assert.NoError(t, err)
 	store, err := cache.NewS3(ctx, cache.S3Config{Bucket: bucket, MaxTTL: time.Hour, UploadPartSizeMB: 5}, func() (*minio.Client, error) { return client, nil })

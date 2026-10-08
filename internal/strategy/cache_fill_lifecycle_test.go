@@ -86,6 +86,7 @@ func TestCacheFillConcurrent(t *testing.T) {
 			if scenario == "upload-failure" {
 				want = callers + 1
 				h.assertStored(t, true)
+				h.failUpload.Store(false)
 				resp, err := h.server.Client().Get(h.server.URL + h.path)
 				assert.NoError(t, err)
 				body, err := io.ReadAll(resp.Body)

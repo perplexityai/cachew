@@ -1066,7 +1066,7 @@ func eventually(t *testing.T, fn func() bool) {
 
 func tierHolds(ctx context.Context, t *testing.T, c cache.Cache, key cache.Key, wantBody []byte, wantETag string) bool {
 	t.Helper()
-	r, headers, err := c.Open(ctx, key)
+	r, headers, err := c.Open(ctx, key, cache.IfMatch(wantETag))
 	if err != nil {
 		return false
 	}
