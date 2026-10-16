@@ -198,6 +198,10 @@ Each origin body `Read` has an idle deadline, so downstream client or cache writ
 do not count as origin stalls and large downloads have no fixed total-duration
 limit. A body read timeout cancels the origin request and is reported as
 `status=read_idle_timeout` in the CodeArtifact origin metrics.
+Failures before response headers use bounded statuses in those same metrics:
+`client_canceled`, `transport_timeout`, `transport_dns`,
+`transport_connection`, or `transport_error` for other failures. Logs include
+only that status, never the origin URL or signed redirect URL.
 
 Authorization tokens are reused in-process. The default 12-hour token enters
 proactive refresh one hour before expiration; one request performs each refresh
