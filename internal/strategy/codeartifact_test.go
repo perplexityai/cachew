@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -569,24 +571,72 @@ func TestCodeArtifactConcurrentDeniedRequestsReachPolicyTogether(t *testing.T) {
 }
 
 func TestCodeArtifactSanitizesOriginTransportErrors(t *testing.T) {
-	target, err := url.Parse("https://codeartifact.example.com")
+	tests := []struct {
+		name   string
+		fault  error
+		status string
+		cancel bool
+	}{
+		{name: "unknown", fault: errors.New("transport failed for credential=must-not-be-logged"), status: "transport_error"},
+		{name: "timeout", fault: context.DeadlineExceeded, status: "transport_timeout"},
+		{name: "dns", fault: &net.DNSError{Err: "no such host", Name: "private.example.com"}, status: "transport_dns"},
+		{name: "connection", fault: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, status: "transport_connection"},
+		{name: "client canceled", fault: context.Canceled, status: "client_canceled", cancel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target, err := url.Parse("https://codeartifact.example.com")
+			assert.NoError(t, err)
+			recorded := &recordingCodeArtifactMetrics{}
+			strategy := &CodeArtifact{
+				target: target,
+				prefix: "/codeartifact.example.com",
+				metric: recorded,
+				client: &http.Client{Transport: codeArtifactRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+					assert.Equal(t, "credential=must-not-be-logged", r.URL.RawQuery)
+					return nil, test.fault
+				})},
+			}
+			request := httptest.NewRequest(
+				http.MethodGet,
+				"/codeartifact.example.com/maven/repository/package?credential=must-not-be-logged",
+				nil,
+			)
+			if test.cancel {
+				ctx, cancel := context.WithCancel(request.Context())
+				cancel()
+				request = request.WithContext(ctx)
+			}
+
+			_, err = strategy.do(request, "token")
+			assert.Equal(t, []recordedCodeArtifactOrigin{{status: test.status, format: "maven"}}, recorded.origin)
+			assert.EqualError(t, err, "request CodeArtifact origin: "+test.status)
+		})
+	}
+}
+
+func TestCodeArtifactSanitizesRedirectTransportErrors(t *testing.T) {
+	originURL, err := url.Parse("https://codeartifact.example.com/maven/repository/package")
 	assert.NoError(t, err)
+	recorded := &recordingCodeArtifactMetrics{}
 	strategy := &CodeArtifact{
-		target: target,
-		prefix: "/codeartifact.example.com",
+		metric: recorded,
 		client: &http.Client{Transport: codeArtifactRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
-			assert.Equal(t, "credential=must-not-be-logged", r.URL.RawQuery)
-			return nil, errors.Errorf("transport failed for %s", r.URL)
+			assert.Equal(t, "X-Amz-Signature=must-not-be-logged", r.URL.RawQuery)
+			return nil, errors.Errorf("redirect failed for %s", r.URL)
 		})},
 	}
-	request := httptest.NewRequest(
-		http.MethodGet,
-		"/codeartifact.example.com/maven/repository/package?credential=must-not-be-logged",
-		nil,
-	)
+	request := httptest.NewRequest(http.MethodGet, "/codeartifact.example.com/maven/repository/package", nil)
+	originResponse := &http.Response{StatusCode: http.StatusFound, Request: &http.Request{URL: originURL}}
 
-	_, err = strategy.do(request, "token")
-	assert.EqualError(t, err, "request CodeArtifact origin")
+	_, err = strategy.followCrossOriginRedirect(
+		request,
+		originResponse,
+		"https://download.example.com/maven/asset?X-Amz-Signature=must-not-be-logged",
+		false,
+	)
+	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "transport_error", format: "maven"}}, recorded.origin)
+	assert.EqualError(t, err, "request CodeArtifact redirect: transport_error")
 }
 
 func TestCodeArtifactBoundsOriginHeaderWait(t *testing.T) {
@@ -619,7 +669,7 @@ func TestCodeArtifactBoundsOriginHeaderWait(t *testing.T) {
 	}
 	select {
 	case requestErr := <-result:
-		assert.EqualError(t, requestErr, "request CodeArtifact origin")
+		assert.EqualError(t, requestErr, "request CodeArtifact origin: transport_timeout")
 	case <-time.After(time.Second):
 		t.Fatal("origin header wait exceeded its deadline")
 	}
