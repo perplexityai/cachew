@@ -34,8 +34,6 @@ require (
 	golang.org/x/sync v0.20.0
 )
 
-require github.com/zeebo/blake3 v0.2.4
-
 require (
 	github.com/agnivade/levenshtein v1.2.1 // indirect
 	github.com/aofei/backoff v1.2.0 // indirect
