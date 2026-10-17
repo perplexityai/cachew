@@ -176,6 +176,23 @@ codeartifact "example-111122223333.d.codeartifact.us-east-1.amazonaws.com" {
 CodeArtifact URLs in npm, Cargo, NuGet, and Swift package metadata so clients
 continue downloading through the unauthenticated proxy.
 
+Download-only deployments can expose stable local aliases without an extra proxy hop:
+
+```hcl
+aliases-only = true
+alias "/downloads/{package}/{version}" {
+  path = "/maven/downloads/org/example/{package}/{version}/{package}-{version}.tar"
+}
+```
+
+These fields belong inside the CodeArtifact strategy. Aliases accept GET/HEAD and
+single-segment wildcards; substitutions stay on the configured CodeArtifact origin.
+`aliases-only` disables the usual origin-prefixed route. OPA sees and must authorize
+the client-facing alias before cache lookup. Configure repository permissions and
+route admission explicitly; an alias is not an authorization grant. Alias requests
+reject queries and noncanonical encodings. Existing deployments are unchanged when
+aliases are absent.
+
 Metadata requests to npm, Cargo, and NuGet origins negotiate gzip independently
 of the client. Cachew decodes the response before rewriting, enforcing the 64 MiB
 metadata limit on decompressed bytes, and compresses rewritten metadata when
