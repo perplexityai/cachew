@@ -7,9 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/alecthomas/errors"
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
@@ -22,16 +24,47 @@ func RegisterAPIV1(r *Registry) {
 
 var _ Strategy = (*APIV1)(nil)
 
-// The APIV1 strategy represents v1 of the proxy API.
-type APIV1 struct {
-	cache  cache.Cache
-	logger *slog.Logger
+// APIV1Config controls metadata exposed by the generic object API.
+type APIV1Config struct {
+	Namespaces []ObjectNamespaceConfig `hcl:"namespace,block"`
 }
 
-func NewAPIV1(ctx context.Context, _ struct{}, cache cache.Cache, mux Mux) (*APIV1, error) {
+// ObjectNamespaceConfig restricts caller-supplied metadata for one namespace.
+type ObjectNamespaceConfig struct {
+	Name          string   `hcl:"name,label"`
+	StoredHeaders []string `hcl:"stored-headers"`
+}
+
+// The APIV1 strategy represents v1 of the proxy API.
+type APIV1 struct {
+	cache         cache.Cache
+	logger        *slog.Logger
+	storedHeaders map[cache.Namespace][]string
+}
+
+func NewAPIV1(ctx context.Context, config APIV1Config, store cache.Cache, mux Mux) (*APIV1, error) {
 	s := &APIV1{
-		logger: logging.FromContext(ctx),
-		cache:  cache,
+		logger:        logging.FromContext(ctx),
+		cache:         store,
+		storedHeaders: map[cache.Namespace][]string{},
+	}
+	for _, policy := range config.Namespaces {
+		namespace, err := cache.ParseNamespace(policy.Name)
+		if err != nil {
+			return nil, errors.Wrap(err, "invalid object metadata namespace")
+		}
+		if _, exists := s.storedHeaders[namespace]; exists {
+			return nil, errors.Errorf("duplicate object metadata namespace %q", namespace)
+		}
+		allowed := make([]string, 0, len(policy.StoredHeaders))
+		for _, header := range policy.StoredHeaders {
+			header = http.CanonicalHeaderKey(header)
+			if !httpguts.ValidHeaderFieldName(header) {
+				return nil, errors.Errorf("invalid stored header %q", header)
+			}
+			allowed = append(allowed, header)
+		}
+		s.storedHeaders[namespace] = allowed
 	}
 	mux.Handle("GET /api/v1/object/{namespace}/{key}", http.HandlerFunc(s.getObject))
 	mux.Handle("HEAD /api/v1/object/{namespace}/{key}", http.HandlerFunc(s.statObject))
@@ -59,7 +92,7 @@ func (d *APIV1) statObject(w http.ResponseWriter, r *http.Request) {
 
 	namespacedCache := d.cache.Namespace(namespace)
 	headers, err := namespacedCache.Stat(r.Context(), key, httputil.ConditionalOptions(r)...)
-	if httputil.ServeCacheStat(w, headers, err) {
+	if httputil.ServeCacheStat(w, d.metadataHeaders(namespace, headers), err) {
 		return
 	}
 	if errors.Is(err, os.ErrNotExist) {
@@ -83,7 +116,7 @@ func (d *APIV1) getObject(w http.ResponseWriter, r *http.Request) {
 
 	namespacedCache := d.cache.Namespace(namespace)
 	cr, headers, err := namespacedCache.Open(r.Context(), key, httputil.ConditionalOptions(r)...)
-	if handled, _, serveErr := httputil.ServeCacheHit(w, headers, cr, err); handled {
+	if handled, _, serveErr := httputil.ServeCacheHit(w, d.metadataHeaders(namespace, headers), cr, err); handled {
 		if serveErr != nil {
 			d.logger.Error("Failed to serve cache object", "error", serveErr, "key", key)
 		}
@@ -119,7 +152,7 @@ func (d *APIV1) putObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract and filter headers from request
-	headers := apiObjectHeaders(r.Header)
+	headers := d.metadataHeaders(namespace, httputil.FilterHeaders(r.Header, httputil.TransportHeaders...))
 	var opts []cache.Option
 	if etag := headers.Get(cache.ETagKey); etag != "" {
 		rawETag, err := cache.RawETagFromHeader(etag)
@@ -149,11 +182,18 @@ func (d *APIV1) putObject(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func apiObjectHeaders(headers http.Header) http.Header {
-	filtered := httputil.FilterHeaders(headers, httputil.TransportHeaders...)
-	filtered.Del("Authorization")
-	filtered.Del("Cookie")
-	filtered.Del("Proxy-Authorization")
+func (d *APIV1) metadataHeaders(namespace cache.Namespace, headers http.Header) http.Header {
+	filtered := headers.Clone()
+	allowed := d.storedHeaders[namespace]
+	for key := range filtered {
+		switch http.CanonicalHeaderKey(key) {
+		case "Etag", "Content-Length", "Content-Range", cache.ExpirationKey:
+			continue
+		}
+		if !slices.Contains(allowed, http.CanonicalHeaderKey(key)) {
+			delete(filtered, key)
+		}
+	}
 	return filtered
 }
 

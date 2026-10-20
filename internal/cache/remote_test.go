@@ -29,7 +29,12 @@ func TestRemoteCache(t *testing.T) {
 		t.Cleanup(func() { memCache.Close() })
 
 		mux := http.NewServeMux()
-		_, err = strategy.NewAPIV1(ctx, struct{}{}, memCache, mux)
+		_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{
+			Namespaces: []strategy.ObjectNamespaceConfig{{
+				Name:          "test",
+				StoredHeaders: []string{"Content-Type", "Cache-Control", "X-Custom-Field", "Last-Modified"},
+			}},
+		}, memCache, mux)
 		assert.NoError(t, err)
 		ts := httptest.NewServer(mux)
 		t.Cleanup(ts.Close)
@@ -53,7 +58,7 @@ func TestRemoteInvalidateSkipsRemoteAuthoritativeTier(t *testing.T) {
 
 	tiered := cache.MaybeNewTiered(ctx, []cache.Cache{lower, authoritative}, metadatadb.New(ctx, metadatadb.NewMemoryBackend()))
 	mux := http.NewServeMux()
-	_, err = strategy.NewAPIV1(ctx, struct{}{}, tiered, mux)
+	_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, tiered, mux)
 	assert.NoError(t, err)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -97,7 +102,7 @@ func TestRemoteCacheSoak(t *testing.T) {
 	defer memCache.Close()
 
 	mux := http.NewServeMux()
-	_, err = strategy.NewAPIV1(ctx, struct{}{}, memCache, mux)
+	_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, memCache, mux)
 	assert.NoError(t, err)
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
