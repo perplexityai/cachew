@@ -116,6 +116,7 @@ func classifyBlocks(ast *hcl.AST) (*classifiedBlocks, error) {
 		// Always enable the default API strategy
 		strategies: []*hcl.Block{{Name: "apiv1"}},
 	}
+	apiConfigured := false
 	for _, node := range ast.Entries {
 		block, ok := node.(*hcl.Block)
 		if !ok {
@@ -134,7 +135,15 @@ func classifyBlocks(ast *hcl.AST) (*classifiedBlocks, error) {
 			if err != nil {
 				return nil, err
 			}
-			result.strategies = append(result.strategies, inner)
+			if inner.Name == "apiv1" {
+				if apiConfigured {
+					return nil, errors.Errorf("%s: only one apiv1 strategy is allowed", block.Pos)
+				}
+				result.strategies[0] = inner
+				apiConfigured = true
+			} else {
+				result.strategies = append(result.strategies, inner)
+			}
 		default:
 			return nil, errors.Errorf("%s: unknown block %q (expected \"cache\", \"metadata\", or \"strategy\")", block.Pos, block.Name)
 		}

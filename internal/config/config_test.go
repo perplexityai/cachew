@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -319,4 +320,40 @@ metadata memory {}
 		time.Sleep(time.Millisecond)
 	}
 	assert.True(t, readiers[0].Ready())
+}
+
+func TestLoadObjectMetadataPolicy(t *testing.T) {
+	cr := cache.NewRegistry()
+	cache.RegisterMemory(cr)
+	mr := metadatadb.NewRegistry()
+	metadatadb.RegisterMemory(mr)
+	sr := strategy.NewRegistry()
+	strategy.RegisterAPIV1(sr)
+	ast, err := hcl.Parse(strings.NewReader(`
+cache memory {}
+metadata memory {}
+strategy apiv1 {
+  namespace "service-impact" {
+    stored-headers = ["Content-Type"]
+  }
+}
+`))
+	assert.NoError(t, err)
+	ctx := logging.ContextWithLogger(t.Context(), slog.Default())
+	handler, _, err := Load(ctx, cr, mr, sr, ast, http.NewServeMux(), nil)
+	assert.NoError(t, err)
+	key := cache.NewKey("configured")
+	path := "/api/v1/object/service-impact/" + key.String()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("snapshot"))
+	req.Header.Set("Content-Type", "application/gzip")
+	req.Header.Set("X-Unlisted", "discard")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req.WithContext(ctx))
+	assert.Equal(t, http.StatusOK, w.Code)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "snapshot", w.Body.String())
+	assert.Equal(t, "application/gzip", w.Header().Get("Content-Type"))
+	assert.Equal(t, "", w.Header().Get("X-Unlisted"))
 }
