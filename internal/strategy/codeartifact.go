@@ -32,17 +32,19 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	ImmutableFallbackTTL  time.Duration         `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
-	Target                string                `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	ProxyBaseURL          string                `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
-	Domain                string                `hcl:"domain" help:"The CodeArtifact domain name."`
-	DomainOwner           string                `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
-	Region                string                `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
-	RoleARN               string                `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
-	OriginHeaderTimeout   time.Duration         `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
-	OriginReadIdleTimeout time.Duration         `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
-	CredentialTimeout     time.Duration         `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
-	PackagePolicy         *packagepolicy.Config `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm artifact reads, including cache hits. Other formats remain unevaluated."`
+	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Optional local download routes mapped to fixed-origin paths."`
+	AliasesOnly           bool                      `hcl:"aliases-only,optional" help:"Disable the origin-prefixed route; requires at least one alias."`
+	ImmutableFallbackTTL  time.Duration             `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
+	Target                string                    `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
+	ProxyBaseURL          string                    `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
+	Domain                string                    `hcl:"domain" help:"The CodeArtifact domain name."`
+	DomainOwner           string                    `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
+	Region                string                    `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
+	RoleARN               string                    `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	OriginHeaderTimeout   time.Duration             `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
+	OriginReadIdleTimeout time.Duration             `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
+	CredentialTimeout     time.Duration             `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
+	PackagePolicy         *packagepolicy.Config     `hcl:"package-policy,block,optional" help:"Optional package security policy enforced on npm artifact reads, including cache hits. Other formats remain unevaluated."`
 }
 
 // CodeArtifact caches origin-declared immutable responses and passes all other
@@ -145,10 +147,15 @@ func newCodeArtifact(
 		}
 	}
 
-	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		pattern := method + " " + c.prefix + "/"
-		mux.Handle(pattern, c)
-		c.logger.InfoContext(ctx, "Registered CodeArtifact route", "pattern", pattern, "target", target)
+	if !config.AliasesOnly {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			pattern := method + " " + c.prefix + "/"
+			mux.Handle(pattern, c)
+			c.logger.InfoContext(ctx, "Registered CodeArtifact route", "pattern", pattern, "target", target)
+		}
+	}
+	if err := c.registerAliases(config, mux); err != nil {
+		return nil, err
 	}
 
 	return c, nil
