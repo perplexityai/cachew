@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	awscodeartifact "github.com/aws/aws-sdk-go-v2/service/codeartifact"
 	"github.com/felixge/httpsnoop"
 
 	"github.com/block/cachew/internal/cache"
@@ -32,15 +33,15 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Optional local download routes mapped to fixed-origin paths."`
-	AliasesOnly           bool                      `hcl:"aliases-only,optional" help:"Disable the origin-prefixed route; requires at least one alias."`
+	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Serves only configured aliases; range requests return the complete asset."`
+	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Maven asset download routes; requires asset-api."`
 	ImmutableFallbackTTL  time.Duration             `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
 	Target                string                    `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
-	ProxyBaseURL          string                    `hcl:"proxy-base-url" help:"The public Cachew origin used when rewriting package metadata URLs."`
+	ProxyBaseURL          string                    `hcl:"proxy-base-url,optional" help:"The public Cachew origin used when rewriting package metadata URLs. Required for repository proxying; unsupported with asset-api."`
 	Domain                string                    `hcl:"domain" help:"The CodeArtifact domain name."`
 	DomainOwner           string                    `hcl:"domain-owner" help:"The AWS account ID that owns the CodeArtifact domain."`
 	Region                string                    `hcl:"region" help:"The AWS region containing the CodeArtifact domain."`
-	RoleARN               string                    `hcl:"role-arn" help:"The read-only IAM role to assume when minting CodeArtifact tokens."`
+	RoleARN               string                    `hcl:"role-arn" help:"The read-only IAM role to assume for CodeArtifact origin access."`
 	OriginHeaderTimeout   time.Duration             `hcl:"origin-header-timeout,optional" default:"30s" help:"Maximum time to wait for CodeArtifact origin response headers. Zero uses the default."`
 	OriginReadIdleTimeout time.Duration             `hcl:"origin-read-idle-timeout,optional" default:"30s" help:"Maximum time a read from the origin body may make no progress. Zero uses the default."`
 	CredentialTimeout     time.Duration             `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for CodeArtifact credential refresh, including a concurrent refresh. Zero uses the default."`
@@ -50,6 +51,7 @@ type CodeArtifactConfig struct {
 // CodeArtifact caches origin-declared immutable responses and passes all other
 // authenticated reads through.
 type CodeArtifact struct {
+	assets                *codeArtifactAssetOrigin
 	immutableFallbackTTL  time.Duration
 	target                *url.URL
 	proxyBase             *url.URL
@@ -87,13 +89,22 @@ func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredC
 	if _, _, err := validateCodeArtifactConfig(config, false); err != nil {
 		return nil, err
 	}
-	tokens, err := newCodeArtifactTokenManager(ctx, config)
+	client, err := newCodeArtifactClient(ctx, config)
 	if err != nil {
 		return nil, err
+	}
+	var tokens codeArtifactTokenSource
+	if !config.AssetAPI {
+		tokens = newCodeArtifactTokenManagerWithClient(config, client, time.Now)
 	}
 	strategy, err := newCodeArtifact(ctx, config, mux, tokens, configuredCache, false)
 	if err != nil {
 		return nil, err
+	}
+	if config.AssetAPI {
+		options := client.Options()
+		options.HTTPClient = strategy.client
+		strategy.assets = &codeArtifactAssetOrigin{client: awscodeartifact.New(options), domain: config.Domain, owner: config.DomainOwner}
 	}
 	if config.PackagePolicy != nil {
 		strategy.packagePolicy, err = packagepolicy.New(*config.PackagePolicy)
@@ -122,12 +133,16 @@ func newCodeArtifact(
 	transport.DisableCompression = true
 	transport.ResponseHeaderTimeout = config.OriginHeaderTimeout
 
+	namespace := cache.Namespace("codeartifact")
+	if config.AssetAPI {
+		namespace = "codeartifact-assets"
+	}
 	c := &CodeArtifact{
 		target:    target,
 		proxyBase: proxyBase,
 		prefix:    "/" + target.Host,
 		tokens:    tokens,
-		cache:     configuredCache.Namespace(cache.Namespace("codeartifact")),
+		cache:     configuredCache.Namespace(namespace),
 		client: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -147,7 +162,7 @@ func newCodeArtifact(
 		}
 	}
 
-	if !config.AliasesOnly {
+	if !config.AssetAPI {
 		for _, method := range []string{http.MethodGet, http.MethodHead} {
 			pattern := method + " " + c.prefix + "/"
 			mux.Handle(pattern, c)
@@ -175,6 +190,13 @@ func codeArtifactConfigWithDefaults(config CodeArtifactConfig) CodeArtifactConfi
 }
 
 func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url.URL, *url.URL, error) {
+	if config.AssetAPI {
+		if len(config.Aliases) == 0 || config.PackagePolicy != nil || config.ProxyBaseURL != "" {
+			return nil, nil, errors.New("codeartifact: asset-api requires aliases and does not support package-policy or proxy-base-url")
+		}
+	} else if len(config.Aliases) != 0 {
+		return nil, nil, errors.New("codeartifact: aliases require asset-api")
+	}
 	if config.ImmutableFallbackTTL < 0 || config.ImmutableFallbackTTL > 24*time.Hour || (config.ImmutableFallbackTTL > 0 && config.ImmutableFallbackTTL < time.Second) {
 		return nil, nil, errors.New("codeartifact: immutable-fallback-ttl must be zero or between 1s and 24h")
 	}
@@ -198,11 +220,13 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 		value string
 	}{
 		{name: "target", value: config.Target},
-		{name: "proxy-base-url", value: config.ProxyBaseURL},
 		{name: "domain", value: config.Domain},
 		{name: "domain-owner", value: config.DomainOwner},
 		{name: "region", value: config.Region},
 		{name: "role-arn", value: config.RoleARN},
+	}
+	if !config.AssetAPI {
+		configured = append(configured, struct{ name, value string }{name: "proxy-base-url", value: config.ProxyBaseURL})
 	}
 	for _, field := range configured {
 		if field.value == "" {
@@ -217,9 +241,12 @@ func validateCodeArtifactConfig(config CodeArtifactConfig, allowHTTP bool) (*url
 	if err != nil {
 		return nil, nil, err
 	}
-	proxyBase, err := parseCodeArtifactOrigin("proxy-base-url", config.ProxyBaseURL, allowHTTP)
-	if err != nil {
-		return nil, nil, err
+	var proxyBase *url.URL
+	if config.ProxyBaseURL != "" {
+		proxyBase, err = parseCodeArtifactOrigin("proxy-base-url", config.ProxyBaseURL, allowHTTP)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	return target, proxyBase, nil
 }
@@ -295,6 +322,14 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 }
 
 func (c *CodeArtifact) serveOrigin(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
+	if c.assets != nil {
+		c.serveAsset(w, r, mode)
+	} else {
+		c.serveRepository(w, r, mode)
+	}
+}
+
+func (c *CodeArtifact) serveRepository(w http.ResponseWriter, r *http.Request, mode codeArtifactCacheMode) {
 	rewriteMetadata := shouldRewriteCodeArtifactMetadata(c.originURL(r).Path)
 	token, err := c.authorizationToken(r.Context())
 	if err != nil {
