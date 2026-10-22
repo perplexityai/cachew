@@ -55,7 +55,7 @@ type codeArtifactToken struct {
 	event      codeArtifactAuthEvent
 }
 
-func newCodeArtifactTokenManager(ctx context.Context, config CodeArtifactConfig) (*codeArtifactTokenManager, error) {
+func newCodeArtifactClient(ctx context.Context, config CodeArtifactConfig) (*awscodeartifact.Client, error) {
 	loadCtx, cancel := context.WithTimeout(ctx, config.CredentialTimeout)
 	defer cancel()
 	awsConfig, err := awsconfig.LoadDefaultConfig(loadCtx, awsconfig.WithRegion(config.Region))
@@ -63,9 +63,26 @@ func newCodeArtifactTokenManager(ctx context.Context, config CodeArtifactConfig)
 		return nil, errors.Wrap(err, "load AWS configuration for CodeArtifact")
 	}
 	stsClient := sts.NewFromConfig(awsConfig)
-	awsConfig.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsClient, config.RoleARN))
+	var provider aws.CredentialsProvider = stscreds.NewAssumeRoleProvider(stsClient, config.RoleARN)
+	if config.AssetAPI {
+		provider = codeArtifactCredentialDeadline(provider, config.CredentialTimeout)
+	}
+	awsConfig.Credentials = aws.NewCredentialsCache(provider)
+	if config.AssetAPI {
+		// The SDK detaches shared refreshes from caller cancellation. Bound both
+		// the refresh (including retries) and each caller waiting for it.
+		awsConfig.Credentials = codeArtifactCredentialDeadline(awsConfig.Credentials, config.CredentialTimeout)
+	}
 
-	return newCodeArtifactTokenManagerWithClient(config, awscodeartifact.NewFromConfig(awsConfig), time.Now), nil
+	return awscodeartifact.NewFromConfig(awsConfig), nil
+}
+
+func codeArtifactCredentialDeadline(provider aws.CredentialsProvider, timeout time.Duration) aws.CredentialsProvider {
+	return aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return provider.Retrieve(ctx)
+	})
 }
 
 func newCodeArtifactTokenManagerWithClient(

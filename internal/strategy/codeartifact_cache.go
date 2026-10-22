@@ -41,6 +41,9 @@ func classifyCodeArtifactRequest(r *http.Request) codeArtifactCacheMode {
 func (c *CodeArtifact) cacheKey(r *http.Request) cache.Key {
 	origin := c.originURL(r)
 	var key strings.Builder
+	if c.assets != nil {
+		key.WriteString(c.assets.client.Options().Region + "/" + c.assets.owner + "/" + c.assets.domain + "\n")
+	}
 	key.WriteString(origin.String())
 	for _, name := range []string{"Accept", "Accept-Encoding"} {
 		if values := r.Header.Values(name); len(values) > 0 {

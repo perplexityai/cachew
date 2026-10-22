@@ -179,19 +179,17 @@ continue downloading through the unauthenticated proxy.
 Download-only deployments can expose stable local aliases without an extra proxy hop:
 
 ```hcl
-aliases-only = true
+asset-api = true
 alias "/downloads/{package}/{version}" {
   path = "/maven/downloads/org/example/{package}/{version}/{package}-{version}.tar"
 }
 ```
 
 These fields belong inside the CodeArtifact strategy. Aliases accept GET/HEAD and
-single-segment wildcards; substitutions stay on the configured CodeArtifact origin.
-`aliases-only` disables the usual origin-prefixed route. OPA sees and must authorize
+single-segment wildcards. Asset mode exposes only these aliases. OPA sees and must authorize
 the client-facing alias before cache lookup. Configure repository permissions and
 route admission explicitly; an alias is not an authorization grant. Alias requests
-reject queries and noncanonical encodings. Existing deployments are unchanged when
-aliases are absent.
+reject queries and noncanonical encodings. Aliases require asset mode.
 
 Metadata requests to npm, Cargo, and NuGet origins negotiate gzip independently
 of the client. Cachew decodes the response before rewriting, enforcing the 64 MiB
@@ -207,6 +205,22 @@ for clients. Compression does not change metadata freshness or cache admission.
 The role needs `codeartifact:GetAuthorizationToken` and its underlying principal
 needs `sts:GetServiceBearerToken`. Repository read permissions remain governed by
 the CodeArtifact resource policy.
+
+For a Maven asset download service, set `asset-api = true`. Alias targets retain their `/maven/<repository>/<group>/<package>/<version>/<asset>`
+shape, but cold reads use the signed `GetPackageVersionAsset` API. Grant only
+`codeartifact:GetPackageVersionAsset` on the required package ARNs; repository
+read and token permissions are unnecessary. IAM limits packages, while the
+admission policy must restrict versions and asset names. This mode does not serve
+repository metadata, mutable `-SNAPSHOT` versions or other package formats.
+Unsupported alias targets fail at startup. `proxy-base-url` and `package-policy` are rejected in
+this mode because it serves assets without metadata rewriting or npm policy evaluation. The SDK uses `domain`,
+`domain-owner` and `region` to select the AWS origin; cache keys include that identity.
+
+Asset reads use a separate `codeartifact-assets` cache namespace and the existing
+`immutable-fallback-ttl` setting. Successful asset responses are treated as immutable;
+source deletion or permission revocation does not evict cached bytes. Admission still
+runs before cache lookup. GET, HEAD and ETag conditions are supported; Range requests
+receive a complete 200 response because the asset API has no range operation.
 
 Credential refresh, including time spent waiting for another required refresh,
 has a whole-operation deadline. The origin header deadline begins after the
