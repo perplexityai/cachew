@@ -787,7 +787,7 @@ func TestCodeArtifactParentCancellationIsNotOriginReadTimeout(t *testing.T) {
 	assert.True(t, errors.Is(err, context.Canceled))
 	assert.False(t, errors.Is(err, errCodeArtifactOriginReadIdleTimeout))
 	assert.NoError(t, body.Close())
-	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "200", format: "maven"}}, recorded.origin)
+	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "canceled", format: "maven"}}, recorded.origin)
 }
 
 func TestCodeArtifactRejectsNegativeTimeouts(t *testing.T) {
@@ -1168,7 +1168,9 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 
 	for range 2 {
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, assetURL, nil).WithContext(ctx))
+		assertCodeArtifactStreamAborted(t, func() {
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, assetURL, nil).WithContext(ctx))
+		})
 		assert.Equal(t, http.StatusOK, w.Code)
 		assert.Equal(t, "short", w.Body.String())
 	}

@@ -148,7 +148,9 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 	assert.Equal(t, 10, calls)
 	wantDomain = "example"
 	for range 2 {
-		assert.Equal(t, "bad", request("GET", "truncated.tar", nil).Body.String())
+		assertCodeArtifactStreamAborted(t, func() {
+			request("GET", "truncated.tar", nil)
+		})
 	}
 	assert.Equal(t, 12, calls)
 }

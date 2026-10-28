@@ -1,6 +1,7 @@
 package strategy //nolint:testpackage // Exercises the real HTTP path with a local origin and audit files.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -21,6 +22,34 @@ import (
 	"github.com/block/cachew/internal/packageaudit"
 	"github.com/block/cachew/internal/packagepolicy"
 )
+
+func TestCodeArtifactAuditSurvivesAbortedStream(t *testing.T) {
+	mux, origin, _, strategy, ctx := newTestCachingCodeArtifact(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = io.WriteString(w, "short")
+	}))
+	directory := filepath.Join(t.TempDir(), "audit")
+	sink, err := packageaudit.New(packageaudit.Config{Directory: directory}, nil)
+	assert.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, sink.Close(context.Background())) })
+	strategy.packageAudit = sink
+	w := httptest.NewRecorder()
+	path := codeArtifactPath(origin, "/npm/repository/package/-/package-1.0.0.tgz")
+	assertCodeArtifactStreamAborted(t, func() {
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+	})
+	assert.NoError(t, sink.Close(context.Background()))
+	files, err := filepath.Glob(filepath.Join(directory, "*.ndjson"))
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(files))
+	data, err := os.ReadFile(files[0])
+	assert.NoError(t, err)
+	var event packageaudit.Event
+	assert.NoError(t, json.Unmarshal(bytes.TrimSpace(data), &event))
+	assert.Equal(t, "pkg:npm/package@1.0.0", event.PURL)
+	assert.Equal(t, codeArtifactAuditUnavailable, event.ResponseSource)
+	assert.Equal(t, http.StatusOK, event.HTTPStatus)
+}
 
 func TestCodeArtifactAuditWithoutProvider(t *testing.T) {
 	for _, disabled := range []bool{false, true} {

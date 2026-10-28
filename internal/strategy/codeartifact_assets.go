@@ -90,7 +90,7 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 	if mode == codeArtifactCacheLookup {
 		c.streamAndCache(w, r, resp, headers)
 	} else {
-		c.streamOriginBody(r.Context(), w, resp.Body)
+		c.streamOriginBody(w, r, resp.Body)
 	}
 }
 

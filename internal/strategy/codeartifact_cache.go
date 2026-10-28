@@ -1,7 +1,6 @@
 package strategy
 
 import (
-	"context"
 	"io"
 	"maps"
 	"net/http"
@@ -159,7 +158,7 @@ func (c *CodeArtifact) streamAndCache(
 	cacheHeaders, ttl, createOptions, cacheable := codeArtifactCacheEntry(responseHeaders, time.Now(), fallback)
 	if !cacheable {
 		c.metric.recordCache(r.Context(), codeArtifactCacheNotCacheable, codeArtifactCacheTierNone)
-		c.streamOriginBody(r.Context(), w, resp.Body)
+		c.streamOriginBody(w, r, resp.Body)
 		return
 	}
 
@@ -169,15 +168,20 @@ func (c *CodeArtifact) streamAndCache(
 	if err != nil {
 		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
 		c.logger.ErrorContext(r.Context(), "Failed to create CodeArtifact cache entry", "error", err)
-		c.streamOriginBody(r.Context(), w, resp.Body)
+		c.streamOriginBody(w, r, resp.Body)
 		return
 	}
 
 	cacheCopy := &bestEffortCacheWriter{writer: writer}
-	_, copyErr := io.Copy(w, io.TeeReader(resp.Body, cacheCopy))
+	started := time.Now()
+	reader := &codeArtifactStreamReader{reader: resp.Body}
+	written, copyErr := io.Copy(w, io.TeeReader(reader, cacheCopy))
 	if copyErr != nil || cacheCopy.err != nil {
 		abortErr := writer.Abort(errors.Join(copyErr, cacheCopy.err))
 		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
+		if copyErr != nil {
+			c.abortStream(w, r, "origin", reader, written, started, copyErr)
+		}
 		if err := errors.Join(copyErr, cacheCopy.err, abortErr); err != nil {
 			c.logger.ErrorContext(r.Context(), "Failed to cache complete CodeArtifact response", "error", err)
 		}
@@ -447,12 +451,6 @@ func commaSeparatedValueContains(headerValue, want string) bool {
 		}
 	}
 	return false
-}
-
-func (c *CodeArtifact) streamOriginBody(ctx context.Context, w http.ResponseWriter, body io.Reader) {
-	if _, err := io.Copy(w, body); err != nil {
-		c.logger.ErrorContext(ctx, "Failed to stream CodeArtifact response", "error", err)
-	}
 }
 
 type bestEffortCacheWriter struct {
