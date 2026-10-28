@@ -2,7 +2,6 @@ package strategy
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -282,21 +281,31 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.servePackage(w, r, decision, err)
 		return
 	}
-	var source string
-	response := httpsnoop.CaptureMetricsFn(w, func(w http.ResponseWriter) {
+	source := codeArtifactAuditUnavailable
+	response := httpsnoop.Metrics{Code: http.StatusOK}
+	defer func() {
+		panicValue := recover()
+		if panicValue == http.ErrAbortHandler { //nolint:errorlint // net/http treats only this exact panic value as a stream abort.
+			source = codeArtifactAuditOrigin
+		}
+		event.ResponseSource = source
+		event.HTTPStatus = response.Code
+		event.PolicyDurationMS = float64(policyDuration) / float64(time.Millisecond)
+		if c.packagePolicy == nil {
+			event.PolicyDurationMS = 0
+		}
+		event.RequestDurationMS = float64(time.Since(started)) / float64(time.Millisecond)
+		if c.policyAudit {
+			event.PolicyMode = packagepolicy.ModeAudit
+		}
+		c.packageAudit.Record(event)
+		if panicValue != nil {
+			panic(panicValue)
+		}
+	}()
+	response.CaptureMetrics(w, func(w http.ResponseWriter) {
 		source = c.servePackage(w, r, decision, err)
 	})
-	event.ResponseSource = source
-	event.HTTPStatus = response.Code
-	event.PolicyDurationMS = float64(policyDuration) / float64(time.Millisecond)
-	if c.packagePolicy == nil {
-		event.PolicyDurationMS = 0
-	}
-	event.RequestDurationMS = float64(time.Since(started)) / float64(time.Millisecond)
-	if c.policyAudit {
-		event.PolicyMode = packagepolicy.ModeAudit
-	}
-	c.packageAudit.Record(event)
 }
 
 func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, decision packagepolicy.Decision, err error) string {
@@ -412,9 +421,7 @@ func (c *CodeArtifact) serveRepository(w http.ResponseWriter, r *http.Request, m
 		c.streamAndCache(w, r, resp, responseHeaders)
 		return
 	}
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		c.logger.ErrorContext(r.Context(), "Failed to stream CodeArtifact response", "error", err)
-	}
+	c.streamOriginBody(w, r, resp.Body)
 }
 
 func (c *CodeArtifact) authorizationToken(ctx context.Context) (codeArtifactToken, error) {
