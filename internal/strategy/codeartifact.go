@@ -281,9 +281,13 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.servePackage(w, r, decision, err)
 		return
 	}
-	source := codeArtifactAuditOrigin
+	source := codeArtifactAuditUnavailable
 	response := httpsnoop.Metrics{Code: http.StatusOK}
 	defer func() {
+		panicValue := recover()
+		if panicValue == http.ErrAbortHandler { //nolint:errorlint // net/http treats only this exact panic value as a stream abort.
+			source = codeArtifactAuditOrigin
+		}
 		event.ResponseSource = source
 		event.HTTPStatus = response.Code
 		event.PolicyDurationMS = float64(policyDuration) / float64(time.Millisecond)
@@ -295,6 +299,9 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			event.PolicyMode = packagepolicy.ModeAudit
 		}
 		c.packageAudit.Record(event)
+		if panicValue != nil {
+			panic(panicValue)
+		}
 	}()
 	response.CaptureMetrics(w, func(w http.ResponseWriter) {
 		source = c.servePackage(w, r, decision, err)

@@ -177,12 +177,16 @@ func (c *CodeArtifact) streamAndCache(
 	reader := &codeArtifactStreamReader{reader: resp.Body}
 	written, copyErr := io.Copy(w, io.TeeReader(reader, cacheCopy))
 	if copyErr != nil || cacheCopy.err != nil {
-		abortErr := writer.Abort(errors.Join(copyErr, cacheCopy.err))
+		abortCause := cacheCopy.err
+		if copyErr != nil {
+			// Backends may return the cancellation cause from Abort. Keep raw
+			// upstream errors out of the storage error log below.
+			abortCause = errors.Join(errors.Errorf("CodeArtifact response stream failed: %s", codeArtifactBodyError(r.Context(), copyErr)), abortCause)
+		}
+		abortErr := writer.Abort(abortCause)
 		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
-		if cacheCopy.err != nil || abortErr != nil {
-			c.logger.ErrorContext(r.Context(), "Failed to cache complete CodeArtifact response",
-				"write_error_kind", codeArtifactBodyError(r.Context(), cacheCopy.err),
-				"abort_error_kind", codeArtifactBodyError(r.Context(), abortErr))
+		if err := errors.Join(cacheCopy.err, abortErr); err != nil {
+			c.logger.ErrorContext(r.Context(), "Failed to cache complete CodeArtifact response", "error", err)
 		}
 		if copyErr != nil {
 			c.abortStream(w, r, "origin", reader, written, started, copyErr)

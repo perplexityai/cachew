@@ -50,12 +50,17 @@ func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request, sourc
 	}
 	kind := codeArtifactBodyError(r.Context(), err)
 	format := codeArtifactMetricFormat(c.originURL(r).Path)
-	trace.SpanFromContext(r.Context()).SetStatus(codes.Error, kind)
-	c.metric.recordStreamFailure(context.WithoutCancel(r.Context()), stage, kind, format)
+	clientCanceled := errors.Is(r.Context().Err(), context.Canceled) || errors.Is(err, context.Canceled)
+	if !clientCanceled {
+		trace.SpanFromContext(r.Context()).SetStatus(codes.Error, kind)
+	}
+	if c.metric != nil {
+		c.metric.recordStreamFailure(context.WithoutCancel(r.Context()), stage, kind, format)
+	}
 	c.logger.ErrorContext(r.Context(), "CodeArtifact response stream failed",
 		"source", source, "stage", stage, "error_kind", kind,
 		"format", format, "bytes_read", reader.bytes, "bytes_written", written,
-		"expected_bytes", expected, "duration_ms", time.Since(started).Milliseconds(), "client_canceled", r.Context().Err() != nil)
+		"expected_bytes", expected, "duration_ms", time.Since(started).Milliseconds(), "client_canceled", clientCanceled)
 	// Headers are already committed. Returning normally would terminate a chunked
 	// body successfully and disguise a failed read as a complete response.
 	panic(http.ErrAbortHandler)

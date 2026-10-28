@@ -106,6 +106,7 @@ func TestCodeArtifactStreamFailureDiagnostics(t *testing.T) {
 		fault       error
 		clientWrite bool
 		cancel      bool
+		noMetrics   bool
 		kind        string
 	}{
 		{name: "origin idle timeout", fault: errCodeArtifactOriginReadIdleTimeout, kind: "read_idle_timeout"},
@@ -113,13 +114,21 @@ func TestCodeArtifactStreamFailureDiagnostics(t *testing.T) {
 		{name: "client write", fault: syscall.EPIPE, clientWrite: true, kind: "broken_pipe"},
 		{name: "origin reset", fault: syscall.ECONNRESET, kind: "connection_reset"},
 		{name: "private error", fault: errors.New("secret-url?token=private"), kind: "transport_error"},
+		{name: "missing metrics", fault: io.ErrUnexpectedEOF, noMetrics: true, kind: "unexpected_eof"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var logs bytes.Buffer
 			recorded := &recordingCodeArtifactMetrics{}
 			strategy := &CodeArtifact{logger: slog.New(slog.NewJSONHandler(&logs, nil)), target: &url.URL{Scheme: "https", Host: "origin.example"}, metric: recorded}
+			if test.noMetrics {
+				strategy.metric = nil
+			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			spans := tracetest.NewSpanRecorder()
+			provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans))
+			t.Cleanup(func() { assert.NoError(t, provider.Shutdown(context.Background())) })
+			ctx, span := provider.Tracer("stream-test").Start(ctx, "download")
 			if test.cancel {
 				cancel()
 			}
@@ -136,7 +145,15 @@ func TestCodeArtifactStreamFailureDiagnostics(t *testing.T) {
 				stage = "client_write"
 			}
 			assertCodeArtifactStreamAborted(t, func() { strategy.streamOriginBody(w, request, body) })
-			assert.Equal(t, [][3]string{{stage, test.kind, "pypi"}}, recorded.streamFailures)
+			span.End()
+			wantStatus := codes.Error
+			if test.cancel {
+				wantStatus = codes.Unset
+			}
+			assert.Equal(t, wantStatus, spans.Ended()[0].Status().Code)
+			if !test.noMetrics {
+				assert.Equal(t, [][3]string{{stage, test.kind, "pypi"}}, recorded.streamFailures)
+			}
 			assert.NoError(t, reader.Close())
 			var entry map[string]any
 			assert.NoError(t, json.Unmarshal(logs.Bytes(), &entry))
@@ -176,37 +193,78 @@ func (c failingCodeArtifactCache) Create(context.Context, cache.Key, http.Header
 
 type failedCodeArtifactCacheWriter struct {
 	cache.Writer
-	aborted bool
+	aborted  bool
+	writeErr error
+	abortErr error
 }
 
-func (w *failedCodeArtifactCacheWriter) Write([]byte) (int, error) { return 0, syscall.EPIPE }
-
-func (w *failedCodeArtifactCacheWriter) Abort(error) error {
-	w.aborted = true
-	return syscall.ECONNRESET
-}
-
-func TestCodeArtifactLogsCacheFailuresBeforeAbortingStream(t *testing.T) {
-	var logs bytes.Buffer
-	writer := &failedCodeArtifactCacheWriter{}
-	strategy := &CodeArtifact{
-		logger: slog.New(slog.NewJSONHandler(&logs, nil)), target: &url.URL{Scheme: "https", Host: "origin.example"},
-		cache: failingCodeArtifactCache{Cache: cache.NoOpCache(), writer: writer}, metric: &recordingCodeArtifactMetrics{},
+func (w *failedCodeArtifactCacheWriter) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
 	}
-	failure, producer := io.Pipe()
-	assert.NoError(t, producer.CloseWithError(io.ErrUnexpectedEOF))
-	defer failure.Close()
-	body := io.MultiReader(strings.NewReader("payload"), failure)
-	headers := http.Header{"Cache-Control": {testCodeArtifactCacheControl}}
-	response := &http.Response{Body: io.NopCloser(body)}
-	request := httptest.NewRequest(http.MethodGet, "/pypi/private/package.whl", nil)
-	assertCodeArtifactStreamAborted(t, func() {
-		strategy.streamAndCache(httptest.NewRecorder(), request, response, headers)
-	})
-	assert.True(t, writer.aborted)
-	entries := codeArtifactFailureLogs(t, logs.Bytes())
-	assert.Equal(t, 2, len(entries))
-	assert.Equal[any](t, "broken_pipe", entries[0]["write_error_kind"])
-	assert.Equal[any](t, "connection_reset", entries[0]["abort_error_kind"])
-	assert.Equal[any](t, "unexpected_eof", entries[1]["error_kind"])
+	return len(p), nil
+}
+
+func (w *failedCodeArtifactCacheWriter) Abort(cause error) error {
+	w.aborted = true
+	return errors.Join(cause, w.abortErr)
+}
+
+func TestCodeArtifactLogsCacheFailureDetails(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		writeErr    error
+		abortErr    error
+		streamFails bool
+	}{
+		{name: "full disk with successful download", writeErr: syscall.ENOSPC},
+		{name: "S3 denied with successful download", writeErr: errors.New("S3 AccessDenied: write denied")},
+		{name: "S3 throttled with successful download", writeErr: errors.New("S3 SlowDown: reduce request rate")},
+		{name: "combined failures", writeErr: syscall.ENOSPC, abortErr: errors.New("storage cleanup failed"), streamFails: true},
+		{name: "abort echoes private origin error", abortErr: errors.New("storage cleanup failed"), streamFails: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			writer := &failedCodeArtifactCacheWriter{writeErr: test.writeErr, abortErr: test.abortErr}
+			strategy := &CodeArtifact{
+				logger: slog.New(slog.NewJSONHandler(&logs, nil)), target: &url.URL{Scheme: "https", Host: "origin.example"},
+				cache: failingCodeArtifactCache{Cache: cache.NoOpCache(), writer: writer}, metric: &recordingCodeArtifactMetrics{},
+			}
+			failure, producer := io.Pipe()
+			assert.NoError(t, producer.CloseWithError(errors.New("private-origin?token=secret")))
+			defer failure.Close()
+			var body io.Reader = strings.NewReader("payload")
+			if test.streamFails {
+				body = io.MultiReader(body, failure)
+			}
+			headers := http.Header{"Cache-Control": {testCodeArtifactCacheControl}}
+			response := &http.Response{Body: io.NopCloser(body)}
+			request := httptest.NewRequest(http.MethodGet, "/pypi/private/package.whl", nil)
+			w := httptest.NewRecorder()
+			run := func() { strategy.streamAndCache(w, request, response, headers) }
+			if test.streamFails {
+				assertCodeArtifactStreamAborted(t, run)
+			} else {
+				run()
+			}
+			assert.Equal(t, "payload", w.Body.String())
+			assert.True(t, writer.aborted)
+			entries := codeArtifactFailureLogs(t, logs.Bytes())
+			wantLogs := 1
+			if test.streamFails {
+				wantLogs = 2
+				assert.Equal[any](t, "transport_error", entries[1]["error_kind"])
+			}
+			assert.Equal(t, wantLogs, len(entries))
+			cacheError, ok := entries[0]["error"].(string)
+			assert.True(t, ok)
+			for _, err := range []error{test.writeErr, test.abortErr} {
+				if err != nil {
+					assert.Contains(t, cacheError, err.Error())
+				}
+			}
+			assert.False(t, strings.Contains(logs.String(), "private-origin"))
+			assert.False(t, strings.Contains(logs.String(), "token=secret"))
+		})
+	}
 }
