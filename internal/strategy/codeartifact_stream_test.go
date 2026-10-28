@@ -218,8 +218,8 @@ func TestCodeArtifactLogsCacheFailureDetails(t *testing.T) {
 		streamFails bool
 	}{
 		{name: "full disk with successful download", writeErr: syscall.ENOSPC},
-		{name: "S3 denied with successful download", writeErr: errors.New("S3 AccessDenied: write denied")},
-		{name: "S3 throttled with successful download", writeErr: errors.New("S3 SlowDown: reduce request rate")},
+		{name: "AccessDenied error text with successful download", writeErr: errors.New("S3 AccessDenied: write denied")},
+		{name: "SlowDown error text with successful download", writeErr: errors.New("S3 SlowDown: reduce request rate")},
 		{name: "combined failures", writeErr: syscall.ENOSPC, abortErr: errors.New("storage cleanup failed"), streamFails: true},
 		{name: "abort echoes private origin error", abortErr: errors.New("storage cleanup failed"), streamFails: true},
 	} {
