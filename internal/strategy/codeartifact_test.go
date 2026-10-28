@@ -787,7 +787,7 @@ func TestCodeArtifactParentCancellationIsNotOriginReadTimeout(t *testing.T) {
 	assert.True(t, errors.Is(err, context.Canceled))
 	assert.False(t, errors.Is(err, errCodeArtifactOriginReadIdleTimeout))
 	assert.NoError(t, body.Close())
-	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "200", format: "maven"}}, recorded.origin)
+	assert.Equal(t, []recordedCodeArtifactOrigin{{status: "client_canceled", format: "maven"}}, recorded.origin)
 }
 
 func TestCodeArtifactRejectsNegativeTimeouts(t *testing.T) {
@@ -1168,7 +1168,9 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 
 	for range 2 {
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, assetURL, nil).WithContext(ctx))
+		assertCodeArtifactStreamAborted(t, func() {
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, assetURL, nil).WithContext(ctx))
+		})
 		assert.Equal(t, http.StatusOK, w.Code)
 		assert.Equal(t, "short", w.Body.String())
 	}
@@ -1177,11 +1179,12 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 }
 
 type recordingCodeArtifactMetrics struct {
-	requests []codeArtifactCacheMode
-	cache    []recordedCodeArtifactCacheEvent
-	auth     []codeArtifactAuthEvent
-	origin   []recordedCodeArtifactOrigin
-	redirect []codeArtifactRedirectEvent
+	requests       []codeArtifactCacheMode
+	cache          []recordedCodeArtifactCacheEvent
+	auth           []codeArtifactAuthEvent
+	origin         []recordedCodeArtifactOrigin
+	redirect       []codeArtifactRedirectEvent
+	streamFailures [][3]string
 }
 
 type recordedCodeArtifactCacheEvent struct {
@@ -1221,6 +1224,10 @@ func (m *recordingCodeArtifactMetrics) recordOrigin(_ context.Context, observati
 
 func (m *recordingCodeArtifactMetrics) recordRedirect(_ context.Context, event codeArtifactRedirectEvent) {
 	m.redirect = append(m.redirect, event)
+}
+
+func (m *recordingCodeArtifactMetrics) recordStreamFailure(_ context.Context, stage, kind, format string) {
+	m.streamFailures = append(m.streamFailures, [3]string{stage, kind, format})
 }
 
 func TestCodeArtifactMetricsExposeOnlyBoundedDecisions(t *testing.T) {

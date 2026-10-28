@@ -60,6 +60,7 @@ type codeArtifactMetricRecorder interface {
 	recordAuth(context.Context, codeArtifactAuthEvent)
 	recordOrigin(context.Context, codeArtifactOriginObservation)
 	recordRedirect(context.Context, codeArtifactRedirectEvent)
+	recordStreamFailure(context.Context, string, string, string)
 }
 
 type codeArtifactOriginObservation struct {
@@ -77,6 +78,7 @@ type codeArtifactMetrics struct {
 	originDuration metric.Float64Histogram
 	originSize     metric.Float64Histogram
 	redirects      metric.Int64Counter
+	streamFailures metric.Int64Counter
 }
 
 func newCodeArtifactMetrics() *codeArtifactMetrics {
@@ -96,6 +98,9 @@ func newCodeArtifactMetrics() *codeArtifactMetrics {
 		),
 		redirects: cachewmetrics.NewMetric[metric.Int64Counter](
 			meter, "cachew.codeartifact.redirects_total", "{redirects}", "CodeArtifact redirect outcomes",
+		),
+		streamFailures: cachewmetrics.NewMetric[metric.Int64Counter](
+			meter, "cachew.codeartifact.stream_failures_total", "{failures}", "Aborted CodeArtifact responses by stage, error kind and package format",
 		),
 	}
 }
@@ -129,23 +134,30 @@ func (m *codeArtifactMetrics) recordRedirect(ctx context.Context, event codeArti
 	m.redirects.Add(ctx, 1, metric.WithAttributes(attribute.String("event", string(event))))
 }
 
+func (m *codeArtifactMetrics) recordStreamFailure(ctx context.Context, stage, kind, format string) {
+	m.streamFailures.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("stage", stage), attribute.String("error_kind", kind), attribute.String("format", format),
+	))
+}
+
 type observedCodeArtifactBody struct {
 	io.ReadCloser
-	ctx      context.Context
-	metric   codeArtifactMetricRecorder
-	status   int
-	format   string
-	started  time.Time
-	bytes    atomic.Int64
-	timedOut atomic.Bool
-	once     sync.Once
+	ctx         context.Context
+	metric      codeArtifactMetricRecorder
+	status      int
+	format      string
+	started     time.Time
+	bytes       atomic.Int64
+	readFailure atomic.Pointer[string]
+	once        sync.Once
 }
 
 func (b *observedCodeArtifactBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.bytes.Add(int64(n))
-	if errors.Is(err, errCodeArtifactOriginReadIdleTimeout) {
-		b.timedOut.Store(true)
+	if err != nil && !errors.Is(err, io.EOF) {
+		failure := codeArtifactBodyError(b.ctx, err)
+		b.readFailure.CompareAndSwap(nil, &failure)
 	}
 	return n, err //nolint:wrapcheck // Reader callers require an unwrapped io.EOF.
 }
@@ -154,8 +166,8 @@ func (b *observedCodeArtifactBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.once.Do(func() {
 		status := strconv.Itoa(b.status)
-		if b.timedOut.Load() {
-			status = "read_idle_timeout"
+		if failure := b.readFailure.Load(); failure != nil {
+			status = *failure
 		}
 		b.metric.recordOrigin(
 			context.WithoutCancel(b.ctx),
