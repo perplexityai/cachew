@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type codeArtifactStreamReader struct {
@@ -46,9 +48,13 @@ func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request, sourc
 	if n, parseErr := strconv.ParseInt(w.Header().Get("Content-Length"), 10, 64); parseErr == nil && n >= 0 {
 		expected = n
 	}
+	kind := codeArtifactBodyError(r.Context(), err)
+	format := codeArtifactMetricFormat(c.originURL(r).Path)
+	trace.SpanFromContext(r.Context()).SetStatus(codes.Error, kind)
+	c.metric.recordStreamFailure(context.WithoutCancel(r.Context()), stage, kind, format)
 	c.logger.ErrorContext(r.Context(), "CodeArtifact response stream failed",
-		"source", source, "stage", stage, "error_kind", codeArtifactBodyError(r.Context(), err),
-		"format", codeArtifactMetricFormat(c.originURL(r).Path), "bytes_read", reader.bytes, "bytes_written", written,
+		"source", source, "stage", stage, "error_kind", kind,
+		"format", format, "bytes_read", reader.bytes, "bytes_written", written,
 		"expected_bytes", expected, "duration_ms", time.Since(started).Milliseconds(), "client_canceled", r.Context().Err() != nil)
 	// Headers are already committed. Returning normally would terminate a chunked
 	// body successfully and disguise a failed read as a complete response.
@@ -57,6 +63,8 @@ func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request, sourc
 
 func codeArtifactBodyError(ctx context.Context, err error) string {
 	switch {
+	case err == nil:
+		return ""
 	case errors.Is(err, errCodeArtifactOriginReadIdleTimeout):
 		return "read_idle_timeout"
 	case errors.Is(err, io.ErrUnexpectedEOF):
@@ -64,7 +72,7 @@ func codeArtifactBodyError(ctx context.Context, err error) string {
 	case errors.Is(err, io.ErrShortWrite):
 		return "short_write"
 	case errors.Is(err, context.Canceled):
-		return "canceled"
+		return "client_canceled"
 	case errors.Is(err, syscall.ECONNRESET):
 		return "connection_reset"
 	case errors.Is(err, syscall.EPIPE):

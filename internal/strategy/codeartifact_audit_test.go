@@ -47,7 +47,7 @@ func TestCodeArtifactAuditSurvivesAbortedStream(t *testing.T) {
 	var event packageaudit.Event
 	assert.NoError(t, json.Unmarshal(bytes.TrimSpace(data), &event))
 	assert.Equal(t, "pkg:npm/package@1.0.0", event.PURL)
-	assert.Equal(t, codeArtifactAuditUnavailable, event.ResponseSource)
+	assert.Equal(t, codeArtifactAuditOrigin, event.ResponseSource)
 	assert.Equal(t, http.StatusOK, event.HTTPStatus)
 }
 

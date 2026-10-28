@@ -281,7 +281,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.servePackage(w, r, decision, err)
 		return
 	}
-	source := codeArtifactAuditUnavailable
+	source := codeArtifactAuditOrigin
 	response := httpsnoop.Metrics{Code: http.StatusOK}
 	defer func() {
 		event.ResponseSource = source

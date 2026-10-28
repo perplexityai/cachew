@@ -60,6 +60,7 @@ type codeArtifactMetricRecorder interface {
 	recordAuth(context.Context, codeArtifactAuthEvent)
 	recordOrigin(context.Context, codeArtifactOriginObservation)
 	recordRedirect(context.Context, codeArtifactRedirectEvent)
+	recordStreamFailure(context.Context, string, string, string)
 }
 
 type codeArtifactOriginObservation struct {
@@ -77,6 +78,7 @@ type codeArtifactMetrics struct {
 	originDuration metric.Float64Histogram
 	originSize     metric.Float64Histogram
 	redirects      metric.Int64Counter
+	streamFailures metric.Int64Counter
 }
 
 func newCodeArtifactMetrics() *codeArtifactMetrics {
@@ -96,6 +98,9 @@ func newCodeArtifactMetrics() *codeArtifactMetrics {
 		),
 		redirects: cachewmetrics.NewMetric[metric.Int64Counter](
 			meter, "cachew.codeartifact.redirects_total", "{redirects}", "CodeArtifact redirect outcomes",
+		),
+		streamFailures: cachewmetrics.NewMetric[metric.Int64Counter](
+			meter, "cachew.codeartifact.stream_failures_total", "{failures}", "Aborted CodeArtifact responses by stage, error kind and package format",
 		),
 	}
 }
@@ -127,6 +132,12 @@ func (m *codeArtifactMetrics) recordOrigin(ctx context.Context, observation code
 
 func (m *codeArtifactMetrics) recordRedirect(ctx context.Context, event codeArtifactRedirectEvent) {
 	m.redirects.Add(ctx, 1, metric.WithAttributes(attribute.String("event", string(event))))
+}
+
+func (m *codeArtifactMetrics) recordStreamFailure(ctx context.Context, stage, kind, format string) {
+	m.streamFailures.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("stage", stage), attribute.String("error_kind", kind), attribute.String("format", format),
+	))
 }
 
 type observedCodeArtifactBody struct {

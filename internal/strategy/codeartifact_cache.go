@@ -179,11 +179,13 @@ func (c *CodeArtifact) streamAndCache(
 	if copyErr != nil || cacheCopy.err != nil {
 		abortErr := writer.Abort(errors.Join(copyErr, cacheCopy.err))
 		c.metric.recordCache(r.Context(), codeArtifactCacheWriteFailure, codeArtifactCacheTierAll)
+		if cacheCopy.err != nil || abortErr != nil {
+			c.logger.ErrorContext(r.Context(), "Failed to cache complete CodeArtifact response",
+				"write_error_kind", codeArtifactBodyError(r.Context(), cacheCopy.err),
+				"abort_error_kind", codeArtifactBodyError(r.Context(), abortErr))
+		}
 		if copyErr != nil {
 			c.abortStream(w, r, "origin", reader, written, started, copyErr)
-		}
-		if err := errors.Join(copyErr, cacheCopy.err, abortErr); err != nil {
-			c.logger.ErrorContext(r.Context(), "Failed to cache complete CodeArtifact response", "error", err)
 		}
 		return
 	}
