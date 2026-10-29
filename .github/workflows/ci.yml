@@ -20,6 +20,17 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: cashapp/activate-hermit@e49f5cb4dd64ff0b0b659d1d8df499595451155a # v1
+      - name: Install pinned uv for recovery tests
+        run: |
+          archive="$RUNNER_TEMP/cachew-test-uv.tar.gz"
+          curl --fail --location --retry 3 \
+            https://github.com/astral-sh/uv/releases/download/0.13.4/uv-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f "$archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/uv-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
       - name: Run tests
         run: just test
   lint:

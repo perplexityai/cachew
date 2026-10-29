@@ -57,7 +57,11 @@ func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request, sourc
 	if c.metric != nil {
 		c.metric.recordStreamFailure(context.WithoutCancel(r.Context()), stage, kind, format)
 	}
-	c.logger.ErrorContext(r.Context(), "CodeArtifact response stream failed",
+	logger := c.logger
+	if goAway, ok := codeArtifactGoAway(err); ok {
+		logger = logger.With("http2_error_code", goAway.code, "http2_last_stream_id", goAway.lastStreamID)
+	}
+	logger.ErrorContext(r.Context(), "CodeArtifact response stream failed",
 		"source", source, "stage", stage, "error_kind", kind,
 		"format", format, "bytes_read", reader.bytes, "bytes_written", written,
 		"expected_bytes", expected, "duration_ms", time.Since(started).Milliseconds(), "client_canceled", clientCanceled)
@@ -82,7 +86,12 @@ func codeArtifactBodyError(ctx context.Context, err error) string {
 		return "connection_reset"
 	case errors.Is(err, syscall.EPIPE):
 		return "broken_pipe"
+	case errors.Is(ctx.Err(), context.Canceled):
+		return codeArtifactTransportStatus(ctx, err)
 	default:
+		if _, ok := codeArtifactGoAway(err); ok {
+			return "http2_goaway"
+		}
 		return codeArtifactTransportStatus(ctx, err)
 	}
 }

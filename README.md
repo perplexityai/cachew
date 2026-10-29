@@ -234,6 +234,13 @@ Failures before response headers use bounded statuses in those same metrics:
 `transport_connection`, or `transport_error` for other failures. Logs include
 only that status, never the origin URL or signed redirect URL.
 
+Incomplete origin bodies abort the downstream transfer rather than completing a
+partial response. Recognized HTTP/2 GOAWAY body failures use the bounded
+`http2_goaway` error kind; stream-failure logs also include `http2_error_code` and
+`http2_last_stream_id`. Those details are not metric labels, and peer-provided
+debug text is never logged. Unknown or malformed GOAWAY metadata retains the
+generic transport classification.
+
 Authorization tokens are reused in-process. The default 12-hour token enters
 proactive refresh one hour before expiration; one request performs each refresh
 attempt under a detached, bounded context while concurrent requests continue
