@@ -81,13 +81,13 @@ func codeArtifactBodyError(ctx context.Context, err error) string {
 	case errors.Is(err, io.ErrShortWrite):
 		return "short_write"
 	case errors.Is(err, context.Canceled):
-		return "client_canceled"
+		return codeArtifactStatusClientCanceled
 	case errors.Is(err, syscall.ECONNRESET):
 		return "connection_reset"
 	case errors.Is(err, syscall.EPIPE):
 		return "broken_pipe"
 	case errors.Is(ctx.Err(), context.Canceled):
-		return codeArtifactTransportStatus(ctx, err)
+		return codeArtifactStatusClientCanceled
 	default:
 		if _, ok := codeArtifactGoAway(err); ok {
 			return "http2_goaway"
