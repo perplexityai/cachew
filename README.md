@@ -600,6 +600,42 @@ conventions without overriding HTTP shared-cache safety. CodeArtifact generic
 packages use AWS CLI or SDK asset APIs rather than a package repository endpoint,
 so they are outside this HTTP proxy strategy.
 
+### S3 Objects
+
+Proxies read-only object downloads from allowlisted key prefixes in a single S3
+bucket. Cachew signs requests with its own AWS identity, so clients such as the
+Bazel downloader need no S3 credentials. Objects are served under the bucket's
+virtual-hosted URL, so a downloader rewrite only changes the host prefix:
+
+**URL pattern:** `/{bucket}.s3.{region}.amazonaws.com/{key}`
+
+```hcl
+s3-objects "example-artifacts" {
+  region         = "us-east-1"
+  expected-owner = "111122223333"
+  prefixes       = ["bazel/archives/"]
+  role-arn       = "arn:aws:iam::111122223333:role/cachew-example-artifacts-read" # optional
+  ttl            = "0s"  # default; uses the cache's maximum TTL
+}
+```
+
+Cachew does not authenticate its own callers, so every allowlisted object is
+readable by anyone who can reach Cachew. Only allowlist prefixes holding reviewed
+build inputs, and treat keys as immutable: a successful `200` response is cached
+by key until it expires, so overwriting an object does not invalidate the cached
+copy. Bazel's `sha256` pins detect, but do not repair, a stale entry.
+
+Requests with query strings, empty or dot segments, or keys outside the
+allowlisted prefixes return `404` without reaching S3. Client `Authorization`,
+`Cookie`, and `X-Amz-*` headers are dropped before signing, and every request
+sets `X-Amz-Expected-Bucket-Owner` so a recreated bucket in another account is
+never read. Redirects are returned to the client rather than followed. Non-`200`
+responses, including `206` range reads and S3 errors, pass through uncached.
+
+Without `role-arn`, Cachew uses the default AWS credential chain (for example
+IRSA). The identity needs `s3:GetObject` on the allowlisted prefixes; granting
+`s3:ListBucket` on the bucket makes missing keys return `404` instead of `403`.
+
 ### Host
 
 Generic reverse-proxy caching for arbitrary HTTP hosts, with optional custom headers.

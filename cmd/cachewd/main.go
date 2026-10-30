@@ -306,6 +306,7 @@ func newRegistries(
 	strategy.RegisterHermit(sr)
 	strategy.RegisterHost(sr)
 	strategy.RegisterHTTPProxy(sr)
+	strategy.RegisterS3Objects(sr)
 	git.Register(sr, scheduler, cloneManagerProvider, tokenManagerProvider)
 	gomod.Register(sr, cloneManagerProvider)
 
