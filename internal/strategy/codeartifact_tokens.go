@@ -35,10 +35,14 @@ type codeArtifactAuthorizationClient interface {
 	) (*awscodeartifact.GetAuthorizationTokenOutput, error)
 }
 
+// codeArtifactTokenManager caches a short-lived origin authorization token and
+// refreshes it before expiry. CodeArtifact and ECR both mint theirs through an
+// assumed role; mint is the only origin-specific part.
 type codeArtifactTokenManager struct {
-	config CodeArtifactConfig
-	client codeArtifactAuthorizationClient
-	now    func() time.Time
+	origin            string
+	credentialTimeout time.Duration
+	mint              originTokenMinter
+	now               func() time.Time
 
 	mu         sync.RWMutex
 	refresh    *semaphore.Weighted
@@ -85,16 +89,41 @@ func codeArtifactCredentialDeadline(provider aws.CredentialsProvider, timeout ti
 	})
 }
 
+// originTokenMinter returns a new token and its expiry. An empty token or a
+// zero expiry is an incomplete response, which is never retried with the
+// previous token.
+type originTokenMinter func(context.Context) (string, time.Time, error)
+
 func newCodeArtifactTokenManagerWithClient(
 	config CodeArtifactConfig,
 	client codeArtifactAuthorizationClient,
 	now func() time.Time,
 ) *codeArtifactTokenManager {
+	mint := func(ctx context.Context) (string, time.Time, error) {
+		output, err := client.GetAuthorizationToken(ctx, &awscodeartifact.GetAuthorizationTokenInput{
+			Domain:      aws.String(config.Domain),
+			DomainOwner: aws.String(config.DomainOwner),
+		})
+		if err != nil {
+			return "", time.Time{}, err //nolint:wrapcheck // refreshToken wraps mint errors with the origin name.
+		}
+		return aws.ToString(output.AuthorizationToken), aws.ToTime(output.Expiration), nil
+	}
+	return newOriginTokenManager("CodeArtifact", config.CredentialTimeout, mint, now)
+}
+
+func newOriginTokenManager(
+	origin string,
+	credentialTimeout time.Duration,
+	mint originTokenMinter,
+	now func() time.Time,
+) *codeArtifactTokenManager {
 	return &codeArtifactTokenManager{
-		config:  config,
-		client:  client,
-		now:     now,
-		refresh: semaphore.NewWeighted(1),
+		origin:            origin,
+		credentialTimeout: credentialTimeout,
+		mint:              mint,
+		now:               now,
+		refresh:           semaphore.NewWeighted(1),
 	}
 }
 
@@ -110,7 +139,7 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 		// that benefits every later request using this token manager.
 		refreshParent = context.WithoutCancel(ctx)
 	}
-	refreshCtx, cancel := context.WithTimeout(refreshParent, m.config.CredentialTimeout)
+	refreshCtx, cancel := context.WithTimeout(refreshParent, m.credentialTimeout)
 	defer cancel()
 	initialGeneration := token.generation
 	if state == codeArtifactTokenRefreshDue {
@@ -121,7 +150,7 @@ func (m *codeArtifactTokenManager) Token(ctx context.Context, rejectedGeneration
 		}
 	} else {
 		if err := m.refresh.Acquire(refreshCtx, 1); err != nil {
-			return codeArtifactToken{}, errors.Wrap(err, "wait for CodeArtifact authorization refresh")
+			return codeArtifactToken{}, errors.Wrapf(err, "wait for %s authorization refresh", m.origin)
 		}
 	}
 	defer m.refresh.Release(1)
@@ -139,10 +168,7 @@ func (m *codeArtifactTokenManager) refreshToken(
 	ctx context.Context,
 	rejectedGeneration uint64,
 ) (codeArtifactToken, error) {
-	output, err := m.client.GetAuthorizationToken(ctx, &awscodeartifact.GetAuthorizationTokenInput{
-		Domain:      aws.String(m.config.Domain),
-		DomainOwner: aws.String(m.config.DomainOwner),
-	})
+	value, expiresAt, err := m.mint(ctx)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err != nil {
@@ -151,14 +177,14 @@ func (m *codeArtifactTokenManager) refreshToken(
 			m.retryAfter = now.Add(codeArtifactTokenRefreshFailureBackoff)
 			return codeArtifactToken{value: m.token, generation: m.generation, event: codeArtifactAuthFailure}, nil
 		}
-		return codeArtifactToken{}, errors.Wrap(err, "mint CodeArtifact authorization token")
+		return codeArtifactToken{}, errors.Wrapf(err, "mint %s authorization token", m.origin)
 	}
-	if output.AuthorizationToken == nil || *output.AuthorizationToken == "" || output.Expiration == nil {
-		return codeArtifactToken{}, errors.New("CodeArtifact returned an incomplete authorization token")
+	if value == "" || expiresAt.IsZero() {
+		return codeArtifactToken{}, errors.Errorf("%s returned an incomplete authorization token", m.origin)
 	}
 
-	m.token = *output.AuthorizationToken
-	m.expiresAt = *output.Expiration
+	m.token = value
+	m.expiresAt = expiresAt
 	m.refreshAt = codeArtifactTokenRefreshTime(m.now(), m.expiresAt)
 	m.generation++
 	m.retryAfter = time.Time{}

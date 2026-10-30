@@ -54,6 +54,30 @@ github-releases {
 }
 ```
 
+### Amazon ECR
+
+Read-only proxy for one Amazon ECR registry, including its pull-through cache repositories. External registries (Docker Hub, Quay, ECR Public, registry.k8s.io, ghcr.io) are reached through ECR pull-through cache rules, which own their upstream credentials and rate limits and keep a durable copy; Cachew only talks to ECR. Helm charts are plain OCI artifacts and work the same way.
+
+Only manifests and blobs addressed by `sha256` digest are served, with `GET` and `HEAD`, and only for the repositories listed in `repositories`: clients are unauthenticated, so that list, not the role, bounds what they can read (an entry ending in `/` is a prefix). Tags are mutable and resolve at ECR. `GET /v2/` answers the version check locally.
+
+Misses authenticate with a `GetAuthorizationToken` token from the assumed role, refreshed before expiry; when ECR rejects one, the request retries once with a newer token, minting one at most once a minute. They follow ECR's redirect to S3 for blobs; the credentials are sent to ECR only. The body is hashed while it streams; on a digest mismatch the cache entry is aborted and the response is cut short of its `Content-Length`, so the client never receives a complete body whose bytes differ from the digest it asked for, and responses that carry no `Content-Length`, or a 2xx other than 200, are refused for the same reason. A `HEAD` is answered from the cache entry; on a miss the entry is filled with a verified `GET` first, so a `HEAD` for a blob downloads it once. The first pull through a pull-through rule imports the image before ECR answers, so `origin-header-timeout` defaults to a minute. The client's `Authorization`, `Range` and conditional headers are dropped, and `Docker-Content-Digest` is set on every response (ECR omits it on manifest `GET`s). ECR's error bodies and AWS errors name the role and account, so clients get only the status.
+
+A pull-through repository is created by its first manifest pull, so a blob read for a repository nobody has pulled yet returns `404`; pull the manifest first. Manifests are cached for `manifest-ttl` (default three days), pinned through every cache tier, even though they never change: cache hits never reach ECR, so its `lastRecordedPullTime` goes stale and `sinceImagePulled` lifecycle rules could expire images still in use. Blobs use the cache's maximum TTL. Cache hits are not re-hashed, so a policy that lets clients write the `ecr` namespace through `/api/v1/object` lets them replace what a digest serves; the default policy denies remote `/api`.
+
+The registry is mounted at the host root, which `go-containerregistry`, Helm and Docker expect, and under `/{registry}/v2/` for containerd mirrors (`override_path`). Only one `ecr` block can own the root; set `prefix-only` on the others.
+
+**URL patterns:** `/v2/{name}/manifests/sha256:{digest}`, `/v2/{name}/blobs/sha256:{digest}`, and the same under `/{registry}/v2/`
+
+```hcl
+ecr "123456789012.dkr.ecr.us-east-1.amazonaws.com" {
+  role-arn     = "arn:aws:iam::123456789012:role/cachew-ecr-read"
+  repositories = ["ecr-public/buildkite/"]
+  manifest-ttl = "72h"
+}
+```
+
+The role needs `ecr:GetAuthorizationToken`, plus `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer` on the listed repositories, and `ecr:BatchImportUpstreamImage` and `ecr:CreateRepository` on them when they are pull-through prefixes, so a first pull can import the image. Scope those resources to the same repositories as `repositories`.
+
 ### Go Modules
 
 Go module proxy (`GOPROXY`-compatible). Private modules are fetched via git clone.
