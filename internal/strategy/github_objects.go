@@ -31,6 +31,10 @@ const (
 	githubObjectsMaxPathBytes      = 4096
 	githubObjectsUpstreamTimeout   = 15 * time.Second
 	githubObjectsResponseError     = "response_error"
+	githubObjectTypeBlob           = "blob"
+	githubObjectTypeTree           = "tree"
+	githubGraphQLTypeBlob          = "Blob"
+	githubGraphQLTypeTree          = "Tree"
 )
 
 // GitHubObjectsConfig configures immutable GitHub object discovery.
@@ -47,8 +51,16 @@ type GitHubObjects struct {
 }
 
 type githubObjectsRequest struct {
-	TreeSHA string   `json:"tree_sha"`
-	Paths   []string `json:"paths"`
+	TreeSHA    string   `json:"tree_sha"`
+	Paths      []string `json:"paths"`
+	ObjectType string   `json:"object_type,omitempty"`
+}
+
+func (r githubObjectsRequest) graphQLType() string {
+	if r.ObjectType == githubObjectTypeTree {
+		return githubGraphQLTypeTree
+	}
+	return githubGraphQLTypeBlob
 }
 
 type githubObject struct {
@@ -149,7 +161,7 @@ func (g *GitHubObjects) resolve(r *http.Request) (githubObjectsResponse, http.He
 	cacheGroup.SetLimit(githubObjectsCacheConcurrent)
 	for index, objectPath := range request.Paths {
 		cacheGroup.Go(func() error {
-			cached, found, err := g.loadCached(r.Context(), r.PathValue("owner"), r.PathValue("repo"), request.TreeSHA, objectPath)
+			cached, found, err := g.loadCached(r.Context(), r.PathValue("owner"), r.PathValue("repo"), request.TreeSHA, objectPath, request.ObjectType)
 			if err != nil {
 				return err
 			}
@@ -195,6 +207,9 @@ func decodeGitHubObjectsRequest(r *http.Request) (githubObjectsRequest, error) {
 }
 
 func validateGitHubObjectsRequest(request githubObjectsRequest) error {
+	if request.ObjectType != "" && request.ObjectType != githubObjectTypeBlob && request.ObjectType != githubObjectTypeTree {
+		return errors.New("object_type must be blob or tree")
+	}
 	if !isGitHubOID(request.TreeSHA) {
 		return errors.New("tree_sha must be a 40-character hexadecimal object ID")
 	}
@@ -258,7 +273,7 @@ func (g *GitHubObjects) fetchBatch(r *http.Request, request githubObjectsRequest
 	startedAt := time.Now()
 	result := "success"
 	defer func() { g.metrics.recordOrigin(context.WithoutCancel(r.Context()), result, startedAt) }()
-	body := buildGitHubObjectsGraphQL(r.PathValue("owner"), r.PathValue("repo"), request.TreeSHA, request.Paths, indices)
+	body := buildGitHubObjectsGraphQL(r.PathValue("owner"), r.PathValue("repo"), request.TreeSHA, request.Paths, indices, request.graphQLType())
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		result = "request_error"
@@ -305,12 +320,12 @@ func (g *GitHubObjects) fetchBatch(r *http.Request, request githubObjectsRequest
 		return nil, httputil.Errorf(http.StatusBadGateway, "GitHub GraphQL returned no repository")
 	}
 
-	fetched, err := parseGitHubGraphQLObjects(payload.Data.Repository, request.TreeSHA, request.Paths, indices)
+	fetched, err := parseGitHubGraphQLObjects(payload.Data.Repository, request.TreeSHA, request.Paths, indices, request.graphQLType())
 	if err != nil {
 		result = githubObjectsResponseError
 		return nil, err
 	}
-	if err := g.cacheFetchedObjects(r, request.TreeSHA, fetched); err != nil {
+	if err := g.cacheFetchedObjects(r, request.TreeSHA, fetched, request.ObjectType); err != nil {
 		return nil, err
 	}
 	for aliasIndex, objectIndex := range indices {
@@ -411,9 +426,9 @@ func (e githubObjectsUpstreamError) WriteHTTP(w http.ResponseWriter, r *http.Req
 	httputil.ErrorResponse(w, r, e.status, e.Error())
 }
 
-func parseGitHubGraphQLObjects(repository map[string]*githubGraphQLObject, treeSHA string, paths []string, indices []int) ([]githubObject, error) {
+func parseGitHubGraphQLObjects(repository map[string]*githubGraphQLObject, treeSHA string, paths []string, indices []int, objectType string) ([]githubObject, error) {
 	root, rootExists := repository["root"]
-	if !rootExists || root == nil || root.TypeName != "Tree" || !strings.EqualFold(root.OID, treeSHA) {
+	if !rootExists || root == nil || root.TypeName != githubGraphQLTypeTree || !strings.EqualFold(root.OID, treeSHA) {
 		return nil, httputil.Errorf(http.StatusBadGateway, "GitHub GraphQL did not resolve the requested tree")
 	}
 	fetched := make([]githubObject, len(indices))
@@ -427,16 +442,16 @@ func parseGitHubGraphQLObjects(repository map[string]*githubGraphQLObject, treeS
 			fetched[aliasIndex] = githubObject{Path: paths[objectIndex]}
 			continue
 		}
-		if object.TypeName == "Blob" && isGitHubOID(object.OID) {
+		if object.TypeName == objectType && isGitHubOID(object.OID) {
 			oid := object.OID
 			fetched[aliasIndex] = githubObject{Path: paths[objectIndex], OID: &oid}
 			continue
 		}
-		if object.TypeName == "Blob" {
-			return nil, httputil.Errorf(http.StatusBadGateway, "GitHub GraphQL returned an invalid blob object ID")
+		if object.TypeName == objectType {
+			return nil, httputil.Errorf(http.StatusBadGateway, "GitHub GraphQL returned an invalid object ID")
 		}
 		switch object.TypeName {
-		case "Commit", "Tag", "Tree":
+		case githubGraphQLTypeBlob, "Commit", "Tag", githubGraphQLTypeTree:
 			fetched[aliasIndex] = githubObject{Path: paths[objectIndex]}
 		default:
 			return nil, httputil.Errorf(http.StatusBadGateway, "GitHub GraphQL returned an invalid object type")
@@ -445,12 +460,12 @@ func parseGitHubGraphQLObjects(repository map[string]*githubGraphQLObject, treeS
 	return fetched, nil
 }
 
-func (g *GitHubObjects) cacheFetchedObjects(r *http.Request, treeSHA string, fetched []githubObject) error {
+func (g *GitHubObjects) cacheFetchedObjects(r *http.Request, treeSHA string, fetched []githubObject, objectType string) error {
 	var cacheGroup errgroup.Group
 	cacheGroup.SetLimit(githubObjectsCacheConcurrent)
 	for aliasIndex := range fetched {
 		cacheGroup.Go(func() error {
-			return g.storeCached(r.Context(), r.PathValue("owner"), r.PathValue("repo"), treeSHA, fetched[aliasIndex])
+			return g.storeCached(r.Context(), r.PathValue("owner"), r.PathValue("repo"), treeSHA, fetched[aliasIndex], objectType)
 		})
 	}
 	if err := cacheGroup.Wait(); err != nil {
@@ -459,7 +474,7 @@ func (g *GitHubObjects) cacheFetchedObjects(r *http.Request, treeSHA string, fet
 	return nil
 }
 
-func buildGitHubObjectsGraphQL(owner, repo, treeSHA string, paths []string, indices []int) githubGraphQLRequest {
+func buildGitHubObjectsGraphQL(owner, repo, treeSHA string, paths []string, indices []int, objectType string) githubGraphQLRequest {
 	variables := map[string]string{"owner": owner, "repo": repo, "tree": treeSHA}
 	definitions := []string{"$owner:String!", "$repo:String!", "$tree:GitObjectID!"}
 	fields := make([]string, 0, len(indices)+1)
@@ -467,7 +482,7 @@ func buildGitHubObjectsGraphQL(owner, repo, treeSHA string, paths []string, indi
 	for aliasIndex, objectIndex := range indices {
 		variable := fmt.Sprintf("expr%d", aliasIndex)
 		definitions = append(definitions, "$"+variable+":String!")
-		fields = append(fields, fmt.Sprintf("o%d:object(expression:$%s){__typename ... on Blob{oid}}", aliasIndex, variable))
+		fields = append(fields, fmt.Sprintf("o%d:object(expression:$%s){__typename ... on %s{oid}}", aliasIndex, variable, objectType))
 		variables[variable] = treeSHA + ":" + paths[objectIndex]
 	}
 	return githubGraphQLRequest{
@@ -488,8 +503,8 @@ func graphQLErrorStatus(graphQLErrors []githubGraphQLError) int {
 	return http.StatusBadGateway
 }
 
-func (g *GitHubObjects) loadCached(ctx context.Context, owner, repo, treeSHA, objectPath string) (cachedGitHubObject, bool, error) {
-	reader, _, err := g.cache.Open(ctx, githubObjectCacheKey(owner, repo, treeSHA, objectPath))
+func (g *GitHubObjects) loadCached(ctx context.Context, owner, repo, treeSHA, objectPath, objectType string) (cachedGitHubObject, bool, error) {
+	reader, _, err := g.cache.Open(ctx, githubObjectCacheKey(owner, repo, treeSHA, objectPath, objectType))
 	if errors.Is(err, os.ErrNotExist) {
 		return cachedGitHubObject{}, false, nil
 	}
@@ -504,8 +519,8 @@ func (g *GitHubObjects) loadCached(ctx context.Context, owner, repo, treeSHA, ob
 	return object, true, nil
 }
 
-func (g *GitHubObjects) storeCached(ctx context.Context, owner, repo, treeSHA string, object githubObject) error {
-	writer, err := g.cache.Create(ctx, githubObjectCacheKey(owner, repo, treeSHA, object.Path), http.Header{"Content-Type": {"application/json"}}, 0)
+func (g *GitHubObjects) storeCached(ctx context.Context, owner, repo, treeSHA string, object githubObject, objectType string) error {
+	writer, err := g.cache.Create(ctx, githubObjectCacheKey(owner, repo, treeSHA, object.Path, objectType), http.Header{"Content-Type": {"application/json"}}, 0)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -515,6 +530,10 @@ func (g *GitHubObjects) storeCached(ctx context.Context, owner, repo, treeSHA st
 	return errors.WithStack(writer.Close())
 }
 
-func githubObjectCacheKey(owner, repo, treeSHA, objectPath string) cache.Key {
-	return cache.NewKey("github-object\n" + owner + "/" + repo + "\n" + treeSHA + "\n" + objectPath)
+func githubObjectCacheKey(owner, repo, treeSHA, objectPath, objectType string) cache.Key {
+	namespace := "github-object"
+	if objectType == githubObjectTypeTree {
+		namespace = "github-tree-object"
+	}
+	return cache.NewKey(namespace + "\n" + owner + "/" + repo + "\n" + treeSHA + "\n" + objectPath)
 }

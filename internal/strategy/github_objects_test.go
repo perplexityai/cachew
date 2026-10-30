@@ -104,6 +104,7 @@ func TestGitHubObjectsRejectsInvalidImmutableLookup(t *testing.T) {
 		{name: "parent path", body: `{"tree_sha":"` + githubObjectsTreeSHA + `","paths":["../OWNERS.yaml"]}`},
 		{name: "duplicate path", body: `{"tree_sha":"` + githubObjectsTreeSHA + `","paths":["OWNERS.yaml","OWNERS.yaml"]}`},
 		{name: "unknown field", body: `{"tree_sha":"` + githubObjectsTreeSHA + `","paths":["OWNERS.yaml"],"extra":true}`},
+		{name: "unknown object type", body: `{"tree_sha":"` + githubObjectsTreeSHA + `","paths":["src"],"object_type":"commit"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -113,6 +114,43 @@ func TestGitHubObjectsRejectsInvalidImmutableLookup(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, response.Code)
 		})
 	}
+}
+
+func TestGitHubObjectsSeparatesTreeAndBlobCaches(t *testing.T) {
+	queries := []string{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, githubObjectsToken, r.Header.Get("Authorization"))
+		var body struct {
+			Query string `json:"query"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		queries = append(queries, body.Query)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"repository": map[string]any{
+				"root": map[string]string{"__typename": "Tree", "oid": githubObjectsTreeSHA},
+				"o0":   map[string]string{"__typename": "Tree", "oid": strings.Repeat("b", 40)},
+				"o1":   map[string]string{"__typename": "Blob", "oid": strings.Repeat("c", 40)},
+				"o2":   nil,
+			}},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+	mux, ctx := newGitHubObjectsTestMux(t, upstream.URL)
+	paths := []string{"src/nested", "src/file", "missing"}
+	for _, objectType := range []string{"", "tree", "tree", "blob"} {
+		response := postGitHubObjectType(ctx, t, mux, paths, objectType)
+		assert.Equal(t, http.StatusOK, response.Code)
+		expected := []githubObjectResponse{{Path: paths[0]}, {Path: paths[1]}, {Path: paths[2]}}
+		if objectType == "tree" {
+			expected[0].OID = stringPointer(strings.Repeat("b", 40))
+		} else {
+			expected[1].OID = stringPointer(strings.Repeat("c", 40))
+		}
+		assert.Equal(t, githubObjectsResponse{Objects: expected}, decodeGitHubObjectsResponse(t, response))
+	}
+	assert.Equal(t, 2, len(queries))
+	assert.Contains(t, queries[0], "... on Blob{oid}")
+	assert.Contains(t, queries[1], "... on Tree{oid}")
 }
 
 func TestGitHubObjectsFailsClosedOnGraphQLErrors(t *testing.T) {
@@ -161,29 +199,43 @@ func TestGitHubObjectsDoesNotCacheMissingPathsUntilRootExists(t *testing.T) {
 }
 
 func TestGitHubObjectsDoesNotCacheMalformedObjectsAsMissing(t *testing.T) {
-	requestCount := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requestCount++
-		object := any(map[string]string{})
-		if requestCount == 2 {
-			object = map[string]string{"__typename": "Blob", "oid": strings.Repeat("b", 40)}
+	for _, objectType := range []string{"blob", "tree"} {
+		for _, malformed := range []string{"missing_type", "invalid_oid"} {
+			t.Run(objectType+"/"+malformed, func(t *testing.T) {
+				requestCount := 0
+				typeName := "Blob"
+				if objectType == "tree" {
+					typeName = "Tree"
+				}
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					requestCount++
+					object := map[string]string{}
+					if malformed == "invalid_oid" {
+						object = map[string]string{"__typename": typeName, "oid": "invalid"}
+					}
+					if requestCount == 2 {
+						object = map[string]string{"__typename": typeName, "oid": strings.Repeat("b", 40)}
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"data": map[string]any{"repository": map[string]any{
+							"root": map[string]string{"__typename": "Tree", "oid": githubObjectsTreeSHA},
+							"o0":   object,
+						}},
+					})
+				}))
+				t.Cleanup(upstream.Close)
+				mux, ctx := newGitHubObjectsTestMux(t, upstream.URL)
+
+				first := postGitHubObjectType(ctx, t, mux, []string{"path"}, objectType)
+				second := postGitHubObjectType(ctx, t, mux, []string{"path"}, objectType)
+
+				assert.Equal(t, http.StatusBadGateway, first.Code)
+				assert.Equal(t, http.StatusOK, second.Code)
+				assert.Equal(t, stringPointer(strings.Repeat("b", 40)), decodeGitHubObjectsResponse(t, second).Objects[0].OID)
+				assert.Equal(t, 2, requestCount)
+			})
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"repository": map[string]any{
-				"root": map[string]string{"__typename": "Tree", "oid": githubObjectsTreeSHA},
-				"o0":   object,
-			}},
-		})
-	}))
-	t.Cleanup(upstream.Close)
-	mux, ctx := newGitHubObjectsTestMux(t, upstream.URL)
-
-	first := postGitHubObjects(ctx, t, mux, []string{"OWNERS.yaml"})
-	second := postGitHubObjects(ctx, t, mux, []string{"OWNERS.yaml"})
-
-	assert.Equal(t, http.StatusBadGateway, first.Code)
-	assert.Equal(t, http.StatusOK, second.Code)
-	assert.Equal(t, 2, requestCount)
+	}
 }
 
 func TestGitHubObjectsPreservesRateLimitHeaders(t *testing.T) {
@@ -306,7 +358,16 @@ func newGitHubObjectsTestMux(t *testing.T, target string) (*http.ServeMux, conte
 
 func postGitHubObjects(ctx context.Context, t *testing.T, mux http.Handler, paths []string) *httptest.ResponseRecorder {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"tree_sha": githubObjectsTreeSHA, "paths": paths})
+	return postGitHubObjectType(ctx, t, mux, paths, "")
+}
+
+func postGitHubObjectType(ctx context.Context, t *testing.T, mux http.Handler, paths []string, objectType string) *httptest.ResponseRecorder {
+	t.Helper()
+	payload := map[string]any{"tree_sha": githubObjectsTreeSHA, "paths": paths}
+	if objectType != "" {
+		payload["object_type"] = objectType
+	}
+	body, err := json.Marshal(payload)
 	assert.NoError(t, err)
 	request := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api.github.com/repos/ppl-ai/agi/git/objects:batch", strings.NewReader(string(body)))
 	request.Header.Set("Authorization", githubObjectsToken)

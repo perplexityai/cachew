@@ -54,6 +54,19 @@ github-releases {
 }
 ```
 
+### GitHub object batches
+
+`POST /api.github.com/repos/{owner}/{repo}/git/objects:batch` resolves paths at an
+exact Git tree SHA. Send `{"tree_sha":"<40-character SHA>","paths":["src"]}`;
+the response is `{"objects":[{"path":"src","oid":null}]}` for a directory,
+because the default lookup returns blob SHAs only.
+
+Set `"object_type":"tree"` to resolve directory SHAs instead. Missing paths and
+objects of the other type return `null`. Results are cached by repository, tree,
+path, and requested type; existing blob cache entries remain compatible. Requests
+accept at most 1,000 paths and use bounded GraphQL batches for cache misses.
+Directory listings and file modes still require the Git trees API.
+
 ### Go Modules
 
 Go module proxy (`GOPROXY`-compatible). Private modules are fetched via git clone.
