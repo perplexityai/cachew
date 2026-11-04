@@ -174,10 +174,24 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 			assert.Equal(t, tc.contentRange, response.Header().Get("Content-Range"))
 			assert.Equal(t, strconv.Itoa(len(tc.body)), response.Header().Get("Content-Length"))
 			assert.Equal(t, "bytes", response.Header().Get("Accept-Ranges"))
+			assert.Equal(t, 12, calls)
 		})
 	}
 	conditionalRange := map[string]string{"Range": "bytes=0-1", "If-None-Match": etag}
-	assert.Equal(t, 304, request("GET", "tool.tar", conditionalRange).Code)
+	response := request("GET", "tool.tar", conditionalRange)
+	assert.Equal(t, 304, response.Code)
+	assert.Equal(t, "7", response.Header().Get("Content-Length"))
+	assert.Equal(t, "", response.Header().Get("Content-Range"))
+	assert.Equal(t, 304, request("GET", "tool.tar", map[string]string{"Range": "bytes=99-", "If-None-Match": "W/" + etag}).Code)
+	assert.Equal(t, 412, request("GET", "tool.tar", map[string]string{"Range": "bytes=99-", "If-Match": `"other"`}).Code)
+	assert.Equal(t, 12, calls)
+	for _, bypass := range []string{"Cache-Control", "Pragma"} {
+		before := calls
+		response = request("GET", "tool.tar", map[string]string{"Range": "bytes=0-1", bypass: "no-cache"})
+		assert.Equal(t, 206, response.Code)
+		assert.Equal(t, "ar", response.Body.String())
+		assert.Equal(t, before+1, calls)
+	}
 	head = request("HEAD", "tool.tar", map[string]string{"Range": "bytes=0-1"})
 	assert.Equal(t, 200, head.Code)
 	assert.Equal(t, "7", head.Header().Get("Content-Length"))
@@ -188,6 +202,11 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 	})
 	assert.Equal(t, 502, request("GET", "truncated.tar", map[string]string{"Range": "bytes=5-6"}).Code)
 	assert.Equal(t, "archive", request("GET", "tool.tar", nil).Body.String())
+	before := calls
+	strategy.immutableFallbackTTL = 0
+	response = request("GET", "tool.tar", map[string]string{"Range": "bytes=99-", "If-None-Match": etag})
+	assert.Equal(t, 304, response.Code)
+	assert.Equal(t, before+1, calls)
 }
 
 func TestCodeArtifactAssetConfiguration(t *testing.T) {

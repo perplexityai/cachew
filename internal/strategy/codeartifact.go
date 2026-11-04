@@ -270,7 +270,7 @@ func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host 
 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	c.metric.recordRequest(r.Context(), classifyCodeArtifactRequest(r))
+	c.metric.recordRequest(r.Context(), c.classifyRequest(r))
 	purl, decision, err := c.evaluatePackage(r)
 	policyDuration := time.Since(started)
 	if err != nil {
@@ -309,7 +309,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, decision packagepolicy.Decision, err error) string {
-	mode := classifyCodeArtifactRequest(r)
+	mode := c.classifyRequest(r)
 	if !packagepolicy.AllowRequest(w, decision, err) {
 		return "policy"
 	}
@@ -319,7 +319,7 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return codeArtifactAuditCache
 	}
-	if !packagepolicy.Cacheable(decision, err) {
+	if !packagepolicy.Cacheable(decision, err) || r.Header.Get("Range") != "" {
 		mode = codeArtifactCachePassthrough
 	}
 	if mode != codeArtifactCacheLookup {

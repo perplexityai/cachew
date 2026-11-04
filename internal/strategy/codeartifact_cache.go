@@ -24,11 +24,11 @@ const (
 	codeArtifactOriginValidatorsHeader                       = "X-Cachew-Codeartifact-Origin-Validators"
 )
 
-func classifyCodeArtifactRequest(r *http.Request) codeArtifactCacheMode {
+func (c *CodeArtifact) classifyRequest(r *http.Request) codeArtifactCacheMode {
 	if len(r.Header.Values("Cache-Control")) != 0 || len(r.Header.Values("Pragma")) != 0 {
 		return codeArtifactCachePassthrough
 	}
-	if r.Method != http.MethodGet || r.Header.Get("Range") != "" || r.URL.RawQuery != "" {
+	if r.Method != http.MethodGet || (r.Header.Get("Range") != "" && c.assets == nil) || r.URL.RawQuery != "" {
 		return codeArtifactCachePassthrough
 	}
 	if strings.Contains(strings.ToLower(r.URL.EscapedPath()), "%2f") {
@@ -56,27 +56,58 @@ func (c *CodeArtifact) cacheKey(r *http.Request) cache.Key {
 }
 
 func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool {
-	body, headers, tier, err := cache.OpenWithTier(r.Context(), c.cache, c.cacheKey(r))
+	var body io.ReadCloser
+	var headers http.Header
+	var tier cache.BackendType
+	var err error
+	ranged := c.assets != nil && r.Header.Get("Range") != ""
+	if ranged {
+		// Evaluate freshness and HTTP preconditions against full-object metadata
+		// before a range read changes Content-Length or returns 416.
+		headers, err = c.cache.Stat(r.Context(), c.cacheKey(r))
+	} else {
+		body, headers, tier, err = cache.OpenWithTier(r.Context(), c.cache, c.cacheKey(r))
+	}
 	if err == nil && headers.Get(codeArtifactFallbackLifetimeHeader) != "" {
 		updateCodeArtifactAge(headers, time.Now())
 		policy := map[string]string{"max-age": strconv.FormatInt(int64(c.immutableFallbackTTL/time.Second), 10)}
 		if _, fresh := codeArtifactFreshnessLifetime(headers, policy, time.Now()); !fresh {
-			_ = body.Close()
+			if body != nil {
+				_ = body.Close()
+			}
 			return false
 		}
 	}
+	storedETag := headers.Get("ETag")
 	if err == nil {
 		headers = codeArtifactOriginHeaders(headers, time.Now())
 		if status := cachedPreconditionStatus(r, headers); status != 0 {
 			c.metric.recordCache(r.Context(), codeArtifactCacheHit, boundedCodeArtifactCacheTier(tier))
-			if closeErr := body.Close(); closeErr != nil {
-				c.logger.ErrorContext(r.Context(), "Failed to close cached CodeArtifact response", "error", closeErr)
+			if body != nil {
+				if closeErr := body.Close(); closeErr != nil {
+					c.logger.ErrorContext(r.Context(), "Failed to close cached CodeArtifact response", "error", closeErr)
+				}
 			}
 			if status == http.StatusNotModified {
 				copyHeaders(w.Header(), headers)
 			}
 			w.WriteHeader(status)
 			return true
+		}
+	}
+	if err == nil && ranged {
+		opts := cache.RequestOptions{Range: r.Header.Get("Range"), IfRange: r.Header.Get("If-Range"), IfMatch: storedETag}
+		if opts.IfRangeMisses(headers.Get("ETag")) {
+			opts.Range = ""
+		}
+		body, headers, tier, err = cache.OpenWithTier(r.Context(), c.cache, c.cacheKey(r), func(o *cache.RequestOptions) { *o = opts })
+		if errors.Is(err, cache.ErrPreconditionFailed) {
+			// The entry changed after Stat; evaluate the request at the origin.
+			return false
+		}
+		headers = codeArtifactOriginHeaders(headers, time.Now())
+		if errors.Is(err, cache.ErrRangeNotSatisfiable) {
+			headers.Set("Content-Length", "0")
 		}
 	}
 	if handled, _, serveErr := httputil.ServeCacheHit(w, headers, body, err); handled {
