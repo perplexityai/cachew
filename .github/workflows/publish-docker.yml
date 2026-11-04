@@ -56,7 +56,8 @@ jobs:
             # Tag stable releases (no pre-release suffix) as latest
             type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
 
-      - uses: cashapp/activate-hermit@e49f5cb4dd64ff0b0b659d1d8df499595451155a # v1
+      - name: Activate Hermit
+        run: ./bin/hermit env --raw >> "$GITHUB_ENV"
       - run: |
           just build linux arm64
           just build linux amd64

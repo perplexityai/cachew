@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,9 @@ import (
 	awscodeartifact "github.com/aws/aws-sdk-go-v2/service/codeartifact"
 	"github.com/aws/aws-sdk-go-v2/service/codeartifact/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/block/cachew/client"
+	"github.com/block/cachew/internal/httputil"
 )
 
 type codeArtifactAssetOrigin struct {
@@ -80,19 +84,91 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 		w.WriteHeader(status)
 		return
 	}
+	if c.serveAssetRange(w, r, resp, headers, mode) {
+		return
+	}
 	copyHeaders(w.Header(), headers)
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
 	}
-	// The asset API has no range operation. HTTP permits a complete 200 response
-	// to Range; these reads stay uncached rather than storing a partial object.
 	if mode == codeArtifactCacheLookup {
 		c.streamAndCache(w, r, resp, headers)
 	} else {
 		c.streamOriginBody(w, r, resp.Body)
 	}
 }
+
+func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, resp *http.Response, headers http.Header, mode codeArtifactCacheMode) bool {
+	size, err := strconv.ParseInt(headers.Get("Content-Length"), 10, 64)
+	if err != nil || size < 0 {
+		return false
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	if r.Method != http.MethodGet || r.Header.Get("Range") == "" {
+		return false
+	}
+	start, length, outcome := client.NewRequestOptions(httputil.ConditionalOptions(r)...).ResolveRange(size, headers.Get("ETag"))
+	if outcome == client.RangeFull {
+		return false
+	}
+	if outcome == client.RangeNotSatisfiable {
+		copyHeaders(w.Header(), headers)
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return true
+	}
+	copyHeaders(w.Header(), headers)
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size))
+	w.WriteHeader(http.StatusPartialContent)
+	started := time.Now()
+	reader := &codeArtifactStreamReader{reader: resp.Body}
+	if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		c.abortStream(w, r, reader, 0, started, err)
+	}
+	// The asset API supplies a full stream. When the range reaches EOF, retain
+	// the prefix too so the existing cache writer can commit a complete object.
+	out := &codeArtifactRangeWriter{ResponseWriter: w, skip: start}
+	if mode == codeArtifactCacheLookup && start+length == size {
+		c.streamAndCache(out, r, resp, headers)
+		return true
+	}
+	_, err = io.CopyN(out, reader, start+length)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+			reader.err = err
+		}
+		c.abortStream(w, r, reader, out.written, started, err)
+	}
+	return true
+}
+
+type codeArtifactRangeWriter struct {
+	http.ResponseWriter
+	skip    int64
+	written int64
+}
+
+func (w *codeArtifactRangeWriter) Write(p []byte) (int, error) {
+	skipped := min(w.skip, int64(len(p)))
+	w.skip -= skipped
+	p = p[skipped:]
+	if len(p) == 0 {
+		return int(skipped), nil
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.written += int64(n)
+	return int(skipped) + n, err //nolint:wrapcheck // Preserve downstream write errors for stream classification.
+}
+
+// BytesWritten excludes consumed prefix bytes from response stream accounting.
+func (w *codeArtifactRangeWriter) BytesWritten() int64 { return w.written }
+
+// Unwrap preserves response-controller operations through range filtering.
+func (w *codeArtifactRangeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func codeArtifactMavenAsset(path string) (*awscodeartifact.GetPackageVersionAssetInput, error) {
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
