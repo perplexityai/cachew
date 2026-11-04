@@ -15,6 +15,7 @@ import (
 	awscodeartifact "github.com/aws/aws-sdk-go-v2/service/codeartifact"
 	"github.com/felixge/httpsnoop"
 
+	"github.com/block/cachew/client"
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
@@ -32,7 +33,7 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Serves only configured aliases; range requests return the complete asset."`
+	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Serves only configured aliases; supports single byte-range downloads."`
 	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Maven asset download routes; requires asset-api."`
 	ImmutableFallbackTTL  time.Duration             `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
 	Target                string                    `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`
@@ -270,7 +271,7 @@ func (c *CodeArtifact) String() string { return "codeartifact:" + c.target.Host 
 
 func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	c.metric.recordRequest(r.Context(), classifyCodeArtifactRequest(r))
+	c.metric.recordRequest(r.Context(), c.classifyRequest(r))
 	purl, decision, err := c.evaluatePackage(r)
 	policyDuration := time.Since(started)
 	if err != nil {
@@ -309,7 +310,7 @@ func (c *CodeArtifact) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, decision packagepolicy.Decision, err error) string {
-	mode := classifyCodeArtifactRequest(r)
+	mode := c.classifyRequest(r)
 	if !packagepolicy.AllowRequest(w, decision, err) {
 		return "policy"
 	}
@@ -322,7 +323,8 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 	if !packagepolicy.Cacheable(decision, err) {
 		mode = codeArtifactCachePassthrough
 	}
-	if mode != codeArtifactCacheLookup {
+	options := client.NewRequestOptions(httputil.ConditionalOptions(r)...)
+	if mode != codeArtifactCacheLookup || options.RangeMayStopEarly() {
 		c.serveOrigin(w, r, mode)
 		return codeArtifactAuditOrigin
 	}

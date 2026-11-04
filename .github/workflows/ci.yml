@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Activate Hermit
+        run: ./bin/hermit env --raw >> "$GITHUB_ENV"
       - run: |
           just fmt
           git diff --exit-code
@@ -19,7 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Activate Hermit
+        run: ./bin/hermit env --raw >> "$GITHUB_ENV"
       - name: Run tests
         run: just test
   lint:
@@ -27,5 +29,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Activate Hermit
+        run: ./bin/hermit env --raw >> "$GITHUB_ENV"
       - run: just lint

@@ -93,3 +93,22 @@ func TestResolveRange(t *testing.T) {
 		})
 	}
 }
+
+func TestRangeMayStopEarly(t *testing.T) {
+	for _, tc := range []struct {
+		spec string
+		want bool
+	}{
+		{"", false}, {"bytes=2-", false}, {"bytes=-3", false},
+		{"bytes=0-1", true}, {"bytes=2-99999999", true},
+		{"bytes=0-1,4-5", false}, {"items=0-4", false},
+		{"Bytes=0-4", false}, {"bytes = 2-4", false},
+		{"bytes= 2 - 4 ", true}, {"bytes=a-b", false},
+		{"bytes=4-2", false}, {"bytes=0-9223372036854775807", false},
+	} {
+		t.Run(tc.spec, func(t *testing.T) {
+			options := client.RequestOptions{Range: tc.spec}
+			assert.Equal(t, tc.want, options.RangeMayStopEarly())
+		})
+	}
+}

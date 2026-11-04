@@ -220,7 +220,18 @@ Asset reads use a separate `codeartifact-assets` cache namespace and the existin
 `immutable-fallback-ttl` setting. Successful asset responses are treated as immutable;
 source deletion or permission revocation does not evict cached bytes. Admission still
 runs before cache lookup. GET, HEAD and ETag conditions are supported; Range requests
-receive a complete 200 response because the asset API has no range operation.
+receive single-range 206 responses, including suffix ranges and If-Range validation.
+Range requests use fresh cached objects when available, including native S3 range reads.
+On a cache miss, the asset API has no range operation, so Cachew streams past preceding
+bytes without buffering the whole asset. Open-ended and suffix ranges fill the cache with
+the complete origin stream, including that prefix, using the existing fill coordination.
+Bounded ranges bypass fill coordination on a miss, but still fill the cache if the
+origin size shows they reach EOF. Ignored multi-range requests can cache their full
+response. Partial objects are never stored.
+Requests joining a fill wait for it to complete before receiving headers and remain
+subject to request timeouts. Origin responses flush headers before reading the prefix;
+failures after that point abort the stream.
+Unsatisfiable ranges return 416; unsupported multi-range requests receive the complete 200 response.
 
 Credential refresh, including time spent waiting for another required refresh,
 has a whole-operation deadline. The origin header deadline begins after the
