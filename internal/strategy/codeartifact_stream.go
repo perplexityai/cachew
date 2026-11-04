@@ -33,11 +33,11 @@ func (c *CodeArtifact) streamOriginBody(w http.ResponseWriter, r *http.Request, 
 	reader := &codeArtifactStreamReader{reader: body}
 	written, err := io.Copy(w, reader)
 	if err != nil {
-		c.abortStream(w, r, "origin", reader, written, started, err)
+		c.abortStream(w, r, reader, written, started, err)
 	}
 }
 
-func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request, source string,
+func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request,
 	reader *codeArtifactStreamReader, written int64, started time.Time, err error,
 ) {
 	stage := "client_write"
@@ -58,7 +58,7 @@ func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request, sourc
 		c.metric.recordStreamFailure(context.WithoutCancel(r.Context()), stage, kind, format)
 	}
 	c.logger.ErrorContext(r.Context(), "CodeArtifact response stream failed",
-		"source", source, "stage", stage, "error_kind", kind,
+		"source", "origin", "stage", stage, "error_kind", kind,
 		"format", format, "bytes_read", reader.bytes, "bytes_written", written,
 		"expected_bytes", expected, "duration_ms", time.Since(started).Milliseconds(), "client_canceled", clientCanceled)
 	// Headers are already committed. Returning normally would terminate a chunked

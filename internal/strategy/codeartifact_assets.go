@@ -84,7 +84,7 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 		w.WriteHeader(status)
 		return
 	}
-	if c.serveAssetRange(w, r, headers, resp.Body) {
+	if c.serveAssetRange(w, r, resp, headers, mode) {
 		return
 	}
 	copyHeaders(w.Header(), headers)
@@ -99,7 +99,7 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 	}
 }
 
-func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, headers http.Header, body io.Reader) bool {
+func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, resp *http.Response, headers http.Header, mode codeArtifactCacheMode) bool {
 	size, err := strconv.ParseInt(headers.Get("Content-Length"), 10, 64)
 	if err != nil || size < 0 {
 		return false
@@ -119,27 +119,47 @@ func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, h
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 		return true
 	}
-	// GetPackageVersionAsset cannot request a byte range. Stream past the prefix
-	// without buffering the object, and never publish a partial body to the cache.
-	if _, err := io.CopyN(io.Discard, body, start); err != nil {
-		c.writeError(w, r, errors.Wrap(err, "skip CodeArtifact range prefix"))
-		return true
-	}
 	copyHeaders(w.Header(), headers)
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size))
 	w.WriteHeader(http.StatusPartialContent)
 	started := time.Now()
-	reader := &codeArtifactStreamReader{reader: body}
-	written, err := io.CopyN(w, reader, length)
+	reader := &codeArtifactStreamReader{reader: resp.Body}
+	if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		c.abortStream(w, r, reader, 0, started, err)
+	}
+	// The asset API supplies a full stream. When the range reaches EOF, retain
+	// the prefix too so the existing cache writer can commit a complete object.
+	out := &codeArtifactRangeWriter{ResponseWriter: w, skip: start}
+	if mode == codeArtifactCacheLookup && start+length == size {
+		c.streamAndCache(out, r, resp, headers)
+		return true
+	}
+	written, err := io.CopyN(out, reader, start+length)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			err = io.ErrUnexpectedEOF
 			reader.err = err
 		}
-		c.abortStream(w, r, "origin", reader, written, started, err)
+		c.abortStream(w, r, reader, written, started, err)
 	}
 	return true
+}
+
+type codeArtifactRangeWriter struct {
+	http.ResponseWriter
+	skip int64
+}
+
+func (w *codeArtifactRangeWriter) Write(p []byte) (int, error) {
+	skipped := min(w.skip, int64(len(p)))
+	w.skip -= skipped
+	p = p[skipped:]
+	if len(p) == 0 {
+		return int(skipped), nil
+	}
+	n, err := w.ResponseWriter.Write(p)
+	return int(skipped) + n, err //nolint:wrapcheck // Preserve downstream write errors for stream classification.
 }
 
 func codeArtifactMavenAsset(path string) (*awscodeartifact.GetPackageVersionAssetInput, error) {

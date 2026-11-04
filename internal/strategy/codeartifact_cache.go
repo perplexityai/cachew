@@ -220,7 +220,7 @@ func (c *CodeArtifact) streamAndCache(
 			c.logger.ErrorContext(r.Context(), "Failed to cache complete CodeArtifact response", "error", err)
 		}
 		if copyErr != nil {
-			c.abortStream(w, r, "origin", reader, written, started, copyErr)
+			c.abortStream(w, r, reader, written, started, copyErr)
 		}
 		return
 	}

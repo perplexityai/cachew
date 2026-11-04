@@ -203,8 +203,25 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 	assertCodeArtifactStreamAborted(t, func() {
 		request("GET", "truncated.tar", map[string]string{"Range": "bytes=0-5"})
 	})
-	assert.Equal(t, 502, request("GET", "truncated.tar", map[string]string{"Range": "bytes=5-6"}).Code)
+	assertCodeArtifactStreamAborted(t, func() {
+		request("GET", "truncated.tar", map[string]string{"Range": "bytes=5-6"})
+	})
+	beforeRetry := calls
+	assertCodeArtifactStreamAborted(t, func() { request("GET", "truncated.tar", nil) })
+	assert.Equal(t, beforeRetry+1, calls)
 	assert.Equal(t, "archive", request("GET", "tool.tar", nil).Body.String())
+	for _, tc := range []struct{ asset, span, body string }{
+		{"resume.tar", "bytes=2-", "chive"},
+		{"suffix.tar", "bytes=-3", "ive"},
+		{"entire.tar", "bytes=0-", "archive"},
+	} {
+		before := calls
+		partial := request("GET", tc.asset, map[string]string{"Range": tc.span})
+		assert.Equal(t, 206, partial.Code)
+		assert.Equal(t, tc.body, partial.Body.String())
+		assert.Equal(t, "archive", request("GET", tc.asset, nil).Body.String())
+		assert.Equal(t, before+1, calls)
+	}
 	before := calls
 	strategy.immutableFallbackTTL = 0
 	response = request("GET", "tool.tar", map[string]string{"Range": "bytes=99-", "If-None-Match": etag})

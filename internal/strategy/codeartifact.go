@@ -319,7 +319,7 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return codeArtifactAuditCache
 	}
-	if !packagepolicy.Cacheable(decision, err) || r.Header.Get("Range") != "" {
+	if !packagepolicy.Cacheable(decision, err) {
 		mode = codeArtifactCachePassthrough
 	}
 	if mode != codeArtifactCacheLookup {
