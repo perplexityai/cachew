@@ -141,14 +141,15 @@ func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, r
 			err = io.ErrUnexpectedEOF
 			reader.err = err
 		}
-		c.abortStream(w, r, reader, written, started, err)
+		c.abortStream(out, r, reader, written, started, err)
 	}
 	return true
 }
 
 type codeArtifactRangeWriter struct {
 	http.ResponseWriter
-	skip int64
+	skip    int64
+	written int64
 }
 
 func (w *codeArtifactRangeWriter) Write(p []byte) (int, error) {
@@ -159,8 +160,12 @@ func (w *codeArtifactRangeWriter) Write(p []byte) (int, error) {
 		return int(skipped), nil
 	}
 	n, err := w.ResponseWriter.Write(p)
+	w.written += int64(n)
 	return int(skipped) + n, err //nolint:wrapcheck // Preserve downstream write errors for stream classification.
 }
+
+// Unwrap preserves response-controller operations through range filtering.
+func (w *codeArtifactRangeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func codeArtifactMavenAsset(path string) (*awscodeartifact.GetPackageVersionAssetInput, error) {
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")

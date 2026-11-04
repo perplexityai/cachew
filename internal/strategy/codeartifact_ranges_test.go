@@ -45,9 +45,7 @@ func TestAssetRangeS3(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
 			bucket := s3clienttest.Start(t)
-			var origins, ranges, heads atomic.Int32
-			var replace func()
-			var replacing atomic.Bool
+			var origins, ranges atomic.Int32
 			transport, err := minio.DefaultTransport(false)
 			assert.NoError(t, err)
 			client, err := minio.New(s3clienttest.Addr, &minio.Options{
@@ -55,10 +53,6 @@ func TestAssetRangeS3(t *testing.T) {
 				Transport: codeArtifactRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 					if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
 						ranges.Add(1)
-					}
-					if r.Method == http.MethodHead && replacing.Load() && heads.Add(1) == 2 {
-						replacing.Store(false)
-						replace()
 					}
 					return transport.RoundTrip(r)
 				}),
@@ -91,16 +85,18 @@ func TestAssetRangeS3(t *testing.T) {
 			if memory != nil {
 				assert.NoError(t, memory.Namespace("codeartifact-assets").Invalidate(ctx, key))
 			}
+			var replacing *cacheAfterStat
 			if scenario == "replacement" {
 				headers, statErr := strategy.cache.Stat(ctx, key)
 				assert.NoError(t, statErr)
-				replace = func() {
+				replacing = &cacheAfterStat{Cache: strategy.cache}
+				replacing.after = func() {
 					assert.NoError(t, cache.WriteFunc(ctx, strategy.cache, key, headers, time.Hour, func(w io.Writer) error {
 						_, writeErr := io.WriteString(w, "changed")
 						return writeErr
 					}, cache.WithETag("replacement")))
 				}
-				replacing.Store(true)
+				strategy.cache = replacing
 			}
 			before := ranges.Load()
 			request.Header.Set("Range", "bytes=2-4")
@@ -113,7 +109,7 @@ func TestAssetRangeS3(t *testing.T) {
 				assert.True(t, ranges.Load() > before)
 				assert.Equal(t, int32(1), origins.Load())
 			} else {
-				assert.False(t, replacing.Load())
+				assert.True(t, replacing.after == nil)
 				assert.Equal(t, int32(2), origins.Load())
 			}
 		})
@@ -155,4 +151,70 @@ func TestCodeArtifactRangeFlushesBeforePrefix(t *testing.T) {
 	body, err := io.ReadAll(response.Body)
 	assert.NoError(t, err)
 	assert.Equal(t, "chive", string(body))
+}
+
+func TestBoundedRangeDoesNotBlockFill(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first := calls.Add(1) == 1
+		w.Header().Set("Content-Length", "7")
+		w.Header().Set("X-Packageversionrevision", "revision-1")
+		assert.NoError(t, http.NewResponseController(w).Flush())
+		if first {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		_, _ = io.WriteString(w, "archive")
+	}))
+	defer origin.Close()
+	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	defer memory.Close()
+	_, handler := newRangeTestStrategy(ctx, t, origin.URL, memory)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r.WithContext(logging.ContextWithLogger(r.Context(), logging.FromContext(ctx))))
+	}))
+	defer server.Close()
+	defer close(release)
+	client := server.Client()
+	client.Timeout = 5 * time.Second
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/downloads/1/tool.tar", nil)
+	assert.NoError(t, err)
+	request.Header.Set("Range", "bytes=0-1")
+	request.Header.Set("Accept-Encoding", "identity")
+	partial, err := client.Do(request)
+	assert.NoError(t, err)
+	defer partial.Body.Close()
+	assert.Equal(t, 206, partial.StatusCode)
+	request.Header.Del("Range")
+	for range 2 {
+		full, requestErr := client.Do(request)
+		assert.NoError(t, requestErr)
+		body, readErr := io.ReadAll(full.Body)
+		assert.NoError(t, readErr)
+		assert.NoError(t, full.Body.Close())
+		assert.Equal(t, 200, full.StatusCode)
+		assert.Equal(t, "archive", string(body))
+	}
+	assert.Equal(t, int32(2), calls.Load())
+}
+
+type cacheAfterStat struct {
+	cache.Cache
+	after func()
+}
+
+func (c *cacheAfterStat) Stat(ctx context.Context, key cache.Key, opts ...cache.Option) (http.Header, error) {
+	headers, err := c.Cache.Stat(ctx, key, opts...)
+	if err == nil && c.after != nil {
+		after := c.after
+		c.after = nil
+		after()
+	}
+	return headers, err
 }

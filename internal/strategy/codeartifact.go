@@ -319,7 +319,10 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return codeArtifactAuditCache
 	}
-	if !packagepolicy.Cacheable(decision, err) {
+	// A bounded range may stop before EOF, so it must not claim a full-object fill.
+	rangeSpec := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Range"), "bytes="))
+	rangeMayFill := rangeSpec == "" || strings.HasPrefix(rangeSpec, "-") || strings.HasSuffix(rangeSpec, "-")
+	if !packagepolicy.Cacheable(decision, err) || !rangeMayFill {
 		mode = codeArtifactCachePassthrough
 	}
 	if mode != codeArtifactCacheLookup {

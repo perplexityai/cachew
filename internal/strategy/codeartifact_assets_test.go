@@ -1,6 +1,7 @@
 package strategy //nolint:testpackage // Exercise the SDK transport and cache without AWS.
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
@@ -210,6 +211,25 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 	assertCodeArtifactStreamAborted(t, func() { request("GET", "truncated.tar", nil) })
 	assert.Equal(t, beforeRetry+1, calls)
 	assert.Equal(t, "archive", request("GET", "tool.tar", nil).Body.String())
+	var failureLogs bytes.Buffer
+	strategy.logger = slog.New(slog.NewJSONHandler(&failureLogs, nil))
+	for _, tc := range []struct {
+		span              string
+		written, expected float64
+	}{
+		{"bytes=1-5", 2, 5},
+		{"bytes=2-", 1, 5},
+		{"bytes=5-", 0, 2},
+	} {
+		failureLogs.Reset()
+		assertCodeArtifactStreamAborted(t, func() {
+			request("GET", "truncated.tar", map[string]string{"Range": tc.span})
+		})
+		entries := codeArtifactFailureLogs(t, failureLogs.Bytes())
+		entry := entries[len(entries)-1]
+		assert.Equal[any](t, tc.written, entry["bytes_written"])
+		assert.Equal[any](t, tc.expected, entry["expected_bytes"])
+	}
 	for _, tc := range []struct{ asset, span, body string }{
 		{"resume.tar", "bytes=2-", "chive"},
 		{"suffix.tar", "bytes=-3", "ive"},

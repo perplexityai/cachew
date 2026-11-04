@@ -40,6 +40,9 @@ func (c *CodeArtifact) streamOriginBody(w http.ResponseWriter, r *http.Request, 
 func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request,
 	reader *codeArtifactStreamReader, written int64, started time.Time, err error,
 ) {
+	if ranged, ok := w.(*codeArtifactRangeWriter); ok {
+		written = ranged.written
+	}
 	stage := "client_write"
 	if reader.err != nil && errors.Is(err, reader.err) {
 		stage = "source_read"
