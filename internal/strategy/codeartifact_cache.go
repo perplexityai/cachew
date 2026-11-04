@@ -58,7 +58,7 @@ func (c *CodeArtifact) cacheKey(r *http.Request) cache.Key {
 func (c *CodeArtifact) serveCached(w http.ResponseWriter, r *http.Request) bool {
 	var body io.ReadCloser
 	var headers http.Header
-	var tier cache.BackendType
+	tier := cache.BackendType(codeArtifactCacheTierUnknown)
 	var err error
 	ranged := c.assets != nil && r.Header.Get("Range") != ""
 	if ranged {

@@ -68,6 +68,8 @@ func TestCodeArtifactAssetAPI(t *testing.T) {
 	mux := http.NewServeMux()
 	strategy, err := newCodeArtifact(ctx, config, mux, nil, memory, true)
 	assert.NoError(t, err)
+	metrics := &recordingCodeArtifactMetrics{}
+	strategy.metric = metrics
 	strategy.assets = &codeArtifactAssetOrigin{
 		domain: "example", owner: "123456789012",
 		client: awscodeartifact.NewFromConfig(aws.Config{
@@ -180,6 +182,7 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 	conditionalRange := map[string]string{"Range": "bytes=0-1", "If-None-Match": etag}
 	response := request("GET", "tool.tar", conditionalRange)
 	assert.Equal(t, 304, response.Code)
+	assert.Equal(t, recordedCodeArtifactCacheEvent{event: codeArtifactCacheHit, tier: codeArtifactCacheTierUnknown}, metrics.cache[len(metrics.cache)-1])
 	assert.Equal(t, "7", response.Header().Get("Content-Length"))
 	assert.Equal(t, "", response.Header().Get("Content-Range"))
 	assert.Equal(t, 304, request("GET", "tool.tar", map[string]string{"Range": "bytes=99-", "If-None-Match": "W/" + etag}).Code)
