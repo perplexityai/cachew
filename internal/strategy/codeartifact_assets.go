@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,9 @@ import (
 	awscodeartifact "github.com/aws/aws-sdk-go-v2/service/codeartifact"
 	"github.com/aws/aws-sdk-go-v2/service/codeartifact/types"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/block/cachew/client"
+	"github.com/block/cachew/internal/httputil"
 )
 
 type codeArtifactAssetOrigin struct {
@@ -80,18 +84,62 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 		w.WriteHeader(status)
 		return
 	}
+	if c.serveAssetRange(w, r, headers, resp.Body) {
+		return
+	}
 	copyHeaders(w.Header(), headers)
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
 	}
-	// The asset API has no range operation. HTTP permits a complete 200 response
-	// to Range; these reads stay uncached rather than storing a partial object.
 	if mode == codeArtifactCacheLookup {
 		c.streamAndCache(w, r, resp, headers)
 	} else {
 		c.streamOriginBody(w, r, resp.Body)
 	}
+}
+
+func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, headers http.Header, body io.Reader) bool {
+	size, err := strconv.ParseInt(headers.Get("Content-Length"), 10, 64)
+	if err != nil || size < 0 {
+		return false
+	}
+	headers.Set("Accept-Ranges", "bytes")
+	if r.Method != http.MethodGet || r.Header.Get("Range") == "" {
+		return false
+	}
+	start, length, outcome := client.NewRequestOptions(httputil.ConditionalOptions(r)...).ResolveRange(size, headers.Get("ETag"))
+	if outcome == client.RangeFull {
+		return false
+	}
+	if outcome == client.RangeNotSatisfiable {
+		copyHeaders(w.Header(), headers)
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return true
+	}
+	// GetPackageVersionAsset cannot request a byte range. Stream past the prefix
+	// without buffering the object, and never publish a partial body to the cache.
+	if _, err := io.CopyN(io.Discard, body, start); err != nil {
+		c.writeError(w, r, errors.Wrap(err, "skip CodeArtifact range prefix"))
+		return true
+	}
+	copyHeaders(w.Header(), headers)
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size))
+	w.WriteHeader(http.StatusPartialContent)
+	started := time.Now()
+	reader := &codeArtifactStreamReader{reader: body}
+	written, err := io.CopyN(w, reader, length)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+			reader.err = err
+		}
+		c.abortStream(w, r, "origin", reader, written, started, err)
+	}
+	return true
 }
 
 func codeArtifactMavenAsset(path string) (*awscodeartifact.GetPackageVersionAssetInput, error) {

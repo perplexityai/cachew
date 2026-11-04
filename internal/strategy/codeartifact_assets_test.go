@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -116,8 +117,10 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 	assert.Equal(t, "7", head.Header().Get("Content-Length"))
 	assert.Equal(t, 304, request("GET", "cold.tar", map[string]string{"If-None-Match": etag}).Code)
 	ranged := request("GET", "cold.tar", map[string]string{"Range": "bytes=0-1"})
-	assert.Equal(t, 200, ranged.Code)
-	assert.Equal(t, "archive", ranged.Body.String())
+	assert.Equal(t, 206, ranged.Code)
+	assert.Equal(t, "ar", ranged.Body.String())
+	assert.Equal(t, "bytes 0-1/7", ranged.Header().Get("Content-Range"))
+	assert.Equal(t, "2", ranged.Header().Get("Content-Length"))
 	assert.Equal(t, 8, calls)
 	assert.Equal(t, "archive", request("GET", "cold.tar", nil).Body.String())
 	assert.Equal(t, 9, calls)
@@ -153,6 +156,38 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 		})
 	}
 	assert.Equal(t, 12, calls)
+	for _, tc := range []struct {
+		name, rangeHeader, ifRange, contentRange, body string
+		status                                         int
+	}{
+		{"resume", "bytes=2-", "", "bytes 2-6/7", "chive", 206},
+		{"suffix", "bytes=-3", "", "bytes 4-6/7", "ive", 206},
+		{"matching validator", "bytes=1-2", etag, "bytes 1-2/7", "rc", 206},
+		{"changed validator", "bytes=1-2", `"other"`, "", "archive", 200},
+		{"past end", "bytes=7-", "", "bytes */7", "", 416},
+		{"multiple ranges", "bytes=0-1,4-5", "", "", "archive", 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := request("GET", "tool.tar", map[string]string{"Range": tc.rangeHeader, "If-Range": tc.ifRange})
+			assert.Equal(t, tc.status, response.Code)
+			assert.Equal(t, tc.body, response.Body.String())
+			assert.Equal(t, tc.contentRange, response.Header().Get("Content-Range"))
+			assert.Equal(t, strconv.Itoa(len(tc.body)), response.Header().Get("Content-Length"))
+			assert.Equal(t, "bytes", response.Header().Get("Accept-Ranges"))
+		})
+	}
+	conditionalRange := map[string]string{"Range": "bytes=0-1", "If-None-Match": etag}
+	assert.Equal(t, 304, request("GET", "tool.tar", conditionalRange).Code)
+	head = request("HEAD", "tool.tar", map[string]string{"Range": "bytes=0-1"})
+	assert.Equal(t, 200, head.Code)
+	assert.Equal(t, "7", head.Header().Get("Content-Length"))
+	assert.Equal(t, "", head.Header().Get("Content-Range"))
+	assert.Equal(t, "", head.Body.String())
+	assertCodeArtifactStreamAborted(t, func() {
+		request("GET", "truncated.tar", map[string]string{"Range": "bytes=0-5"})
+	})
+	assert.Equal(t, 502, request("GET", "truncated.tar", map[string]string{"Range": "bytes=5-6"}).Code)
+	assert.Equal(t, "archive", request("GET", "tool.tar", nil).Body.String())
 }
 
 func TestCodeArtifactAssetConfiguration(t *testing.T) {

@@ -32,7 +32,7 @@ const (
 
 // CodeArtifactConfig configures an authenticated, read-only CodeArtifact origin.
 type CodeArtifactConfig struct {
-	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Serves only configured aliases; range requests return the complete asset."`
+	AssetAPI              bool                      `hcl:"asset-api,optional" help:"Read Maven assets through GetPackageVersionAsset for package-scoped IAM. Serves only configured aliases; supports single byte-range downloads."`
 	Aliases               []CodeArtifactAliasConfig `hcl:"alias,block" help:"Maven asset download routes; requires asset-api."`
 	ImmutableFallbackTTL  time.Duration             `hcl:"immutable-fallback-ttl,optional" help:"Opt-in freshness for public immutable responses without origin freshness. Zero disables; maximum 24h."`
 	Target                string                    `hcl:"target,label" help:"The CodeArtifact origin URL to proxy requests to."`

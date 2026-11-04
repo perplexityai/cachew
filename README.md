@@ -220,7 +220,9 @@ Asset reads use a separate `codeartifact-assets` cache namespace and the existin
 `immutable-fallback-ttl` setting. Successful asset responses are treated as immutable;
 source deletion or permission revocation does not evict cached bytes. Admission still
 runs before cache lookup. GET, HEAD and ETag conditions are supported; Range requests
-receive a complete 200 response because the asset API has no range operation.
+receive single-range 206 responses, including suffix ranges and If-Range validation.
+The asset API has no range operation, so Cachew streams past preceding bytes without buffering the whole asset; partial responses remain uncached.
+Unsatisfiable ranges return 416; unsupported multi-range requests receive the complete 200 response.
 
 Credential refresh, including time spent waiting for another required refresh,
 has a whole-operation deadline. The origin header deadline begins after the
