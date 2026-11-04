@@ -104,7 +104,7 @@ func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, r
 	if err != nil || size < 0 {
 		return false
 	}
-	headers.Set("Accept-Ranges", "bytes")
+	w.Header().Set("Accept-Ranges", "bytes")
 	if r.Method != http.MethodGet || r.Header.Get("Range") == "" {
 		return false
 	}
@@ -135,13 +135,13 @@ func (c *CodeArtifact) serveAssetRange(w http.ResponseWriter, r *http.Request, r
 		c.streamAndCache(out, r, resp, headers)
 		return true
 	}
-	written, err := io.CopyN(out, reader, start+length)
+	_, err = io.CopyN(out, reader, start+length)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			err = io.ErrUnexpectedEOF
 			reader.err = err
 		}
-		c.abortStream(out, r, reader, written, started, err)
+		c.abortStream(w, r, reader, out.written, started, err)
 	}
 	return true
 }
@@ -163,6 +163,9 @@ func (w *codeArtifactRangeWriter) Write(p []byte) (int, error) {
 	w.written += int64(n)
 	return int(skipped) + n, err //nolint:wrapcheck // Preserve downstream write errors for stream classification.
 }
+
+// BytesWritten excludes consumed prefix bytes from response stream accounting.
+func (w *codeArtifactRangeWriter) BytesWritten() int64 { return w.written }
 
 // Unwrap preserves response-controller operations through range filtering.
 func (w *codeArtifactRangeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

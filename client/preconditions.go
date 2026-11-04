@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -164,6 +165,14 @@ func (o RequestOptions) ResolveRange(size int64, etag string) (start, length int
 		return 0, size, RangeFull
 	}
 	return resolveByteRange(o.Range, size)
+}
+
+// RangeMayStopEarly reports whether a range could end before the object does.
+// Resolving against the largest possible object reuses the serving parser without
+// needing origin metadata. If-Range is deliberately ignored until the ETag is known.
+func (o RequestOptions) RangeMayStopEarly() bool {
+	start, length, outcome := resolveByteRange(o.Range, math.MaxInt64)
+	return outcome == RangePartial && start+length < math.MaxInt64
 }
 
 // resolveByteRange parses a single HTTP byte-range specifier against size.

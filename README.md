@@ -225,7 +225,9 @@ Range requests use fresh cached objects when available, including native S3 rang
 On a cache miss, the asset API has no range operation, so Cachew streams past preceding
 bytes without buffering the whole asset. Open-ended and suffix ranges fill the cache with
 the complete origin stream, including that prefix, using the existing fill coordination.
-Bounded ranges bypass fill coordination on a miss and never store partial objects.
+Bounded ranges bypass fill coordination on a miss, but still fill the cache if the
+origin size shows they reach EOF. Ignored multi-range requests can cache their full
+response. Partial objects are never stored.
 Requests joining a fill wait for it to complete before receiving headers and remain
 subject to request timeouts. Origin responses flush headers before reading the prefix;
 failures after that point abort the stream.

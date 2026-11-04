@@ -15,6 +15,7 @@ import (
 	awscodeartifact "github.com/aws/aws-sdk-go-v2/service/codeartifact"
 	"github.com/felixge/httpsnoop"
 
+	"github.com/block/cachew/client"
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
@@ -319,13 +320,11 @@ func (c *CodeArtifact) servePackage(w http.ResponseWriter, r *http.Request, deci
 	if mode == codeArtifactCacheLookup && c.serveCached(w, r) {
 		return codeArtifactAuditCache
 	}
-	// A bounded range may stop before EOF, so it must not claim a full-object fill.
-	rangeSpec := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Range"), "bytes="))
-	rangeMayFill := rangeSpec == "" || strings.HasPrefix(rangeSpec, "-") || strings.HasSuffix(rangeSpec, "-")
-	if !packagepolicy.Cacheable(decision, err) || !rangeMayFill {
+	if !packagepolicy.Cacheable(decision, err) {
 		mode = codeArtifactCachePassthrough
 	}
-	if mode != codeArtifactCacheLookup {
+	options := client.NewRequestOptions(httputil.ConditionalOptions(r)...)
+	if mode != codeArtifactCacheLookup || options.RangeMayStopEarly() {
 		c.serveOrigin(w, r, mode)
 		return codeArtifactAuditOrigin
 	}

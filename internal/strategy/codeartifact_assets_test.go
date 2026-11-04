@@ -230,14 +230,21 @@ allow if { input.headers["authorization"] == "Bearer caller" }
 		assert.Equal[any](t, tc.written, entry["bytes_written"])
 		assert.Equal[any](t, tc.expected, entry["expected_bytes"])
 	}
-	for _, tc := range []struct{ asset, span, body string }{
-		{"resume.tar", "bytes=2-", "chive"},
-		{"suffix.tar", "bytes=-3", "ive"},
-		{"entire.tar", "bytes=0-", "archive"},
+	for _, tc := range []struct {
+		asset, span, body string
+		status            int
+	}{
+		{"resume.tar", "bytes=2-", "chive", 206},
+		{"suffix.tar", "bytes=-3", "ive", 206},
+		{"entire.tar", "bytes=0-", "archive", 206},
+		{"bounded-eof.tar", "bytes=2-6", "chive", 206},
+		{"bounded-past-eof.tar", "bytes=0-99999999", "archive", 206},
+		{"multi.tar", "bytes=0-1,4-5", "archive", 200},
+		{"invalid.tar", "bytes=a-b", "archive", 200},
 	} {
 		before := calls
 		partial := request("GET", tc.asset, map[string]string{"Range": tc.span})
-		assert.Equal(t, 206, partial.Code)
+		assert.Equal(t, tc.status, partial.Code)
 		assert.Equal(t, tc.body, partial.Body.String())
 		assert.Equal(t, "archive", request("GET", tc.asset, nil).Body.String())
 		assert.Equal(t, before+1, calls)

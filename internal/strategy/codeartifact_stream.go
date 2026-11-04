@@ -33,16 +33,20 @@ func (c *CodeArtifact) streamOriginBody(w http.ResponseWriter, r *http.Request, 
 	reader := &codeArtifactStreamReader{reader: body}
 	written, err := io.Copy(w, reader)
 	if err != nil {
-		c.abortStream(w, r, reader, written, started, err)
+		c.abortStream(w, r, reader, streamBytesWritten(w, written), started, err)
 	}
+}
+
+func streamBytesWritten(w io.Writer, copied int64) int64 {
+	if counter, ok := w.(interface{ BytesWritten() int64 }); ok {
+		return counter.BytesWritten()
+	}
+	return copied
 }
 
 func (c *CodeArtifact) abortStream(w http.ResponseWriter, r *http.Request,
 	reader *codeArtifactStreamReader, written int64, started time.Time, err error,
 ) {
-	if ranged, ok := w.(*codeArtifactRangeWriter); ok {
-		written = ranged.written
-	}
 	stage := "client_write"
 	if reader.err != nil && errors.Is(err, reader.err) {
 		stage = "source_read"
