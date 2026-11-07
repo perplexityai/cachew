@@ -17,15 +17,6 @@ import (
 	cachewmetrics "github.com/block/cachew/internal/metrics"
 )
 
-type codeArtifactAuthEvent string
-
-const (
-	codeArtifactAuthReuse         codeArtifactAuthEvent = "reuse"
-	codeArtifactAuthRefresh       codeArtifactAuthEvent = "refresh"
-	codeArtifactAuthForcedRefresh codeArtifactAuthEvent = "forced_refresh"
-	codeArtifactAuthFailure       codeArtifactAuthEvent = "failure"
-)
-
 type codeArtifactCacheEvent string
 
 const (
@@ -57,7 +48,7 @@ const (
 type codeArtifactMetricRecorder interface {
 	recordRequest(context.Context, codeArtifactCacheMode)
 	recordCache(context.Context, codeArtifactCacheEvent, codeArtifactCacheTier)
-	recordAuth(context.Context, codeArtifactAuthEvent)
+	recordAuth(context.Context, originAuthEvent)
 	recordOrigin(context.Context, codeArtifactOriginObservation)
 	recordRedirect(context.Context, codeArtifactRedirectEvent)
 	recordStreamFailure(context.Context, string, string, string)
@@ -116,7 +107,7 @@ func (m *codeArtifactMetrics) recordCache(ctx context.Context, event codeArtifac
 	))
 }
 
-func (m *codeArtifactMetrics) recordAuth(ctx context.Context, event codeArtifactAuthEvent) {
+func (m *codeArtifactMetrics) recordAuth(ctx context.Context, event originAuthEvent) {
 	m.auth.Add(ctx, 1, metric.WithAttributes(attribute.String("event", string(event))))
 }
 
