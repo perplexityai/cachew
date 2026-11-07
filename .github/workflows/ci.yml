@@ -22,6 +22,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Activate Hermit
         run: ./bin/hermit env --raw >> "$GITHUB_ENV"
+      - name: Install pinned uv for recovery tests
+        run: |
+          archive="$RUNNER_TEMP/cachew-test-uv.tar.gz"
+          curl --fail --location --retry 3 \
+            https://github.com/astral-sh/uv/releases/download/0.13.4/uv-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f "$archive" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/uv-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
       - name: Run tests
         run: just test
   lint:
