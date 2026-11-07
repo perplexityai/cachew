@@ -37,6 +37,10 @@ func (l *loggingMux) HandleFunc(pattern string, handler func(http.ResponseWriter
 	l.mux.HandleFunc(pattern, handler)
 }
 
+func (l *loggingMux) Handler(r *http.Request) (http.Handler, string) {
+	return l.mux.Handler(r)
+}
+
 var _ strategy.Mux = (*loggingMux)(nil)
 
 // Schema returns the configuration file schema.

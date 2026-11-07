@@ -21,8 +21,15 @@ import (
 	cachewmetrics "github.com/block/cachew/internal/metrics"
 )
 
-// CacheResultHeader reports whether CacheW served a request from cache.
+// CacheResultHeader reports whether CacheW served a request from cache, with
+// the value CacheResultHit or CacheResultMiss.
 const CacheResultHeader = "X-Cachew-Result"
+
+// Values of CacheResultHeader.
+const (
+	CacheResultHit  = "hit"
+	CacheResultMiss = "miss"
+)
 
 // CacheKeyParts holds the components used to build a cache key. Path is the
 // primary identifier (typically the upstream URL) and Vary captures
@@ -179,16 +186,16 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, key cache.
 	cr, headers, err := h.cache.Open(r.Context(), key, httputil.ConditionalOptions(r)...)
 	trustedHeaders := maps.Clone(headers)
 	trustedHeaders.Del(CacheResultHeader)
-	w.Header().Set(CacheResultHeader, "hit")
+	w.Header().Set(CacheResultHeader, CacheResultHit)
 	if handled, _, serveErr := httputil.ServeCacheHit(w, trustedHeaders, cr, err); handled {
 		logging.FromContext(r.Context()).DebugContext(r.Context(), "Cache hit")
-		h.recordCacheLookup(r.Context(), "hit")
+		h.recordCacheLookup(r.Context(), CacheResultHit)
 		return true, errors.WithStack(serveErr)
 	}
 	w.Header().Del(CacheResultHeader)
 	if errors.Is(err, os.ErrNotExist) {
-		w.Header().Set(CacheResultHeader, "miss")
-		h.recordCacheLookup(r.Context(), "miss")
+		w.Header().Set(CacheResultHeader, CacheResultMiss)
+		h.recordCacheLookup(r.Context(), CacheResultMiss)
 		return false, nil
 	}
 	h.errorHandler(httputil.Errorf(http.StatusInternalServerError, "failed to open cache: %w", err), w, r)
@@ -260,7 +267,7 @@ func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cac
 	}()
 
 	maps.Copy(w.Header(), responseHeaders)
-	w.Header().Set(CacheResultHeader, "miss")
+	w.Header().Set(CacheResultHeader, CacheResultMiss)
 	_, copyErr := io.Copy(w, pr)
 	closeErr := pr.Close()
 	return errors.Wrap(errors.Join(copyErr, closeErr), "stream and cache response")
