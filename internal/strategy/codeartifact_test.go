@@ -112,7 +112,7 @@ func (s *localTokenServer) requestCount() int {
 	return s.requests
 }
 
-func (s *localTokenServer) tokenManager(now func() time.Time) *codeArtifactTokenManager {
+func (s *localTokenServer) tokenManager(now func() time.Time) *originTokenManager {
 	awsConfig := aws.Config{
 		Credentials: credentials.NewStaticCredentialsProvider("access-key", "secret-key", "session-token"),
 		HTTPClient:  s.server.Client(),
@@ -1181,7 +1181,7 @@ func TestCodeArtifactDoesNotCacheIncompleteResponses(t *testing.T) {
 type recordingCodeArtifactMetrics struct {
 	requests       []codeArtifactCacheMode
 	cache          []recordedCodeArtifactCacheEvent
-	auth           []codeArtifactAuthEvent
+	auth           []originAuthEvent
 	origin         []recordedCodeArtifactOrigin
 	redirect       []codeArtifactRedirectEvent
 	streamFailures [][3]string
@@ -1210,7 +1210,7 @@ func (m *recordingCodeArtifactMetrics) recordCache(
 	m.cache = append(m.cache, recordedCodeArtifactCacheEvent{event: event, tier: tier})
 }
 
-func (m *recordingCodeArtifactMetrics) recordAuth(_ context.Context, event codeArtifactAuthEvent) {
+func (m *recordingCodeArtifactMetrics) recordAuth(_ context.Context, event originAuthEvent) {
 	m.auth = append(m.auth, event)
 }
 
@@ -1259,7 +1259,7 @@ func TestCodeArtifactMetricsExposeOnlyBoundedDecisions(t *testing.T) {
 		{event: codeArtifactCacheMiss, tier: codeArtifactCacheTierNone},
 		{event: codeArtifactCacheNotCacheable, tier: codeArtifactCacheTierNone},
 	}, recorded.cache)
-	assert.Equal(t, []codeArtifactAuthEvent{codeArtifactAuthRefresh, codeArtifactAuthReuse}, recorded.auth)
+	assert.Equal(t, []originAuthEvent{originAuthRefresh, originAuthReuse}, recorded.auth)
 	assert.Equal(t, []recordedCodeArtifactOrigin{
 		{status: "200", format: "other", size: 7},
 		{status: "200", format: "pypi", size: 7},
@@ -1768,7 +1768,7 @@ func TestCodeArtifactTokenReuseContinuesDuringForcedRefresh(t *testing.T) {
 	manager := newCodeArtifactTokenManagerWithClient(config, client, time.Now)
 	first, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
-	forcedResult := make(chan codeArtifactToken, 1)
+	forcedResult := make(chan originToken, 1)
 	forcedError := make(chan error, 1)
 	go func() {
 		token, refreshErr := manager.Token(t.Context(), first.generation)
@@ -1784,7 +1784,7 @@ func TestCodeArtifactTokenReuseContinuesDuringForcedRefresh(t *testing.T) {
 	reused, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
 	assert.Equal(t, first.value, reused.value)
-	assert.Equal(t, codeArtifactAuthReuse, reused.event)
+	assert.Equal(t, originAuthReuse, reused.event)
 	release()
 	assert.NoError(t, <-forcedError)
 	refreshed := <-forcedResult
@@ -1829,7 +1829,7 @@ func TestCodeArtifactTokenReuseContinuesDuringProactiveRefresh(t *testing.T) {
 	assert.NoError(t, err)
 	currentTime = now.Add(11 * time.Hour)
 
-	refreshResult := make(chan codeArtifactToken, 1)
+	refreshResult := make(chan originToken, 1)
 	refreshError := make(chan error, 1)
 	go func() {
 		token, refreshErr := manager.Token(t.Context(), 0)
@@ -1847,12 +1847,12 @@ func TestCodeArtifactTokenReuseContinuesDuringProactiveRefresh(t *testing.T) {
 	reused, err := manager.Token(reuseCtx, 0)
 	assert.NoError(t, err)
 	assert.Equal(t, first.value, reused.value)
-	assert.Equal(t, codeArtifactAuthReuse, reused.event)
+	assert.Equal(t, originAuthReuse, reused.event)
 	release()
 	assert.NoError(t, <-refreshError)
 	refreshed := <-refreshResult
 	assert.Equal(t, "token-2", refreshed.value)
-	assert.Equal(t, codeArtifactAuthRefresh, refreshed.event)
+	assert.Equal(t, originAuthRefresh, refreshed.event)
 	assert.Equal(t, int32(2), requests.Load())
 }
 
@@ -1891,7 +1891,7 @@ func TestCodeArtifactProactiveRefreshOutlivesCallerCancellation(t *testing.T) {
 	assert.NoError(t, err)
 	currentTime = now.Add(11 * time.Hour)
 	requestCtx, cancelRequest := context.WithCancel(t.Context())
-	result := make(chan codeArtifactToken, 1)
+	result := make(chan originToken, 1)
 	resultErr := make(chan error, 1)
 	go func() {
 		token, refreshErr := manager.Token(requestCtx, 0)
@@ -1905,7 +1905,7 @@ func TestCodeArtifactProactiveRefreshOutlivesCallerCancellation(t *testing.T) {
 	assert.NoError(t, <-resultErr)
 	refreshed := <-result
 	assert.Equal(t, "token-2", refreshed.value)
-	assert.Equal(t, codeArtifactAuthRefresh, refreshed.event)
+	assert.Equal(t, originAuthRefresh, refreshed.event)
 	assert.Equal(t, first.generation+1, refreshed.generation)
 	assert.True(t, manager.retryAfter.IsZero())
 }
@@ -1942,7 +1942,7 @@ func TestCodeArtifactRefreshesBeforeExpiration(t *testing.T) {
 			refreshed, err := manager.Token(t.Context(), 0)
 			assert.NoError(t, err)
 			assert.Equal(t, "token-2", refreshed.value)
-			assert.Equal(t, codeArtifactAuthRefresh, refreshed.event)
+			assert.Equal(t, originAuthRefresh, refreshed.event)
 			assert.Equal(t, 2, tokenServer.requestCount())
 		})
 	}
@@ -1965,7 +1965,7 @@ func TestCodeArtifactRefreshFailureFallsBackOnlyToUnrejectedToken(t *testing.T) 
 	assert.NoError(t, err)
 	assert.Equal(t, first.value, fallback.value)
 	assert.Equal(t, first.generation, fallback.generation)
-	assert.Equal(t, codeArtifactAuthFailure, fallback.event)
+	assert.Equal(t, originAuthFailure, fallback.event)
 
 	_, err = manager.Token(t.Context(), first.generation)
 	assert.Error(t, err)
@@ -1999,7 +1999,7 @@ func TestCodeArtifactFailedProactiveRefreshesBackOff(t *testing.T) {
 
 	const callers = 16
 	start := make(chan struct{})
-	tokens := make(chan codeArtifactToken, callers)
+	tokens := make(chan originToken, callers)
 	errorsCh := make(chan error, callers)
 	var wg sync.WaitGroup
 	wg.Add(callers)
@@ -2020,20 +2020,20 @@ func TestCodeArtifactFailedProactiveRefreshesBackOff(t *testing.T) {
 	for tokenErr := range errorsCh {
 		assert.NoError(t, tokenErr)
 	}
-	events := map[codeArtifactAuthEvent]int{}
+	events := map[originAuthEvent]int{}
 	for token := range tokens {
 		assert.Equal(t, first.value, token.value)
 		assert.Equal(t, first.generation, token.generation)
 		events[token.event]++
 	}
-	assert.Equal(t, 1, events[codeArtifactAuthFailure])
-	assert.Equal(t, callers-1, events[codeArtifactAuthReuse])
+	assert.Equal(t, 1, events[originAuthFailure])
+	assert.Equal(t, callers-1, events[originAuthReuse])
 	assert.Equal(t, int32(2), requests.Load(), "failed proactive refreshes should back off")
 
-	currentTime = now.Add(11*time.Hour + codeArtifactTokenRefreshFailureBackoff)
+	currentTime = now.Add(11*time.Hour + originTokenRefreshFailureBackoff)
 	retry, err := manager.Token(t.Context(), 0)
 	assert.NoError(t, err)
-	assert.Equal(t, codeArtifactAuthFailure, retry.event)
+	assert.Equal(t, originAuthFailure, retry.event)
 	assert.Equal(t, int32(3), requests.Load(), "refresh should retry after the backoff")
 }
 

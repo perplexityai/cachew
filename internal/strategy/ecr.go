@@ -99,7 +99,7 @@ type ECR struct {
 	registry     string
 	repositories []string
 	manifestTTL  time.Duration
-	tokens       codeArtifactTokenSource
+	tokens       originTokenSource
 	client       *http.Client // manifests: follows redirects over https
 	blobClient   *http.Client // blobs: returns ECR's redirect unfollowed
 	cache        cache.Cache
@@ -224,7 +224,7 @@ func ecrTokenMinter(client ecrAuthorizationClient) originTokenMinter {
 	}
 }
 
-func newECR(config ECRConfig, tokens codeArtifactTokenSource, base http.RoundTripper, c cache.Cache, mux Mux) (*ECR, error) {
+func newECR(config ECRConfig, tokens originTokenSource, base http.RoundTripper, c cache.Cache, mux Mux) (*ECR, error) {
 	if ecrRouteTaken(mux, "/"+config.Registry+"/v2/") {
 		return nil, errors.Errorf("ecr %s: configured more than once", config.Registry)
 	}
@@ -605,7 +605,7 @@ type ecrFetch struct {
 	repository  string
 	digest      string
 	accept      string
-	token       codeArtifactToken
+	token       originToken
 	strategy    *ECR
 	retried     bool
 	passthrough bool      // blobs: serveBlob reads the status and headers

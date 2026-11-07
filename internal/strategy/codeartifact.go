@@ -56,7 +56,7 @@ type CodeArtifact struct {
 	target                *url.URL
 	proxyBase             *url.URL
 	prefix                string
-	tokens                codeArtifactTokenSource
+	tokens                originTokenSource
 	cache                 cache.Cache
 	client                *http.Client
 	logger                *slog.Logger
@@ -73,13 +73,6 @@ type CodeArtifact struct {
 
 var _ Strategy = (*CodeArtifact)(nil)
 
-type codeArtifactTokenSource interface {
-	// Token returns a usable token. rejectedGeneration is zero for a normal
-	// lookup. When non-zero, it identifies the token generation an origin
-	// rejected so a concurrent refresh can be reused instead of repeated.
-	Token(context.Context, uint64) (codeArtifactToken, error)
-}
-
 func RegisterCodeArtifact(r *Registry) {
 	Register(r, "codeartifact", "Authenticated read-only proxy for AWS CodeArtifact.", NewCodeArtifact)
 }
@@ -93,7 +86,7 @@ func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredC
 	if err != nil {
 		return nil, err
 	}
-	var tokens codeArtifactTokenSource
+	var tokens originTokenSource
 	if !config.AssetAPI {
 		tokens = newCodeArtifactTokenManagerWithClient(config, client, time.Now)
 	}
@@ -120,7 +113,7 @@ func newCodeArtifact(
 	ctx context.Context,
 	config CodeArtifactConfig,
 	mux Mux,
-	tokens codeArtifactTokenSource,
+	tokens originTokenSource,
 	configuredCache cache.Cache,
 	allowHTTP bool,
 ) (*CodeArtifact, error) {
@@ -360,7 +353,7 @@ func (c *CodeArtifact) serveRepository(w http.ResponseWriter, r *http.Request, m
 		}
 		refreshed, refreshErr := c.tokens.Token(r.Context(), token.generation)
 		if refreshErr != nil {
-			c.metric.recordAuth(r.Context(), codeArtifactAuthFailure)
+			c.metric.recordAuth(r.Context(), originAuthFailure)
 			c.writeError(w, r, errors.Wrap(refreshErr, "refresh CodeArtifact authorization"))
 			return
 		}
@@ -426,11 +419,11 @@ func (c *CodeArtifact) serveRepository(w http.ResponseWriter, r *http.Request, m
 	c.streamOriginBody(w, r, resp.Body)
 }
 
-func (c *CodeArtifact) authorizationToken(ctx context.Context) (codeArtifactToken, error) {
+func (c *CodeArtifact) authorizationToken(ctx context.Context) (originToken, error) {
 	token, err := c.tokens.Token(ctx, 0)
 	if err != nil {
-		c.metric.recordAuth(ctx, codeArtifactAuthFailure)
-		return codeArtifactToken{}, errors.Wrap(err, "obtain CodeArtifact authorization")
+		c.metric.recordAuth(ctx, originAuthFailure)
+		return originToken{}, errors.Wrap(err, "obtain CodeArtifact authorization")
 	}
 	c.metric.recordAuth(ctx, token.event)
 	return token, nil

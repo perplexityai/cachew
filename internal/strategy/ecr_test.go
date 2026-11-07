@@ -174,7 +174,7 @@ func (p pinTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // fakeTokens mints tok-1, tok-2, ... and advances only when the current
-// generation is rejected, as codeArtifactTokenManager does.
+// generation is rejected, as originTokenManager does.
 type fakeTokens struct {
 	mu       sync.Mutex
 	gen      uint64
@@ -182,17 +182,17 @@ type fakeTokens struct {
 	err      error
 }
 
-func (f *fakeTokens) Token(_ context.Context, rejected uint64) (codeArtifactToken, error) {
+func (f *fakeTokens) Token(_ context.Context, rejected uint64) (originToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rejected = append(f.rejected, rejected)
 	if f.err != nil {
-		return codeArtifactToken{}, f.err
+		return originToken{}, f.err
 	}
 	if f.gen == 0 || (rejected != 0 && rejected >= f.gen) {
 		f.gen++
 	}
-	return codeArtifactToken{value: "tok-" + string(rune('0'+f.gen)), generation: f.gen}, nil
+	return originToken{value: "tok-" + string(rune('0'+f.gen)), generation: f.gen}, nil
 }
 
 type ecrTest struct {
@@ -532,11 +532,11 @@ func TestECRRetriesOnceWithAFreshToken(t *testing.T) {
 // scriptedTokens returns its tokens in order, then repeats the last one.
 type scriptedTokens struct {
 	mu       sync.Mutex
-	script   []codeArtifactToken
+	script   []originToken
 	rejected []uint64
 }
 
-func (s *scriptedTokens) Token(_ context.Context, rejected uint64) (codeArtifactToken, error) {
+func (s *scriptedTokens) Token(_ context.Context, rejected uint64) (originToken, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rejected = append(s.rejected, rejected)
@@ -551,7 +551,7 @@ func TestECRReusesATokenAnotherRequestMinted(t *testing.T) {
 	e := setupECRTest(t, func(f *fakeECR) { f.acceptedToken = "tok-2" })
 	// This request started with tok-1 while another one, rejected a moment
 	// earlier, used up the refresh interval minting tok-2.
-	tokens := &scriptedTokens{script: []codeArtifactToken{{value: "tok-1", generation: 1}, {value: "tok-2", generation: 2}}}
+	tokens := &scriptedTokens{script: []originToken{{value: "tok-1", generation: 1}, {value: "tok-2", generation: 2}}}
 	e.ecr.tokens = tokens
 	e.ecr.lastForcedRefresh.Store(time.Now().UnixNano())
 
