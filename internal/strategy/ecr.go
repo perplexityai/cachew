@@ -112,6 +112,7 @@ type ECR struct {
 	blobClient   *http.Client // blobs: returns ECR's redirect unfollowed
 	cache        cache.Cache
 	handler      *handler.Handler
+	metric       ecrMetricRecorder
 	now          func() time.Time
 	// lastForcedRefresh is the UnixNano time of the last refresh a rejection
 	// triggered; see ecrForcedRefreshInterval.
@@ -250,8 +251,9 @@ func newECR(config ECRConfig, tokens originTokenSource, base http.RoundTripper, 
 			Transport:     transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		cache: c,
-		now:   time.Now,
+		cache:  c,
+		metric: newECRMetrics(),
+		now:    time.Now,
 	}
 	s.handler = handler.New(s.client, c, spools).
 		CacheKey(func(r *http.Request) string {
@@ -277,19 +279,32 @@ func newECR(config ECRConfig, tokens originTokenSource, base http.RoundTripper, 
 			servePing(w, r)
 			return
 		}
+		ctx, observation := withECRObservation(r.Context())
+		r = r.WithContext(ctx)
+		rw := &ecrResponse{ResponseWriter: w}
+		kind := ecrKindUnknown
+		defer func() {
+			s.metric.recordRequest(context.WithoutCancel(ctx), observation.outcome(kind, r.Method, rw.status, rw.Header().Get(handler.CacheResultHeader)))
+		}()
 		// Reject anything but a digest path before the cache is consulted, so an
 		// entry another strategy wrote under a similar key can never be served here.
 		ref, err := parseECRPath(rest)
 		if err != nil {
-			http.Error(w, err.Error()+": only /v2/<name>/manifests/sha256:<digest> and /v2/<name>/blobs/sha256:<digest> are served", http.StatusNotFound)
+			observation.refuse()
+			http.Error(rw, err.Error()+": only /v2/<name>/manifests/sha256:<digest> and /v2/<name>/blobs/sha256:<digest> are served", http.StatusNotFound)
 			return
 		}
+		kind = ecrKindManifest
+		if ref.kind == ecrBlobs {
+			kind = ecrKindBlob
+		}
 		if !s.allowed(ref.name) {
-			http.Error(w, "repository is not served by this proxy", http.StatusNotFound)
+			observation.refuse()
+			http.Error(rw, "repository is not served by this proxy", http.StatusNotFound)
 			return
 		}
 		if ref.kind == ecrBlobs {
-			s.serveBlob(w, r, ref)
+			s.serveBlob(rw, r, ref)
 			return
 		}
 		// The upstream fetch is always identity-encoded, so the handler must
@@ -301,10 +316,10 @@ func newECR(config ECRConfig, tokens originTokenSource, base http.RoundTripper, 
 		r.Header.Del("Range")
 		r.Header.Del("If-Range")
 		if r.Method == http.MethodHead {
-			s.serveManifestHead(w, r, ref)
+			s.serveManifestHead(rw, r, ref)
 			return
 		}
-		s.handler.ServeHTTP(&hideExpiry{ResponseWriter: w}, r)
+		s.handler.ServeHTTP(rw, r)
 	})
 	// GET patterns also match HEAD. Clients such as go-containerregistry, Helm
 	// and Docker want the registry at the host root; containerd mirrors can use
@@ -342,7 +357,7 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		raw := resp.Header.Get("Location")
 		location, err := url.Parse(raw)
 		if err != nil || location.Scheme != ecrSchemeHTTPS || location.Host == "" {
-			s.blobFailure(w, r, "ECR blob redirect is not an absolute https URL", resp.StatusCode)
+			s.blobFailure(w, r, ecrFailureBadRedirect, "ECR blob redirect is not an absolute https URL", resp.StatusCode)
 			return
 		}
 		// Copied verbatim: re-serializing could change the signed URL.
@@ -352,11 +367,11 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		w.WriteHeader(http.StatusTemporaryRedirect)
 	case r.Method == http.MethodHead && resp.StatusCode == http.StatusOK:
 		if digest := resp.Header.Get("Docker-Content-Digest"); digest != ref.digest {
-			s.blobFailure(w, r, "ECR reported a different digest for the blob", resp.StatusCode)
+			s.blobFailure(w, r, ecrFailureDigestMismatch, "ECR reported a different digest for the blob", resp.StatusCode)
 			return
 		}
 		if resp.ContentLength < 0 {
-			s.blobFailure(w, r, "ECR blob HEAD has no Content-Length", resp.StatusCode)
+			s.blobFailure(w, r, ecrFailureNoLength, "ECR blob HEAD has no Content-Length", resp.StatusCode)
 			return
 		}
 		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
@@ -370,15 +385,16 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		}
 		http.Error(w, http.StatusText(resp.StatusCode), resp.StatusCode)
 	default:
-		s.blobFailure(w, r, "unexpected ECR blob response", resp.StatusCode)
+		s.blobFailure(w, r, ecrFailureUpstreamStatus, "unexpected ECR blob response", resp.StatusCode)
 	}
 }
 
 // blobFailure logs the upstream status and answers 502. It never logs or echoes
 // the Location, which carries a presigned credential.
-func (s *ECR) blobFailure(w http.ResponseWriter, r *http.Request, reason string, status int) {
-	logging.FromContext(r.Context()).ErrorContext(r.Context(), reason, "registry", s.registry, "method", r.Method, "status", status)
-	http.Error(w, reason, http.StatusBadGateway)
+func (s *ECR) blobFailure(w http.ResponseWriter, r *http.Request, reason ecrFailureReason, msg string, status int) {
+	ecrObservationFrom(r.Context()).fail(reason)
+	logging.FromContext(r.Context()).ErrorContext(r.Context(), msg, "registry", s.registry, "method", r.Method, "status", status)
+	http.Error(w, msg, http.StatusBadGateway)
 }
 
 // serveManifestHead answers a manifest HEAD from the cache entry's metadata. On
@@ -408,6 +424,7 @@ func (s *ECR) serveManifestHead(w http.ResponseWriter, r *http.Request, ref ecrR
 		if errors.Is(err, os.ErrNotExist) {
 			if !fill.complete() {
 				// The fill was cut short: the bytes did not match the digest.
+				ecrObservationFrom(r.Context()).fail(ecrFailureDigestMismatch)
 				httputil.ErrorResponse(w, r, http.StatusBadGateway, "ECR returned bytes that do not match "+ref.digest)
 				return
 			}
@@ -422,6 +439,7 @@ func (s *ECR) serveManifestHead(w http.ResponseWriter, r *http.Request, ref ecrR
 	w.Header().Set(handler.CacheResultHeader, result)
 	if !httputil.ServeCacheStat(w, headers, err) {
 		w.Header().Del(handler.CacheResultHeader)
+		ecrObservationFrom(r.Context()).fail(ecrFailureInternal)
 		logging.FromContext(r.Context()).ErrorContext(r.Context(), "Failed to stat ECR cache entry", "error", err)
 		http.Error(w, "cache unavailable", http.StatusInternalServerError)
 	}
@@ -473,21 +491,24 @@ func (r *statusRecorder) complete() bool {
 	return ok && err == nil && r.written == length
 }
 
-// hideExpiry keeps the cache's internal expiry header out of client responses.
-type hideExpiry struct {
+// ecrResponse keeps the cache's internal expiry header out of client responses
+// and remembers the status for metrics.
+type ecrResponse struct {
 	http.ResponseWriter
 	wroteHeader bool
+	status      int
 }
 
-func (w *hideExpiry) WriteHeader(status int) {
+func (w *ecrResponse) WriteHeader(status int) {
 	if !w.wroteHeader {
 		w.wroteHeader = true
+		w.status = status
 		w.Header().Del(cache.ExpirationKey)
 	}
 	w.ResponseWriter.WriteHeader(status)
 }
 
-func (w *hideExpiry) Write(p []byte) (int, error) {
+func (w *ecrResponse) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
@@ -495,14 +516,14 @@ func (w *hideExpiry) Write(p []byte) (int, error) {
 }
 
 // ReadFrom keeps the server's sendfile path for disk-cache hits.
-func (w *hideExpiry) ReadFrom(r io.Reader) (int64, error) {
+func (w *ecrResponse) ReadFrom(r io.Reader) (int64, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
 	return io.Copy(w.ResponseWriter, r) //nolint:wrapcheck // ResponseWriter callers expect its errors unwrapped.
 }
 
-func (w *hideExpiry) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *ecrResponse) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (s *ECR) String() string { return "ecr:" + s.registry }
 
@@ -529,6 +550,7 @@ func (s *ECR) allowed(name string) bool {
 // errors can quote a raw Location, which may be a presigned S3 URL. Only this
 // strategy's errors, which name hosts alone, are echoed.
 func writeECRError(err error, w http.ResponseWriter, r *http.Request) {
+	ecrObservationFrom(r.Context()).fail(ecrFailureFor(r.Context(), err))
 	for _, logged := range []error{errECRRejected, errECRRefresh} {
 		if errors.Is(err, logged) {
 			// The transport already logged it with its detail.
@@ -549,6 +571,30 @@ func writeECRError(err error, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httputil.ErrorResponse(w, r, http.StatusInternalServerError, err.Error())
+}
+
+func ecrFailureFor(ctx context.Context, err error) ecrFailureReason {
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		// Whatever failed, the client had already gone.
+		return ecrFailureClientCanceled
+	case errors.Is(err, errECRRejected):
+		return ecrFailureRejected
+	case errors.Is(err, errECRRefresh):
+		return ecrFailureAuthorization
+	case errors.Is(err, errDigestFailed):
+		return ecrFailureDigestMismatch
+	case errors.Is(err, errNoLength):
+		return ecrFailureNoLength
+	case errors.Is(err, errPartial):
+		return ecrFailurePartial
+	case errors.Is(err, errTooManyHops), errors.Is(err, errInsecureHop):
+		return ecrFailureBadRedirect
+	case errors.Is(err, errECRTransport):
+		return ecrFailureReason(originTransportStatus(ctx, err))
+	default:
+		return ecrFailureInternal
+	}
 }
 
 func ecrOwnError(err error) bool {
@@ -595,7 +641,13 @@ func parseECRPath(rest string) (ecrRef, error) {
 // token to the registry only, and verifies manifest bytes.
 func (s *ECR) request(ctx context.Context, ref ecrRef, method string) (*http.Request, error) {
 	token, err := s.tokens.Token(ctx, 0)
+	s.recordAuth(ctx, token, err)
 	if err != nil {
+		reason := ecrFailureAuthorization
+		if errors.Is(ctx.Err(), context.Canceled) {
+			reason = ecrFailureClientCanceled
+		}
+		ecrObservationFrom(ctx).fail(reason)
 		// AWS errors name the role and account; log them, answer with the status.
 		logging.FromContext(ctx).ErrorContext(ctx, "Failed to obtain ECR authorization", "error", err)
 		return nil, httputil.Errorf(http.StatusBadGateway, "could not obtain ECR authorization")
@@ -637,6 +689,15 @@ type ecrFetch struct {
 	retried     bool
 	passthrough bool      // blobs: serveBlob reads the status and headers
 	expiresAt   time.Time // zero for blobs
+}
+
+func (s *ECR) recordAuth(ctx context.Context, token originToken, err error) {
+	switch {
+	case err != nil:
+		s.metric.recordAuth(ctx, originAuthFailure)
+	case token.event != "":
+		s.metric.recordAuth(ctx, token.event)
+	}
 }
 
 // allowForcedRefresh reports whether a rejection may mint a new token now.
@@ -729,6 +790,7 @@ func (t ecrTransport) retryRejected(req *http.Request, resp *http.Response, fetc
 		rejectedGeneration = fetch.token.generation
 	}
 	refreshed, err := fetch.strategy.tokens.Token(req.Context(), rejectedGeneration)
+	fetch.strategy.recordAuth(req.Context(), refreshed, err)
 	if err != nil {
 		_ = resp.Body.Close()
 		logging.FromContext(req.Context()).ErrorContext(req.Context(), "Failed to refresh ECR authorization", "error", err)
@@ -756,7 +818,9 @@ func verifyECRResponse(req *http.Request, resp *http.Response, fetch *ecrFetch) 
 		_ = resp.Body.Close()
 		return nil, errors.Wrapf(errDigestFailed, "%s returned an empty body for sha256:%s", req.URL.Host, expected)
 	}
-	resp.Body = &digestVerifyingBody{ReadCloser: resp.Body, hash: sha256.New(), expected: expected}
+	resp.Body = &digestVerifyingBody{
+		ReadCloser: resp.Body, hash: sha256.New(), expected: expected, observation: ecrObservationFrom(req.Context()),
+	}
 	// ECR sends this on HEAD but not on GET for manifests; clients that verify
 	// or resolve by it expect it on both, and the digest is checked as it streams.
 	resp.Header.Set("Docker-Content-Digest", fetch.digest)
@@ -812,6 +876,8 @@ type digestVerifyingBody struct {
 	held     []byte
 	verified bool
 	failed   error
+	// observation records a mismatch, which the client sees only as a short body.
+	observation *ecrObservation
 }
 
 func (b *digestVerifyingBody) Read(p []byte) (int, error) {
@@ -830,6 +896,7 @@ func (b *digestVerifyingBody) Read(p []byte) (int, error) {
 		if errors.Is(err, io.EOF) {
 			if actual := hex.EncodeToString(b.hash.Sum(nil)); actual != b.expected {
 				b.held = nil
+				b.observation.fail(ecrFailureDigestMismatch)
 				b.failed = errors.Wrapf(errDigestFailed, "expected sha256:%s, got sha256:%s", b.expected, actual)
 				return 0, b.failed
 			}

@@ -90,6 +90,6 @@ func codeArtifactBodyError(ctx context.Context, err error) string {
 	case errors.Is(err, syscall.EPIPE):
 		return "broken_pipe"
 	default:
-		return codeArtifactTransportStatus(ctx, err)
+		return originTransportStatus(ctx, err)
 	}
 }
