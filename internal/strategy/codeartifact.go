@@ -23,7 +23,10 @@ import (
 	"github.com/block/cachew/internal/packagepolicy"
 )
 
-const codeArtifactUsername = "aws"
+const (
+	codeArtifactUsername             = "aws"
+	codeArtifactStatusClientCanceled = "client_canceled"
+)
 
 const (
 	defaultCodeArtifactOriginHeaderTimeout   = 30 * time.Second
@@ -611,7 +614,7 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 
 func codeArtifactTransportStatus(ctx context.Context, err error) string {
 	if errors.Is(ctx.Err(), context.Canceled) {
-		return "client_canceled"
+		return codeArtifactStatusClientCanceled
 	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
