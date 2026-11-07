@@ -40,7 +40,7 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 	started := time.Now()
 	output, err := c.assets.client.GetPackageVersionAsset(ctx, input)
 	if err != nil {
-		status := codeArtifactTransportStatus(ctx, err)
+		status := originTransportStatus(ctx, err)
 		var responseError *smithyhttp.ResponseError
 		if errors.As(err, &responseError) {
 			status = strconv.Itoa(responseError.HTTPStatusCode())
