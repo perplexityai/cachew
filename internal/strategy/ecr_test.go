@@ -189,19 +189,38 @@ func (f *fakeTokens) Token(_ context.Context, rejected uint64) (originToken, err
 	if f.err != nil {
 		return originToken{}, f.err
 	}
+	event := originAuthReuse
 	if f.gen == 0 || (rejected != 0 && rejected >= f.gen) {
+		event = originAuthRefresh
+		if f.gen != 0 {
+			event = originAuthForcedRefresh
+		}
 		f.gen++
 	}
-	return originToken{value: "tok-" + string(rune('0'+f.gen)), generation: f.gen}, nil
+	return originToken{value: "tok-" + string(rune('0'+f.gen)), generation: f.gen, event: event}, nil
+}
+
+type recordingECRMetrics struct {
+	requests []ecrRequestOutcome
+	auth     []originAuthEvent
+}
+
+func (m *recordingECRMetrics) recordRequest(_ context.Context, outcome ecrRequestOutcome) {
+	m.requests = append(m.requests, outcome)
+}
+
+func (m *recordingECRMetrics) recordAuth(_ context.Context, event originAuthEvent) {
+	m.auth = append(m.auth, event)
 }
 
 type ecrTest struct {
-	fake   *fakeECR
-	mux    *http.ServeMux
-	cache  cache.Cache
-	ctx    context.Context
-	tokens *fakeTokens
-	ecr    *ECR
+	fake    *fakeECR
+	mux     *http.ServeMux
+	cache   cache.Cache
+	ctx     context.Context
+	tokens  *fakeTokens
+	ecr     *ECR
+	metrics *recordingECRMetrics
 }
 
 func setupECRTest(t *testing.T, configure func(*fakeECR)) *ecrTest {
@@ -235,7 +254,9 @@ func setupECRTestWith(t *testing.T, configure func(*fakeECR), override cache.Cac
 	s, err := newECR(config, tokens, pinTransport{backend: fake.server}, c, mux)
 	assert.NoError(t, err)
 	assert.Equal(t, "ecr:"+testECRRegistry, s.String())
-	return &ecrTest{fake: fake, mux: mux, cache: c, ctx: ctx, tokens: tokens, ecr: s}
+	metrics := &recordingECRMetrics{}
+	s.metric = metrics
+	return &ecrTest{fake: fake, mux: mux, cache: c, ctx: ctx, tokens: tokens, ecr: s, metrics: metrics}
 }
 
 func (e *ecrTest) do(method, path string, headers ...string) *httptest.ResponseRecorder {
@@ -747,4 +768,98 @@ func TestECRTokenMinterFeedsTheTokenManager(t *testing.T) {
 	_, err = manager.Token(ctx, 0)
 	assert.IsError(t, err, denied)
 	assert.Contains(t, err.Error(), "mint ECR authorization token")
+}
+
+func TestECRMetricsRecordEachRequestOutcome(t *testing.T) {
+	e := setupECRTest(t, func(*fakeECR) {})
+	manifest := "/v2/" + testECRName + "/manifests/" + testDigest(e.fake.manifest)
+	blob := "/v2/" + testECRName + "/blobs/" + testDigest(e.fake.blob)
+	e.do(http.MethodGet, manifest)
+	e.do(http.MethodGet, manifest)
+	e.do(http.MethodHead, manifest)
+	e.do(http.MethodGet, blob)
+	e.do(http.MethodHead, blob)
+	e.do(http.MethodGet, "/v2/"+testECRName+"/manifests/sha256:"+strings.Repeat("0", 64))
+	e.do(http.MethodGet, "/v2/"+testECRName+"/tags/list")
+	e.do(http.MethodGet, "/v2/ecr-public/other/chart/blobs/"+testDigest(e.fake.blob))
+	e.do(http.MethodGet, "/v2/")
+	e.fake.tooMany = true
+	e.do(http.MethodGet, blob)
+
+	assert.Equal(t, []ecrRequestOutcome{
+		{kind: ecrKindManifest, method: http.MethodGet, result: ecrResultMiss},
+		{kind: ecrKindManifest, method: http.MethodGet, result: ecrResultHit},
+		{kind: ecrKindManifest, method: http.MethodHead, result: ecrResultHit},
+		{kind: ecrKindBlob, method: http.MethodGet, result: ecrResultRedirect},
+		{kind: ecrKindBlob, method: http.MethodHead, result: ecrResultMetadata},
+		{kind: ecrKindManifest, method: http.MethodGet, result: ecrResultNotFound},
+		{kind: ecrKindUnknown, method: http.MethodGet, result: ecrResultNotServed},
+		{kind: ecrKindBlob, method: http.MethodGet, result: ecrResultNotServed},
+		{kind: ecrKindBlob, method: http.MethodGet, result: ecrResultRateLimited},
+	}, e.metrics.requests, "the version check is not counted")
+	assert.Equal(t, []originAuthEvent{originAuthRefresh, originAuthReuse, originAuthReuse, originAuthReuse, originAuthReuse}, e.metrics.auth,
+		"cache hits and refused requests use no token")
+}
+
+func TestECRMetricsRecordWhyARequestFailed(t *testing.T) {
+	manifest := func(e *ecrTest) string { return "/v2/" + testECRName + "/manifests/" + testDigest(e.fake.manifest) }
+	blob := func(e *ecrTest) string { return "/v2/" + testECRName + "/blobs/" + testDigest(e.fake.blob) }
+	for name, tc := range map[string]struct {
+		configure func(*ecrTest)
+		method    string
+		path      func(*ecrTest) string
+		kind      string
+		reason    ecrFailureReason
+	}{
+		"manifest bytes that do not match": {
+			method: http.MethodGet, kind: ecrKindManifest, reason: ecrFailureDigestMismatch,
+			path: func(*ecrTest) string { return "/v2/" + testECRName + "/manifests/" + testDigest([]byte("other")) },
+		},
+		"manifest without Content-Length": {
+			configure: func(e *ecrTest) { e.fake.chunked = true },
+			method:    http.MethodGet, path: manifest, kind: ecrKindManifest, reason: ecrFailureNoLength,
+		},
+		"partial manifest": {
+			configure: func(e *ecrTest) { e.fake.partial = true },
+			method:    http.MethodGet, path: manifest, kind: ecrKindManifest, reason: ecrFailurePartial,
+		},
+		"token rejected after a refresh": {
+			configure: func(e *ecrTest) { e.fake.acceptedToken = "never" },
+			method:    http.MethodGet, path: manifest, kind: ecrKindManifest, reason: ecrFailureRejected,
+		},
+		"no token": {
+			configure: func(e *ecrTest) { e.tokens.err = errors.New("AccessDenied") },
+			method:    http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureAuthorization,
+		},
+		"plain http redirect": {
+			configure: func(e *ecrTest) { e.fake.insecureS3 = true },
+			method:    http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureBadRedirect,
+		},
+		"blob HEAD for another digest": {
+			configure: func(e *ecrTest) { e.fake.headDigest = testDigest([]byte("other")) },
+			method:    http.MethodHead, path: blob, kind: ecrKindBlob, reason: ecrFailureDigestMismatch,
+		},
+		"blob bytes instead of a redirect": {
+			configure: func(e *ecrTest) { e.fake.noRedirect = true },
+			method:    http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureUpstreamStatus,
+		},
+		"ECR unreachable": {
+			configure: func(e *ecrTest) { e.fake.server.Close() },
+			method:    http.MethodGet, path: manifest, kind: ecrKindManifest, reason: ecrFailureTransport,
+		},
+	} {
+		e := setupECRTest(t, func(*fakeECR) {})
+		if tc.configure != nil {
+			tc.configure(e)
+		}
+		e.do(tc.method, tc.path(e))
+		assert.Equal(t, []ecrRequestOutcome{{kind: tc.kind, method: tc.method, result: ecrResultFailure, reason: tc.reason}}, e.metrics.requests, name)
+	}
+
+	e := setupECRTest(t, func(f *fakeECR) { f.acceptedToken = "never" })
+	e.do(http.MethodGet, blob(e))
+	assert.Equal(t, []originAuthEvent{originAuthRefresh, originAuthForcedRefresh}, e.metrics.auth, "a rejection's refresh is counted as forced")
+	e.tokens.err = errors.New("AccessDenied")
+	e.do(http.MethodGet, blob(e))
+	assert.Equal(t, originAuthFailure, e.metrics.auth[len(e.metrics.auth)-1])
 }

@@ -79,6 +79,14 @@ Read-only proxy for one Amazon ECR registry, including its pull-through cache re
 - The registry at the host root (`go-containerregistry`, Helm, Docker) or under `/{registry}/v2/` (containerd `override_path`). Only one `ecr` block can own the root; set `prefix-only` on the others.
 - Helm needs a release that pulls `oci://<host>/<repo>@sha256:<digest>` without listing tags. Digest pulls arrived in 3.17, and 3.19 is tested; 3.16 calls `tags/list` first and fails on the proxy's `404`, since tags are not served.
 
+**Metrics**
+
+- `cachew.ecr.requests_total` counts requests by `kind` (`manifest`, `blob`, or `unknown` for a path that names neither), `method` and `result`: `hit` or `miss` for manifests, `redirect` for blob `GET`s, `metadata` for blob `HEAD`s, `not_found`, `rate_limited`, `not_served` for paths and repositories the proxy refuses, or `failure`. The version check is not counted.
+- `cachew.ecr.failures_total` counts each failure by `kind` and `reason`: `digest_mismatch`, `no_length`, `partial`, `rejected` (ECR refused the proxy's token), `authorization` (no token could be minted or refreshed), `bad_redirect`, `transport`, `upstream_status`, `cache`, or `internal`. A manifest whose bytes fail verification is a failure even though its `200` was already sent.
+- `cachew.ecr.auth_events_total` counts token `reuse`, `refresh`, `forced_refresh` (after a rejection) and `failure` events.
+
+Repository names and digests are never labels.
+
 Cache hits are not re-hashed, so keep remote `/api/v1/object` writes denied for the `ecr` namespace (the default policy denies remote `/api`); the trust model matches `host` and `codeartifact`.
 
 ```hcl
