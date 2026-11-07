@@ -22,7 +22,10 @@ import (
 	"github.com/block/cachew/internal/packagepolicy"
 )
 
-const codeArtifactUsername = "aws"
+const (
+	codeArtifactUsername             = "aws"
+	codeArtifactStatusClientCanceled = "client_canceled"
+)
 
 const (
 	defaultCodeArtifactOriginHeaderTimeout   = 30 * time.Second
