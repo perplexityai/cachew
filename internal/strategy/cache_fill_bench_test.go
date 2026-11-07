@@ -17,8 +17,8 @@ import (
 
 type benchmarkCodeArtifactTokens struct{}
 
-func (benchmarkCodeArtifactTokens) Token(context.Context, uint64) (codeArtifactToken, error) {
-	return codeArtifactToken{value: "benchmark", event: codeArtifactAuthReuse}, nil
+func (benchmarkCodeArtifactTokens) Token(context.Context, uint64) (originToken, error) {
+	return originToken{value: "benchmark", event: originAuthReuse}, nil
 }
 
 func BenchmarkCodeArtifactFill(b *testing.B) {
