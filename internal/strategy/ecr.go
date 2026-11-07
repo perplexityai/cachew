@@ -276,7 +276,7 @@ func newECR(config ECRConfig, tokens originTokenSource, base http.RoundTripper, 
 		rw := &ecrResponse{ResponseWriter: w}
 		kind := ecrKindUnknown
 		defer func() {
-			s.metric.recordRequest(ctx, observation.outcome(kind, r.Method, rw.status, rw.Header().Get(handler.CacheResultHeader)))
+			s.metric.recordRequest(context.WithoutCancel(ctx), observation.outcome(kind, r.Method, rw.status, rw.Header().Get(handler.CacheResultHeader)))
 		}()
 		// Reject anything but a digest path before the cache is consulted, so an
 		// entry another strategy wrote under a similar key can never be served here.
@@ -426,7 +426,7 @@ func (s *ECR) serveManifestHead(w http.ResponseWriter, r *http.Request, ref ecrR
 	w.Header().Set(handler.CacheResultHeader, result)
 	if !httputil.ServeCacheStat(w, headers, err) {
 		w.Header().Del(handler.CacheResultHeader)
-		ecrObservationFrom(r.Context()).fail(ecrFailureCache)
+		ecrObservationFrom(r.Context()).fail(ecrFailureInternal)
 		logging.FromContext(r.Context()).ErrorContext(r.Context(), "Failed to stat ECR cache entry", "error", err)
 		http.Error(w, "cache unavailable", http.StatusInternalServerError)
 	}
@@ -523,7 +523,7 @@ func (s *ECR) allowed(name string) bool {
 // errors can quote a raw Location, which may be a presigned S3 URL. Only this
 // strategy's errors, which name hosts alone, are echoed.
 func writeECRError(err error, w http.ResponseWriter, r *http.Request) {
-	ecrObservationFrom(r.Context()).fail(ecrFailureFor(err))
+	ecrObservationFrom(r.Context()).fail(ecrFailureFor(r.Context(), err))
 	for _, logged := range []error{errECRRejected, errECRRefresh} {
 		if errors.Is(err, logged) {
 			// The transport already logged it with its detail.
@@ -546,8 +546,11 @@ func writeECRError(err error, w http.ResponseWriter, r *http.Request) {
 	httputil.ErrorResponse(w, r, http.StatusInternalServerError, err.Error())
 }
 
-func ecrFailureFor(err error) ecrFailureReason {
+func ecrFailureFor(ctx context.Context, err error) ecrFailureReason {
 	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		// Whatever failed, the client had already gone.
+		return ecrFailureClientCanceled
 	case errors.Is(err, errECRRejected):
 		return ecrFailureRejected
 	case errors.Is(err, errECRRefresh):
@@ -561,7 +564,7 @@ func ecrFailureFor(err error) ecrFailureReason {
 	case errors.Is(err, errTooManyHops), errors.Is(err, errInsecureHop):
 		return ecrFailureBadRedirect
 	case errors.Is(err, errECRTransport):
-		return ecrFailureTransport
+		return ecrFailureReason(originTransportStatus(ctx, err))
 	default:
 		return ecrFailureInternal
 	}
@@ -613,7 +616,11 @@ func (s *ECR) request(ctx context.Context, ref ecrRef, method string) (*http.Req
 	token, err := s.tokens.Token(ctx, 0)
 	s.recordAuth(ctx, token, err)
 	if err != nil {
-		ecrObservationFrom(ctx).fail(ecrFailureAuthorization)
+		reason := ecrFailureAuthorization
+		if errors.Is(ctx.Err(), context.Canceled) {
+			reason = ecrFailureClientCanceled
+		}
+		ecrObservationFrom(ctx).fail(reason)
 		// AWS errors name the role and account; log them, answer with the status.
 		logging.FromContext(ctx).ErrorContext(ctx, "Failed to obtain ECR authorization", "error", err)
 		return nil, httputil.Errorf(http.StatusBadGateway, "could not obtain ECR authorization")

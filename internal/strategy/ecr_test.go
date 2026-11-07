@@ -845,7 +845,15 @@ func TestECRMetricsRecordWhyARequestFailed(t *testing.T) {
 		},
 		"ECR unreachable": {
 			configure: func(e *ecrTest) { e.fake.server.Close() },
-			method:    http.MethodGet, path: manifest, kind: ecrKindManifest, reason: ecrFailureTransport,
+			method:    http.MethodGet, path: manifest, kind: ecrKindManifest, reason: "transport_connection",
+		},
+		"client gone before ECR answered": {
+			configure: func(e *ecrTest) {
+				ctx, cancel := context.WithCancel(e.ctx)
+				cancel()
+				e.ctx = ctx
+			},
+			method: http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureClientCanceled,
 		},
 	} {
 		e := setupECRTest(t, func(*fakeECR) {})

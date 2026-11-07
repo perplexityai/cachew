@@ -35,10 +35,13 @@ const (
 	ecrFailureRejected       ecrFailureReason = "rejected"
 	ecrFailureAuthorization  ecrFailureReason = "authorization"
 	ecrFailureBadRedirect    ecrFailureReason = "bad_redirect"
-	ecrFailureTransport      ecrFailureReason = "transport"
 	ecrFailureUpstreamStatus ecrFailureReason = "upstream_status"
-	ecrFailureCache          ecrFailureReason = "cache"
 	ecrFailureInternal       ecrFailureReason = "internal"
+	// The client went away first; not a proxy or ECR failure.
+	ecrFailureClientCanceled ecrFailureReason = "client_canceled"
+	// Other transport failures are labeled by originTransportStatus, as in the
+	// codeartifact metrics: transport_timeout, transport_dns,
+	// transport_connection or transport_error.
 )
 
 const (

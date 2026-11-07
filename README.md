@@ -82,7 +82,7 @@ Read-only proxy for one Amazon ECR registry, including its pull-through cache re
 **Metrics**
 
 - `cachew.ecr.requests_total` counts requests by `kind` (`manifest`, `blob`, or `unknown` for a path that names neither), `method` and `result`: `hit` or `miss` for manifests, `redirect` for blob `GET`s, `metadata` for blob `HEAD`s, `not_found`, `rate_limited`, `not_served` for paths and repositories the proxy refuses, or `failure`. The version check is not counted.
-- `cachew.ecr.failures_total` counts each failure by `kind` and `reason`: `digest_mismatch`, `no_length`, `partial`, `rejected` (ECR refused the proxy's token), `authorization` (no token could be minted or refreshed), `bad_redirect`, `transport`, `upstream_status`, `cache`, or `internal`. A manifest whose bytes fail verification is a failure even though its `200` was already sent.
+- `cachew.ecr.failures_total` counts each failure by `kind` and `reason`: `digest_mismatch`, `no_length`, `partial`, `rejected` (ECR refused the proxy's token), `authorization` (no token could be minted or refreshed), `bad_redirect`, `upstream_status` (any other ECR error status), `internal` (a cache or request error), `client_canceled` (the client left first), or, when the connection to ECR or S3 failed, the same `transport_timeout`, `transport_dns`, `transport_connection` and `transport_error` statuses the CodeArtifact metrics use. A manifest whose bytes fail verification is a failure even though its `200` was already sent.
 - `cachew.ecr.auth_events_total` counts token `reuse`, `refresh`, `forced_refresh` (after a rejection) and `failure` events.
 
 Repository names and digests are never labels.

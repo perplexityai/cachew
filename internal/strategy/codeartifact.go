@@ -3,7 +3,6 @@ package strategy
 import (
 	"context"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -497,7 +496,7 @@ func (c *CodeArtifact) do(r *http.Request, token string) (*http.Response, error)
 	resp, err := c.client.Do(upstream)
 	if err != nil {
 		cancel(nil)
-		status := codeArtifactTransportStatus(r.Context(), err)
+		status := originTransportStatus(r.Context(), err)
 		if c.metric != nil {
 			c.metric.recordOrigin(context.WithoutCancel(r.Context()), codeArtifactOriginObservation{
 				status: status, format: codeArtifactMetricFormat(target.Path), duration: time.Since(started),
@@ -587,7 +586,7 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 	resp, err := c.client.Do(redirected)
 	if err != nil {
 		cancel(nil)
-		status := codeArtifactTransportStatus(r.Context(), err)
+		status := originTransportStatus(r.Context(), err)
 		if c.metric != nil {
 			c.metric.recordOrigin(context.WithoutCancel(r.Context()), codeArtifactOriginObservation{
 				status: status, format: codeArtifactMetricFormat(resolved.Path), duration: time.Since(started),
@@ -600,25 +599,6 @@ func (c *CodeArtifact) followCrossOriginRedirect(
 	resp.Body = newCodeArtifactOriginBody(redirectCtx, resp.Body, cancel, c.originReadIdleTimeout)
 	c.observeOriginResponse(r.Context(), resp, resolved.Path, started)
 	return resp, nil
-}
-
-func codeArtifactTransportStatus(ctx context.Context, err error) string {
-	if errors.Is(ctx.Err(), context.Canceled) {
-		return "client_canceled"
-	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
-		return "transport_dns"
-	}
-	var timeoutErr net.Error
-	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeoutErr) && timeoutErr.Timeout()) {
-		return "transport_timeout"
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		return "transport_connection"
-	}
-	return "transport_error"
 }
 
 func (c *CodeArtifact) observeOriginResponse(ctx context.Context, resp *http.Response, path string, started time.Time) {
