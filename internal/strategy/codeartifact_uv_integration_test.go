@@ -51,7 +51,7 @@ type codeArtifactUVResult struct {
 	err    error
 }
 
-func compileCodeArtifactUV(t *testing.T, ctx context.Context, executable string, proxy *goAwayProxy) codeArtifactUVResult {
+func compileCodeArtifactUV(ctx context.Context, t *testing.T, executable string, proxy *goAwayProxy) codeArtifactUVResult {
 	t.Helper()
 	home := t.TempDir()
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -116,7 +116,7 @@ func TestCodeArtifactUVGoAwayRecovery(t *testing.T) {
 			origin := newGoAwayOrigin(t, 1)
 			proxy := newGoAwayProxy(t, origin, downstream)
 
-			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(t, ctx, executable, proxy))
+			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(ctx, t, executable, proxy))
 			assertCodeArtifactUVRequests(t, proxy, goAwayIndexPath, goAwayIndexPath, goAwayWheelPath+".metadata")
 			requests := origin.snapshot()
 			assert.Equal(t, 3, len(requests))
@@ -125,7 +125,7 @@ func TestCodeArtifactUVGoAwayRecovery(t *testing.T) {
 			assert.Equal(t, goAwayWheelPath+".metadata", requests[2].path)
 			assertGoAwayDiagnostics(t, proxy, origin, 1)
 
-			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(t, ctx, executable, proxy))
+			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(ctx, t, executable, proxy))
 			assertCodeArtifactUVRequests(t, proxy, goAwayIndexPath, goAwayWheelPath+".metadata")
 			assert.Equal(t, requests, origin.snapshot(), "fresh uv cache must use the complete Cachew index and metadata fills")
 		})
@@ -141,7 +141,7 @@ func TestCodeArtifactUVGoAwayRetryExhaustion(t *testing.T) {
 			origin := newGoAwayOrigin(t, 100)
 			proxy := newGoAwayProxy(t, origin, downstream)
 
-			failure := compileCodeArtifactUV(t, ctx, executable, proxy)
+			failure := compileCodeArtifactUV(ctx, t, executable, proxy)
 			assert.Error(t, failure.err, "repeated origin truncation must fail resolution")
 			assert.Equal(t, "", failure.stdout, "failed resolution must not emit a successful lock")
 			for range 4 {
@@ -156,7 +156,7 @@ func TestCodeArtifactUVGoAwayRetryExhaustion(t *testing.T) {
 			assertGoAwayDiagnostics(t, proxy, origin, 4)
 
 			origin.recover()
-			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(t, ctx, executable, proxy))
+			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(ctx, t, executable, proxy))
 			assertCodeArtifactUVRequests(t, proxy, goAwayIndexPath, goAwayWheelPath+".metadata")
 			requests = origin.snapshot()
 			assert.Equal(t, 6, len(requests), "recovery must fetch a fresh index and metadata, not a partial cached response")
@@ -164,7 +164,7 @@ func TestCodeArtifactUVGoAwayRetryExhaustion(t *testing.T) {
 			assert.False(t, requests[4].failed)
 			assert.Equal(t, goAwayWheelPath+".metadata", requests[5].path)
 
-			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(t, ctx, executable, proxy))
+			assertCodeArtifactUVResolved(t, compileCodeArtifactUV(ctx, t, executable, proxy))
 			assertCodeArtifactUVRequests(t, proxy, goAwayIndexPath, goAwayWheelPath+".metadata")
 			assert.Equal(t, requests, origin.snapshot(), "only the complete recovery response may be a warm Cachew hit")
 		})
