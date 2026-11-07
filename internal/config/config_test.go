@@ -17,6 +17,7 @@ import (
 	"github.com/block/cachew/internal/logging"
 	"github.com/block/cachew/internal/metadatadb"
 	"github.com/block/cachew/internal/packagepolicy"
+	"github.com/block/cachew/internal/spool"
 	"github.com/block/cachew/internal/strategy"
 )
 
@@ -356,4 +357,43 @@ strategy apiv1 {
 	assert.Equal(t, "snapshot", w.Body.String())
 	assert.Equal(t, "application/gzip", w.Header().Get("Content-Type"))
 	assert.Equal(t, "", w.Header().Get("X-Unlisted"))
+}
+
+func TestLoadRejectsConflictingECRBlocks(t *testing.T) {
+	const a = `strategy ecr "123456789012.dkr.ecr.us-east-1.amazonaws.com" { role-arn = "arn:aws:iam::123456789012:role/read" }`
+	const b = `strategy ecr "210987654321.dkr.ecr.us-west-2.amazonaws.com" { role-arn = "arn:aws:iam::210987654321:role/read" }`
+	const bPrefixOnly = `strategy ecr "210987654321.dkr.ecr.us-west-2.amazonaws.com" {
+  role-arn    = "arn:aws:iam::210987654321:role/read"
+  prefix-only = true
+}`
+	const aPrefixOnly = `strategy ecr "123456789012.dkr.ecr.us-east-1.amazonaws.com" {
+  role-arn    = "arn:aws:iam::123456789012:role/read"
+  prefix-only = true
+}`
+	load := func(strategies ...string) error {
+		cr := cache.NewRegistry()
+		cache.RegisterMemory(cr)
+		mr := metadatadb.NewRegistry()
+		metadatadb.RegisterMemory(mr)
+		sr := strategy.NewRegistry()
+		strategy.RegisterAPIV1(sr)
+		strategy.RegisterECR(sr, spool.NewProvider(t.Context(), spool.Config{Dir: t.TempDir()}, func(err error) { t.Error(err) }))
+		ast, err := hcl.Parse(strings.NewReader("cache memory {}\nmetadata memory {}\n" + strings.Join(strategies, "\n")))
+		assert.NoError(t, err)
+		baseCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ctx := logging.ContextWithLogger(baseCtx, slog.Default())
+		_, _, err = Load(ctx, cr, mr, sr, ast, http.NewServeMux(), nil)
+		return err
+	}
+
+	err := load(a, b)
+	assert.Error(t, err, "two blocks cannot both own /v2/")
+	assert.Contains(t, err.Error(), "prefix-only")
+
+	err = load(a, aPrefixOnly)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "more than once")
+
+	assert.NoError(t, load(a, bPrefixOnly))
 }

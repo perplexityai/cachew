@@ -317,6 +317,7 @@ func newRegistries(
 	strategy.RegisterHost(sr, spoolProvider)
 	strategy.RegisterHTTPProxy(sr, spoolProvider)
 	strategy.RegisterOCI(sr, spoolProvider)
+	strategy.RegisterECR(sr, spoolProvider)
 	git.Register(sr, scheduler, cloneManagerProvider, tokenManagerProvider, spoolProvider)
 	gomod.Register(sr, cloneManagerProvider)
 

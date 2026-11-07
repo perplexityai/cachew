@@ -752,6 +752,36 @@ func TestVerify(t *testing.T) {
 	}
 }
 
+type transformValueKey struct{}
+
+type transportFunc func(*http.Request) (*http.Response, error)
+
+func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestTransformContextReachesTheTransport(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "content")
+	}))
+	defer upstream.Close()
+	c := mustNewMemoryCache(t)
+	defer c.Close()
+	client := &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Context().Value(transformValueKey{}) != "set by transform" {
+			return &http.Response{StatusCode: http.StatusUnauthorized, Body: http.NoBody, Request: r}, nil
+		}
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	h := handler.New(client, c, newTestSpools(t)).
+		Transform(func(r *http.Request) (*http.Request, error) {
+			ctx := context.WithValue(r.Context(), transformValueKey{}, "set by transform")
+			return http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
+		})
+
+	w := serve(t, h, http.MethodGet, "http://example.com/v", nil)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "content", w.Body.String())
+}
+
 func TestRevalidate(t *testing.T) {
 	tests := []struct {
 		name         string

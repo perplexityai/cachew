@@ -28,8 +28,15 @@ import (
 	"github.com/block/cachew/internal/spool"
 )
 
-// CacheResultHeader reports whether CacheW served a request from cache.
+// CacheResultHeader reports whether CacheW served a request from cache, with
+// the value CacheResultHit or CacheResultMiss.
 const CacheResultHeader = "X-Cachew-Result"
+
+// Values of CacheResultHeader.
+const (
+	CacheResultHit  = "hit"
+	CacheResultMiss = "miss"
+)
 
 // CacheKeyParts holds the components used to build a cache key. Path is the
 // primary identifier (typically the upstream URL) and Vary captures
@@ -356,10 +363,10 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, key cache.
 			h.markCacheMiss(ctx, w)
 			return false, nil
 		}
-		w.Header().Set(CacheResultHeader, "hit")
+		w.Header().Set(CacheResultHeader, CacheResultHit)
 		if httputil.ServeCacheStat(w, clientHeaders(headers), err) {
 			h.labelCacheHit(ctx)
-			h.recordCacheLookup(ctx, "hit")
+			h.recordCacheLookup(ctx, CacheResultHit)
 			return true, nil
 		}
 		w.Header().Del(CacheResultHeader)
@@ -373,11 +380,11 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, key cache.
 		}
 		return false, nil
 	}
-	w.Header().Set(CacheResultHeader, "hit")
+	w.Header().Set(CacheResultHeader, CacheResultHit)
 	if handled, _, serveErr := httputil.ServeCacheHit(w, clientHeaders(headers), cr, err); handled {
 		h.labelCacheHit(ctx)
 		logging.FromContext(ctx).DebugContext(ctx, "Cache hit")
-		h.recordCacheLookup(ctx, "hit")
+		h.recordCacheLookup(ctx, CacheResultHit)
 		return true, errors.WithStack(serveErr)
 	}
 	w.Header().Del(CacheResultHeader)
@@ -387,8 +394,8 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, key cache.
 // markCacheMiss sets the trusted result before any upstream response is
 // forwarded; upstream values of CacheResultHeader are stripped on the way in.
 func (h *Handler) markCacheMiss(ctx context.Context, w http.ResponseWriter) {
-	w.Header().Set(CacheResultHeader, "miss")
-	h.recordCacheLookup(ctx, "miss")
+	w.Header().Set(CacheResultHeader, CacheResultMiss)
+	h.recordCacheLookup(ctx, CacheResultMiss)
 }
 
 // cacheMiss reports whether a failed cache lookup was answered with an error,
@@ -494,12 +501,12 @@ func (h *Handler) upstreamRequest(r *http.Request) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx := r.Context()
+	// Keep the transform's context: strategies hand per-request state, such as
+	// credentials and cooldown scopes, to their transports through it.
+	// Transforms derive it from r.
+	ctx := req.Context()
 	if !h.external {
 		ctx = httputil.WithoutCooldown(ctx)
-	}
-	if scope, ok := httputil.CooldownScope(req.Context()); ok {
-		ctx = httputil.WithCooldownScope(ctx, scope)
 	}
 	req = req.Clone(ctx)
 	// Forward safe headers from the original request, without overwriting headers set by transform.
@@ -721,7 +728,7 @@ func (h *Handler) streamNonOKResponse(w http.ResponseWriter, resp *http.Response
 // discarded and the response is streamed in full.
 func (h *Handler) streamAndCache(w http.ResponseWriter, r *http.Request, key cache.Key, resp *http.Response) error {
 	maps.Copy(w.Header(), upstreamHeaders(resp.Header))
-	w.Header().Set(CacheResultHeader, "miss")
+	w.Header().Set(CacheResultHeader, CacheResultMiss)
 	result := fillSuccess
 	if h.external {
 		defer func() { metrics.RecordCacheFill(r.Context(), result) }()
