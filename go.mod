@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
 	github.com/aws/aws-sdk-go-v2/service/codeartifact v1.38.22
+	github.com/aws/aws-sdk-go-v2/service/ecr v1.58.5
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/golang-jwt/jwt/v5 v5.3.1

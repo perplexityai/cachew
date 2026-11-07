@@ -54,6 +54,41 @@ github-releases {
 }
 ```
 
+### Amazon ECR
+
+Read-only proxy for one Amazon ECR registry, including its pull-through cache repositories. External registries (Docker Hub, Quay, ECR Public, registry.k8s.io, ghcr.io) are reached through ECR pull-through cache rules, which own their upstream credentials and rate limits and keep a durable copy; Cachew only talks to ECR. Helm charts are plain OCI artifacts and work the same way.
+
+**What is served**
+
+- `GET` and `HEAD` for `/v2/{name}/manifests/sha256:{digest}` and `/v2/{name}/blobs/sha256:{digest}`, at the host root and under `/{registry}/v2/`. Digests only: tags are mutable and resolve at ECR. `GET /v2/` answers the version check locally.
+- **Manifests** are fetched from ECR, verified against their digest while they stream, and cached for `manifest-ttl` (default three days). The lifetime is pinned through every cache tier even though manifests never change: cache hits never reach ECR, so its `lastRecordedPullTime` goes stale and `sinceImagePulled` lifecycle rules could expire images still in use. A mismatch is neither cached nor delivered complete, and a response without `Content-Length`, or a 2xx other than 200, is refused. `Docker-Content-Digest` is set on every successful manifest response; ECR omits it on `GET`s.
+- **Blobs** go to S3 directly. A `GET` answers with ECR's `307` to a presigned S3 URL, with `Cache-Control: no-store`; a `HEAD` answers with ECR's `Content-Length` and `Docker-Content-Digest`. Blob bytes never pass through Cachew or its cache, so `Range` and resumed downloads work against S3 and large layers do not load the proxy.
+- `repositories` optionally narrows the repositories clients may read (an entry ending in `/` is a prefix); by default, everything the role can read is served.
+- A pull-through repository is created by its first manifest pull, so a blob read for a repository nobody has pulled yet returns `404`. A `404` is passed through so mirror clients fall back, and a `429` so they back off.
+
+**How it authenticates**
+
+- Cachew assumes `role-arn` and mints a `GetAuthorizationToken` token, refreshed before expiry. When ECR rejects one, the request retries once with a newer token, minting at most once a minute; a rejection after that is a `502`, since the proxy's token or role was refused, not the client. Clients send no credentials.
+- Upstream request headers are built from scratch: `Accept` for manifests, `Accept-Encoding: identity`, a fixed `User-Agent`, and the token to ECR only. ECR's error bodies and AWS errors name the role and account, so clients get only the status; the presigned URL appears only in a blob redirect, never in logs or error bodies.
+- The role needs `ecr:GetAuthorizationToken`, plus `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability` (blob `HEAD`) on the repositories to serve, and `ecr:BatchImportUpstreamImage` and `ecr:CreateRepository` on pull-through prefixes so a first pull can import. A repository outside the role's scope answers `502`, like an expired token. Without `repositories`, any client can cause that, so rejections are logged at warn; with it, unlisted repositories never reach ECR, and a rejection is logged at error.
+
+**What clients need**
+
+- Network access to S3 in the registry's region, and to drop `Authorization` when following the redirect to another host (S3 rejects a presigned URL that also carries it). Helm, go-containerregistry and containerd already do, because ECR itself redirects.
+- ECR and S3 to be reachable for blob pulls: a cache hit does not cover an outage. Every blob `GET` calls ECR, so watch the account's ECR request-rate quotas under large fan-outs.
+- The registry at the host root (`go-containerregistry`, Helm, Docker) or under `/{registry}/v2/` (containerd `override_path`). Only one `ecr` block can own the root; set `prefix-only` on the others.
+- Helm needs a release that pulls `oci://<host>/<repo>@sha256:<digest>` without listing tags. Digest pulls arrived in 3.17, and 3.19 is tested; 3.16 calls `tags/list` first and fails on the proxy's `404`, since tags are not served.
+
+Cache hits are not re-hashed, so keep remote `/api/v1/object` writes denied for the `ecr` namespace (the default policy denies remote `/api`); the trust model matches `host` and `codeartifact`.
+
+```hcl
+ecr "123456789012.dkr.ecr.us-east-1.amazonaws.com" {
+  role-arn     = "arn:aws:iam::123456789012:role/cachew-ecr-read"
+  repositories = ["ecr-public/buildkite/"] # optional
+  manifest-ttl = "72h"
+}
+```
+
 ### Go Modules
 
 Go module proxy (`GOPROXY`-compatible). Private modules are fetched via git clone.

@@ -19,6 +19,10 @@ var ErrNotFound = errors.New("strategy not found")
 type Mux interface {
 	Handle(pattern string, handler http.Handler)
 	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+	// Handler reports the handler and pattern a request would route to, as
+	// *http.ServeMux does, so a strategy can detect a route another block
+	// already registered and fail with a configuration error, not a panic.
+	Handler(r *http.Request) (h http.Handler, pattern string)
 }
 
 type Registry struct {

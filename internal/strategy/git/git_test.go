@@ -36,6 +36,8 @@ func (m *testMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *
 	m.handlers[pattern] = http.HandlerFunc(handler)
 }
 
+func (m *testMux) Handler(*http.Request) (http.Handler, string) { return http.NotFoundHandler(), "" }
+
 func newTestScheduler(ctx context.Context, t *testing.T) jobscheduler.Provider {
 	t.Helper()
 	// Derive a context that carries the caller's logger but cancels when the
