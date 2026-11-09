@@ -268,7 +268,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	served, err := h.serveCached(w, r, key)
 	if err != nil {
-		logger.ErrorContext(ctx, "Failed to serve from cache", "cache_key", parts.Path, "error", err)
+		logger.ErrorContext(ctx, "Failed to serve from cache", "cache_key", key.String(), "error", err)
 	}
 	if served {
 		return
@@ -282,7 +282,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !coalescable(r) {
 		labelCacheResult(ctx, CacheMiss)
 		if err := h.fetchAndCache(w, r, key); err != nil {
-			logger.ErrorContext(ctx, "Failed to fetch and cache", "cache_key", parts.Path, "error", err)
+			logger.ErrorContext(ctx, "Failed to fetch and cache", "cache_key", key.String(), "error", err)
 		}
 		return
 	}
@@ -300,10 +300,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, spool.ErrNotShared):
 		if err := h.fetchAndCache(w, r, key); err != nil {
-			logger.ErrorContext(ctx, "Failed to fetch and cache", "cache_key", parts.Path, "error", err)
+			logger.ErrorContext(ctx, "Failed to fetch and cache", "cache_key", key.String(), "error", err)
 		}
 	case err != nil:
-		logger.ErrorContext(ctx, "Failed to serve shared response", "cache_key", parts.Path, "error", err)
+		logger.ErrorContext(ctx, "Failed to serve shared response", "cache_key", key.String(), "error", err)
 		if ctx.Err() == nil {
 			panic(http.ErrAbortHandler)
 		}
@@ -575,7 +575,7 @@ func (h *Handler) fill(ctx context.Context, w *spool.Writer, r *http.Request, ke
 	cw, err := h.cache.Create(ctx, key, h.cacheHeaders(resp), h.ttlFunc(r))
 	if err != nil {
 		result = fillCreateError
-		logging.FromContext(ctx).WarnContext(ctx, "Failed to create cache entry", "error", err)
+		logging.FromContext(ctx).WarnContext(ctx, "Failed to create cache entry", "cache_key", key.String(), "error", err)
 	} else {
 		fw = h.fillWriter(r, cw)
 		if err := w.Store(fw); err != nil {
@@ -591,7 +591,7 @@ func (h *Handler) fill(ctx context.Context, w *spool.Writer, r *http.Request, ke
 	}
 	if err := w.Commit(); err != nil {
 		result = fw.result(ctx, fillCommitError)
-		logging.FromContext(ctx).WarnContext(ctx, "Failed to cache response", "error", err)
+		logging.FromContext(ctx).WarnContext(ctx, "Failed to cache response", "cache_key", key.String(), "error", err)
 	}
 	return nil
 }
