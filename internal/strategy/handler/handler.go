@@ -172,14 +172,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	served, err := h.serveCached(w, r, key)
 	if err != nil {
-		logger.ErrorContext(ctx, "Failed to serve from cache", "cache_key", parts.Path, "error", err)
+		logger.ErrorContext(ctx, "Failed to serve from cache", "cache_key", key.String(), "error", err)
 	}
 	if served {
 		return
 	}
 
 	if err := h.fetchAndCache(w, r, key); err != nil {
-		logger.ErrorContext(ctx, "Failed to fetch and cache", "cache_key", parts.Path, "error", err)
+		logger.ErrorContext(ctx, "Failed to fetch and cache", "cache_key", key.String(), "error", err)
 	}
 }
 
