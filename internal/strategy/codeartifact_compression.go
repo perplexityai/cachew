@@ -16,7 +16,7 @@ const codeArtifactGzipEncoding = "gzip"
 
 func decodeCodeArtifactMetadata(resp *http.Response, headers http.Header, method string) error {
 	switch strings.ToLower(strings.TrimSpace(strings.Join(headers.Values("Content-Encoding"), ","))) {
-	case "", "identity":
+	case "", encodingIdentity:
 		return nil
 	case codeArtifactGzipEncoding:
 		if method != http.MethodHead && resp.StatusCode != http.StatusNotModified && resp.StatusCode != http.StatusNoContent {
@@ -27,7 +27,7 @@ func decodeCodeArtifactMetadata(resp *http.Response, headers http.Header, method
 			resp.Body = &codeArtifactGzipBody{Reader: reader, origin: resp.Body}
 		}
 		resp.ContentLength = -1
-		for _, name := range []string{"Content-Encoding", "Content-Length", "Content-MD5", "Digest", "ETag"} {
+		for _, name := range []string{"Content-Encoding", headerContentLength, "Content-MD5", "Digest", "ETag"} {
 			headers.Del(name)
 		}
 		return nil

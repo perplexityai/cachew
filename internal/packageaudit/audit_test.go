@@ -114,7 +114,7 @@ func TestWriterOverflowIsNonblockingAndReported(t *testing.T) {
 	counter, err := provider.Meter("test").Int64Counter("events")
 	assert.NoError(t, err)
 	var logs bytes.Buffer
-	sink := &Sink{queue: make(chan []byte, 1), events: counter, warn: slog.New(slog.NewTextHandler(&logs, nil)).Warn}
+	sink := &Sink{segmentState: &segmentState{}, queue: make(chan []byte, 1), events: counter, warn: slog.New(slog.NewTextHandler(&logs, nil)).Warn}
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -163,7 +163,7 @@ func testWriter(t *testing.T, limit int) (*Sink, *sdkmetric.ManualReader) {
 	assert.NoError(t, err)
 	lock, err := root.OpenFile(".lock", os.O_CREATE|os.O_RDWR, 0600)
 	assert.NoError(t, err)
-	sink := &Sink{root: root, lock: lock, fileSize: 20, fileLimit: limit,
+	sink := &Sink{segmentState: &segmentState{}, root: root, lock: lock, fileSize: 20, fileLimit: limit,
 		queue: make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}),
 		events: events, evictions: evictions, syncErrors: syncErrors, retentionErrors: retentionErrors,
 		shutdownTimeouts: shutdownTimeouts, warn: slog.New(slog.NewTextHandler(io.Discard, nil)).Warn}

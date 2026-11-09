@@ -92,23 +92,11 @@ func NewCodeArtifact(ctx context.Context, config CodeArtifactConfig, configuredC
 	if !config.AssetAPI {
 		tokens = newCodeArtifactTokenManagerWithClient(config, client, time.Now)
 	}
-	strategy, err := newCodeArtifact(ctx, config, mux, tokens, configuredCache, false)
-	if err != nil {
-		return nil, err
-	}
+	var assetClient *awscodeartifact.Client
 	if config.AssetAPI {
-		options := client.Options()
-		options.HTTPClient = strategy.client
-		strategy.assets = &codeArtifactAssetOrigin{client: awscodeartifact.New(options), domain: config.Domain, owner: config.DomainOwner}
+		assetClient = client
 	}
-	if config.PackagePolicy != nil {
-		strategy.packagePolicy, err = packagepolicy.New(*config.PackagePolicy)
-		if err != nil {
-			return nil, errors.Wrap(err, "create package policy")
-		}
-		strategy.policyAudit = config.PackagePolicy.Mode == packagepolicy.ModeAudit
-	}
-	return strategy, nil
+	return newCodeArtifactWithAssets(ctx, config, mux, tokens, configuredCache, false, assetClient)
 }
 
 func newCodeArtifact(
@@ -118,6 +106,20 @@ func newCodeArtifact(
 	tokens originTokenSource,
 	configuredCache cache.Cache,
 	allowHTTP bool,
+) (*CodeArtifact, error) {
+	return newCodeArtifactWithAssets(ctx, config, mux, tokens, configuredCache, allowHTTP, nil)
+}
+
+// newCodeArtifactWithAssets sets every field before mounting routes, after
+// which request handlers share the strategy.
+func newCodeArtifactWithAssets(
+	ctx context.Context,
+	config CodeArtifactConfig,
+	mux Mux,
+	tokens originTokenSource,
+	configuredCache cache.Cache,
+	allowHTTP bool,
+	assetClient *awscodeartifact.Client,
 ) (*CodeArtifact, error) {
 	target, proxyBase, err := validateCodeArtifactConfig(config, allowHTTP)
 	if err != nil {
@@ -155,6 +157,18 @@ func newCodeArtifact(
 		if err != nil {
 			return nil, errors.Wrap(err, "create audit exclusions")
 		}
+	}
+	if assetClient != nil {
+		options := assetClient.Options()
+		options.HTTPClient = c.client
+		c.assets = &codeArtifactAssetOrigin{client: awscodeartifact.New(options), domain: config.Domain, owner: config.DomainOwner}
+	}
+	if config.PackagePolicy != nil {
+		c.packagePolicy, err = packagepolicy.New(*config.PackagePolicy)
+		if err != nil {
+			return nil, errors.Wrap(err, "create package policy")
+		}
+		c.policyAudit = config.PackagePolicy.Mode == packagepolicy.ModeAudit
 	}
 
 	if !config.AssetAPI {
@@ -251,7 +265,7 @@ func parseCodeArtifactOrigin(name, value string, allowHTTP bool) (*url.URL, erro
 	if err != nil {
 		return nil, errors.Errorf("codeartifact: invalid %s URL: %w", name, err)
 	}
-	validScheme := origin.Scheme == "https" || (allowHTTP && origin.Scheme == "http")
+	validScheme := origin.Scheme == schemeHTTPS || (allowHTTP && origin.Scheme == "http")
 	if origin.Host == "" || !validScheme {
 		return nil, errors.Errorf("codeartifact: %s must be an HTTPS origin", name)
 	}
@@ -621,7 +635,7 @@ func (c *CodeArtifact) observeOriginResponse(ctx context.Context, resp *http.Res
 func codeArtifactMetricFormat(path string) string {
 	format := codeArtifactPackageFormat(path)
 	switch format {
-	case codeArtifactCargoFormat, "generic", "maven", "npm", "nuget", "pypi", "ruby", codeArtifactSwiftFormat:
+	case codeArtifactCargoFormat, "generic", codeArtifactMavenFormat, "npm", "nuget", "pypi", "ruby", codeArtifactSwiftFormat:
 		return format
 	default:
 		return "other"
@@ -645,16 +659,7 @@ func endToEndHeaders(headers http.Header) http.Header {
 
 func codeArtifactRequestHeaders(headers http.Header) http.Header {
 	allowed := make(http.Header)
-	for _, name := range []string{
-		"Accept",
-		"Accept-Encoding",
-		"If-Match",
-		"If-Modified-Since",
-		"If-None-Match",
-		"If-Range",
-		"If-Unmodified-Since",
-		"Range",
-	} {
+	for _, name := range append([]string{headerAccept, headerAcceptEncoding}, rangeAndConditionalHeaders()...) {
 		for _, value := range headers.Values(name) {
 			allowed.Add(name, value)
 		}

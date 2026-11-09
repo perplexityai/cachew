@@ -44,7 +44,7 @@ func (c *CodeArtifact) cacheKey(r *http.Request) cache.Key {
 		key.WriteString(c.assets.client.Options().Region + "/" + c.assets.owner + "/" + c.assets.domain + "\n")
 	}
 	key.WriteString(origin.String())
-	for _, name := range []string{"Accept", "Accept-Encoding"} {
+	for _, name := range []string{headerAccept, headerAcceptEncoding} {
 		if values := r.Header.Values(name); len(values) > 0 {
 			key.WriteByte('\n')
 			key.WriteString(name)

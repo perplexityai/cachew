@@ -186,7 +186,7 @@ func newMemoryState(config MemoryConfig) (*memoryState, error) {
 	}
 	shards := make([]memoryShard, memoryShardCount)
 	for index := range shards {
-		shards[index].entries = make(map[Namespace]map[Key]*memoryEntry)
+		shards[index] = memoryShard{entries: make(map[Namespace]map[Key]*memoryEntry)}
 	}
 	return &memoryState{
 		shards: shards, limitBytes: limitBytes,

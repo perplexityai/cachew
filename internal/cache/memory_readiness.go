@@ -47,7 +47,9 @@ func newMemoryReadiness(ctx context.Context, memory *Memory) *memoryReadiness {
 			},
 			readiness: true,
 		}
+		shard.mu.Lock()
 		shard.entries[memoryReadinessNamespace] = map[Key]*memoryEntry{key: entry}
+		shard.mu.Unlock()
 		go readiness.run(shardIndex)
 	}
 	return readiness

@@ -25,7 +25,7 @@ func (c *CodeArtifact) packageAuditEvent(r *http.Request, purl string, decision 
 	}
 	event := packageaudit.Event{
 		PURL: purl, PackageRedacted: c.auditExclusions.Matches(purl),
-		PolicyMode: packagepolicy.ModeDisabled, PolicyVerdict: "not_evaluated", PolicyAction: "allow",
+		PolicyMode: packagepolicy.ModeDisabled, PolicyVerdict: codeArtifactNotEvaluated, PolicyAction: "allow",
 	}
 	if err != nil {
 		event.PolicyError = codeArtifactUnmappablePackage
@@ -39,6 +39,7 @@ const (
 	codeArtifactAuditOrigin       = "origin"
 	codeArtifactAuditUnavailable  = "unavailable"
 	codeArtifactUnmappablePackage = "unmappable_package"
+	codeArtifactNotEvaluated      = "not_evaluated"
 )
 
 func codeArtifactAuditEvent(purl string, decision packagepolicy.Decision, err error) packageaudit.Event {
@@ -56,7 +57,7 @@ func codeArtifactAuditEvent(purl string, decision packagepolicy.Decision, err er
 		event.PolicyVerdict = string(decision.OriginalVerdict)
 	}
 	if event.PolicyVerdict == "" {
-		event.PolicyVerdict = "not_evaluated"
+		event.PolicyVerdict = codeArtifactNotEvaluated
 	}
 	if decision.Audit {
 		event.PolicyMode = packagepolicy.ModeAudit
@@ -71,7 +72,7 @@ func codeArtifactAuditEvent(purl string, decision packagepolicy.Decision, err er
 			event.PolicyError = "timeout"
 		}
 		if decision.OriginalVerdict == "" {
-			event.PolicyVerdict = "not_evaluated"
+			event.PolicyVerdict = codeArtifactNotEvaluated
 		}
 	case errors.Is(err, packagepolicy.ErrOverloaded):
 		event.PolicyError = "overloaded"

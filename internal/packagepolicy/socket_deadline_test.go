@@ -67,7 +67,7 @@ func TestSocketDeadlineIncludesQueueAndProvider(t *testing.T) {
 		assert.Equal(t, Decision{}, got.decision)
 		assert.NoError(t, t.Context().Err())
 		assert.Equal(t, int32(1), metrics.evaluations.Load())
-		assert.Equal(t, 1, client.breaker.failures)
+		assert.Equal(t, 1, client.breaker.failureCount())
 		assert.Equal(t, 0, len(client.callSlots))
 	})
 }
@@ -90,7 +90,7 @@ func TestSocketDeadlineInterruptsProviderResponseBody(t *testing.T) {
 		assert.Equal(t, Decision{}, decision)
 		assert.NoError(t, t.Context().Err())
 		assert.Equal(t, int32(1), metrics.evaluations.Load())
-		assert.Equal(t, 1, client.breaker.failures)
+		assert.Equal(t, 1, client.breaker.failureCount())
 		assert.Equal(t, 0, len(client.callSlots))
 	})
 }
@@ -124,7 +124,7 @@ func TestSocketDeadlineDoesNotResetAfterSharedOwnerCancellation(t *testing.T) {
 		assert.Equal(t, Decision{}, got.decision)
 		assert.NoError(t, t.Context().Err())
 		assert.Equal(t, int32(2), metrics.evaluations.Load())
-		assert.Equal(t, 1, client.breaker.failures)
+		assert.Equal(t, 1, client.breaker.failureCount())
 		assert.Equal(t, 0, len(client.callSlots))
 	})
 }
@@ -149,7 +149,7 @@ func TestSocketSharedProviderDeadlineDoesNotRetry(t *testing.T) {
 		assert.Equal(t, deadlineTestBudget, time.Since(start))
 		assert.Equal(t, int32(1), metrics.evaluations.Load())
 		assert.Equal(t, 0, len(started))
-		assert.Equal(t, 1, client.breaker.failures)
+		assert.Equal(t, 1, client.breaker.failureCount())
 	})
 }
 
@@ -180,7 +180,7 @@ func TestSocketDeadlineBeforeAdmissionRemainsOverload(t *testing.T) {
 		assert.Equal(t, deadlineTestBudget, time.Since(start))
 		assert.NoError(t, t.Context().Err())
 		assert.Equal(t, int32(0), metrics.evaluations.Load())
-		assert.Equal(t, 0, client.breaker.failures)
+		assert.Equal(t, 0, client.breaker.failureCount())
 		assert.True(t, client.breaker.allow())
 	})
 }

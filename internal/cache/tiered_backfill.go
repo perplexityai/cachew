@@ -159,17 +159,26 @@ type backfillWriterFactory func(context.Context) (Writer, error)
 // backfillReadCloser copies source reads to an asynchronously-created cache
 // writer. The client path never waits for writer creation, writes, or commit;
 // incomplete streams and any resource saturation abort only the optional fill.
+// Fill results of backfills and heals, beside the writer results.
+const (
+	fillCreateError   = "create_error"
+	fillWriteError    = "write_error"
+	fillReadError     = "read_error"
+	fillTransferError = "transfer_error"
+	fillSuperseded    = "superseded"
+	fillDeclined      = "declined"
+)
+
 type backfillReadCloser struct {
 	src       io.ReadCloser
 	create    backfillWriterFactory
 	lease     *tieredBackfillLease
 	chunks    chan []byte
+	closer    func() error
 	mu        sync.Mutex
 	accepting bool
 	eof       bool
 	commit    bool
-	closeOnce sync.Once
-	closeErr  error
 }
 
 func newBackfillReadCloser(src io.ReadCloser, create backfillWriterFactory, lease *tieredBackfillLease) *backfillReadCloser {
@@ -180,6 +189,7 @@ func newBackfillReadCloser(src io.ReadCloser, create backfillWriterFactory, leas
 		chunks:    make(chan []byte, tieredBackfillBufferSlots),
 		accepting: true,
 	}
+	b.closer = sync.OnceValue(b.closeSource)
 	go b.run()
 	return b
 }
@@ -190,7 +200,7 @@ func (b *backfillReadCloser) run() {
 	defer func() { metrics.RecordCacheFill(b.lease.ctx, result) }()
 	w, err := b.create(b.lease.ctx)
 	if err != nil || w == nil {
-		result = "create_error"
+		result = fillCreateError
 		if err == nil {
 			err = errBackfillNilWriter
 		}
@@ -227,7 +237,7 @@ func (b *backfillReadCloser) run() {
 				err = io.ErrShortWrite
 			}
 			if err != nil {
-				result = "write_error"
+				result = fillWriteError
 				b.stop(err, false)
 				b.drainChunks()
 				logging.FromContext(b.lease.ctx).WarnContext(b.lease.ctx, "Tier backfill: write failed", "error", errors.Join(err, w.Abort(err)))
@@ -321,12 +331,14 @@ func (b *backfillReadCloser) Read(p []byte) (int, error) {
 }
 
 func (b *backfillReadCloser) Close() error {
-	b.closeOnce.Do(func() {
-		b.closeErr = b.src.Close()
-		b.mu.Lock()
-		complete := b.eof && b.closeErr == nil
-		b.mu.Unlock()
-		b.stop(errBackfillAbandoned, complete)
-	})
-	return errors.WithStack(b.closeErr)
+	return b.closer()
+}
+
+func (b *backfillReadCloser) closeSource() error {
+	err := b.src.Close()
+	b.mu.Lock()
+	complete := b.eof && err == nil
+	b.mu.Unlock()
+	b.stop(errBackfillAbandoned, complete)
+	return errors.WithStack(err)
 }

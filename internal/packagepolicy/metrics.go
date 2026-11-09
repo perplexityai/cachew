@@ -15,6 +15,7 @@ import (
 const (
 	outcomeUnavailable = "unavailable"
 	outcomeWouldDeny   = "would_deny"
+	outcomeOverloaded  = "overloaded"
 )
 
 type metricRecorder interface {
@@ -135,7 +136,7 @@ func (m *clientMetrics) attributes(decision Decision, err error) metric.Measurem
 		outcome = outcomeUnavailable
 	}
 	if errors.Is(err, ErrOverloaded) {
-		outcome = "overloaded"
+		outcome = outcomeOverloaded
 	}
 	if decision.Audit && decision.Verdict != VerdictNotApplicable {
 		outcome = "would_allow"

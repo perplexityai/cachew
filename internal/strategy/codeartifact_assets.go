@@ -46,7 +46,7 @@ func (c *CodeArtifact) serveAsset(w http.ResponseWriter, r *http.Request, mode c
 			status = strconv.Itoa(responseError.HTTPStatusCode())
 		}
 		c.metric.recordOrigin(context.WithoutCancel(ctx), codeArtifactOriginObservation{
-			status: status, format: "maven", duration: time.Since(started),
+			status: status, format: codeArtifactMavenFormat, duration: time.Since(started),
 		})
 		if responseError != nil {
 			switch responseError.HTTPStatusCode() {
@@ -173,7 +173,7 @@ func (w *codeArtifactRangeWriter) Unwrap() http.ResponseWriter { return w.Respon
 func codeArtifactMavenAsset(path string) (*awscodeartifact.GetPackageVersionAssetInput, error) {
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	n := len(parts)
-	if n < 6 || parts[0] != "maven" || strings.HasSuffix(parts[n-2], "-SNAPSHOT") {
+	if n < 6 || parts[0] != codeArtifactMavenFormat || strings.HasSuffix(parts[n-2], "-SNAPSHOT") {
 		return nil, errors.New("expected a non-snapshot Maven asset path")
 	}
 	for _, part := range parts {

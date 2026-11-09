@@ -372,9 +372,7 @@ func TestClientCanceledQueueDoesNotFailOpen(t *testing.T) {
 			}
 			assert.Equal(t, int32(0), requests.Load())
 			assert.True(t, client.breaker.allow())
-			client.breaker.mu.Lock()
-			failures := client.breaker.failures
-			client.breaker.mu.Unlock()
+			failures := client.breaker.failureCount()
 			assert.Equal(t, 0, failures)
 			assert.Equal(t, int32(0), metrics.outcomes.Load())
 			assert.Equal(t, int32(0), metrics.evaluations.Load())
@@ -445,7 +443,7 @@ func TestClientRejectsQueueSaturationWithoutFailingOpen(t *testing.T) {
 				assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 			}
 			assert.True(t, client.breaker.allow())
-			assert.Equal(t, 0, client.breaker.failures)
+			assert.Equal(t, 0, client.breaker.failureCount())
 			assert.Equal(t, int32(0), metrics.evaluations.Load())
 		})
 	}

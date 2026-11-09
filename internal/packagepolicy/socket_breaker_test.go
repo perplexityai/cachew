@@ -192,3 +192,9 @@ func TestClientSkipsQueuedEvaluationsAfterCircuitOpens(t *testing.T) {
 	assert.Equal(t, int32(breakerFailureThreshold), metrics.evaluations.Load())
 	assert.Equal(t, int32(breakerFailureThreshold+waiters), metrics.outcomes.Load())
 }
+
+func (b *circuitBreaker) failureCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.failures
+}

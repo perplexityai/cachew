@@ -16,6 +16,7 @@ type codeArtifactOriginBody struct {
 	ctx     context.Context
 	cancel  context.CancelCauseFunc
 	timeout time.Duration
+	closer  func() error
 
 	mu         sync.Mutex
 	timer      *time.Timer
@@ -23,8 +24,6 @@ type codeArtifactOriginBody struct {
 	timerArmed bool
 	reading    bool
 	closed     bool
-	closeOnce  sync.Once
-	closeErr   error
 }
 
 func newCodeArtifactOriginBody(
@@ -33,7 +32,9 @@ func newCodeArtifactOriginBody(
 	cancel context.CancelCauseFunc,
 	timeout time.Duration,
 ) io.ReadCloser {
-	return &codeArtifactOriginBody{body: body, ctx: ctx, cancel: cancel, timeout: timeout}
+	r := &codeArtifactOriginBody{body: body, ctx: ctx, cancel: cancel, timeout: timeout}
+	r.closer = sync.OnceValue(r.closeBody)
+	return r
 }
 
 func (r *codeArtifactOriginBody) Read(p []byte) (int, error) {
@@ -47,15 +48,16 @@ func (r *codeArtifactOriginBody) Read(p []byte) (int, error) {
 }
 
 func (r *codeArtifactOriginBody) Close() error {
-	r.closeOnce.Do(func() {
-		r.mu.Lock()
-		r.closed = true
-		r.mu.Unlock()
-		r.stopReadTimer()
-		r.cancel(nil)
-		r.closeErr = r.body.Close()
-	})
-	return errors.WithStack(r.closeErr)
+	return r.closer()
+}
+
+func (r *codeArtifactOriginBody) closeBody() error {
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	r.stopReadTimer()
+	r.cancel(nil)
+	return errors.WithStack(r.body.Close())
 }
 
 func (r *codeArtifactOriginBody) startRead() {

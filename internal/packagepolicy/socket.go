@@ -57,10 +57,10 @@ type socketEvaluator struct {
 	label        string
 	httpClient   *http.Client
 	metrics      metricRecorder
+	callSlots    chan struct{}
+	breaker      *circuitBreaker
 	mu           sync.Mutex
 	inflight     map[string]*socketEvaluation
-	callSlots    chan struct{}
-	breaker      circuitBreaker
 }
 
 type socketEvaluation struct {
@@ -126,7 +126,7 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 		},
 		metrics:   newMetrics(),
 		callSlots: providerCallSlots,
-		breaker:   circuitBreaker{now: time.Now},
+		breaker:   &circuitBreaker{now: time.Now},
 	}, nil
 }
 
@@ -178,7 +178,7 @@ func (c *socketEvaluator) Evaluate(ctx context.Context, purl string) (decision D
 
 func evaluationDeadlineResult(shared *socketEvaluation) (Decision, error) {
 	if shared == nil || !shared.providerStarted.Load() {
-		return Decision{Verdict: VerdictDeny, Reasons: []string{"overloaded"}}, ErrOverloaded
+		return Decision{Verdict: VerdictDeny, Reasons: []string{outcomeOverloaded}}, ErrOverloaded
 	}
 	return Decision{}, errors.Wrap(context.DeadlineExceeded, "socket policy: evaluation deadline exceeded")
 }
@@ -227,7 +227,7 @@ func (c *socketEvaluator) evaluateQueued(ctx context.Context, purl string, deadl
 		return Decision{}, errSharedEvaluationOwnerDone
 	}
 	if queueErr != nil || requestCtx.Err() != nil || !time.Now().Before(deadline) {
-		return Decision{Verdict: VerdictDeny, Reasons: []string{"overloaded"}}, ErrOverloaded
+		return Decision{Verdict: VerdictDeny, Reasons: []string{outcomeOverloaded}}, ErrOverloaded
 	}
 	if !c.breaker.allow() {
 		c.metrics.recordBreakerSkip(metricsCtx)

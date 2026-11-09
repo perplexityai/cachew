@@ -61,23 +61,15 @@ type Event struct {
 
 // Sink keeps disk and collector latency off request handlers. Close it after HTTP handlers have drained.
 type Sink struct {
+	*segmentState
 	exclusions       packagepolicy.Exclusions
-	mu               sync.RWMutex
-	closed           bool
 	queue            chan []byte
 	done             chan struct{}
 	stop             chan struct{}
 	stopOnce         sync.Once
-	closeErr         error
 	warn             func(string, ...any)
 	root             *os.Root
 	lock             *os.File
-	file             *os.File
-	name             string
-	sequence         uint64
-	rollback         bool
-	size             int64
-	files            []string
 	fileSize         int64
 	fileLimit        int
 	events           metric.Int64Counter
@@ -89,7 +81,21 @@ type Sink struct {
 	evicted          atomic.Int64
 	unsynced         atomic.Int64
 	unpruned         atomic.Int64
-	lastWarn         time.Time
+	mu               sync.RWMutex
+	closed           bool
+}
+
+// segmentState belongs to the run goroutine. New fills it before starting run,
+// and Close reads closeErr only after run closes done.
+type segmentState struct {
+	file     *os.File
+	name     string
+	sequence uint64
+	rollback bool
+	size     int64
+	files    []string
+	closeErr error
+	lastWarn time.Time
 }
 
 type contextKey struct{}
@@ -128,8 +134,9 @@ func New(config Config, warn func(string, ...any)) (*Sink, error) {
 	}
 	meter := otel.Meter("cachew.package_audit")
 	sink := &Sink{
-		exclusions: exclusions,
-		queue:      make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}), warn: warn,
+		segmentState: &segmentState{},
+		exclusions:   exclusions,
+		queue:        make(chan []byte, queueCapacity), done: make(chan struct{}), stop: make(chan struct{}), warn: warn,
 		root: root, lock: lock, fileSize: maxFileSize, fileLimit: maxFiles,
 		events: metrics.NewMetric[metric.Int64Counter](meter, "cachew.package_audit.events_total", "{events}",
 			"Audit events written locally or dropped; local writes do not confirm collector delivery"),

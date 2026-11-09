@@ -91,10 +91,6 @@ func TestCodeArtifactAuditWithoutProvider(t *testing.T) {
 			mux := http.NewServeMux()
 			strategy, err := newCodeArtifact(ctx, config, mux, tokens.tokenManager(time.Now), memory, true)
 			assert.NoError(t, err)
-			if disabled {
-				strategy.packagePolicy, err = packagepolicy.New(*config.PackagePolicy)
-				assert.NoError(t, err)
-			}
 			assert.Equal(t, nil, strategy.packagePolicy)
 			paths := []string{
 				"/npm/repository/package/-/package-1.0.0.tgz",

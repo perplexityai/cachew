@@ -32,8 +32,7 @@ import (
 )
 
 const (
-	ecrSchemeHTTPS = "https"
-	ecrUserAgent   = "cachew-ecr"
+	ecrUserAgent = "cachew-ecr"
 
 	defaultECRManifestTTL       = 72 * time.Hour
 	defaultECRCredentialTimeout = 15 * time.Second
@@ -356,7 +355,7 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 	case r.Method == http.MethodGet && resp.StatusCode == http.StatusTemporaryRedirect:
 		raw := resp.Header.Get("Location")
 		location, err := url.Parse(raw)
-		if err != nil || location.Scheme != ecrSchemeHTTPS || location.Host == "" {
+		if err != nil || location.Scheme != schemeHTTPS || location.Host == "" {
 			s.blobFailure(w, r, ecrFailureBadRedirect, "ECR blob redirect is not an absolute https URL", resp.StatusCode)
 			return
 		}
@@ -410,7 +409,7 @@ func (s *ECR) serveManifestHead(w http.ResponseWriter, r *http.Request, ref ecrR
 		fill := &statusRecorder{header: http.Header{}}
 		get := r.Clone(r.Context())
 		get.Method = http.MethodGet
-		for _, name := range []string{"Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+		for _, name := range rangeAndConditionalHeaders() {
 			get.Header.Del(name)
 		}
 		s.fillManifest(fill, get)
@@ -659,7 +658,7 @@ func (s *ECR) request(ctx context.Context, ref ecrRef, method string) (*http.Req
 	} else {
 		fetch.passthrough = true
 	}
-	target := ecrSchemeHTTPS + "://" + s.registry + "/v2/" + ref.name + "/" + ref.kind + "/" + ref.digest
+	target := schemeHTTPS + "://" + s.registry + "/v2/" + ref.name + "/" + ref.kind + "/" + ref.digest
 	req, err := http.NewRequestWithContext(context.WithValue(ctx, ecrFetchKey{}, fetch), method, target, nil)
 	if err != nil {
 		return nil, httputil.Errorf(http.StatusInternalServerError, "create ECR request: %w", err)
@@ -671,7 +670,7 @@ func checkHTTPSRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 10 {
 		return errTooManyHops
 	}
-	if req.URL.Scheme != ecrSchemeHTTPS {
+	if req.URL.Scheme != schemeHTTPS {
 		return errors.Wrapf(errInsecureHop, "%s://%s", req.URL.Scheme, req.URL.Host)
 	}
 	return nil
@@ -725,7 +724,7 @@ type ecrTransport struct {
 func (t ecrTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	fetch, isFetch := req.Context().Value(ecrFetchKey{}).(*ecrFetch)
 	req = req.Clone(req.Context())
-	req.Header = http.Header{"Accept-Encoding": {"identity"}, "User-Agent": {ecrUserAgent}}
+	req.Header = http.Header{headerAcceptEncoding: {encodingIdentity}, "User-Agent": {ecrUserAgent}}
 	if !isFetch {
 		return t.roundTrip(req)
 	}

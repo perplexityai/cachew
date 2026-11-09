@@ -137,7 +137,7 @@ func (f *fakeECR) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case f.noRedirect:
 		_, _ = w.Write(f.blob)
 	default:
-		location := ecrSchemeHTTPS + "://" + testECRS3Host + testPresigned
+		location := schemeHTTPS + "://" + testECRS3Host + testPresigned
 		if f.insecureS3 {
 			location = plainHTTP + "://" + testECRS3Host + testPresigned
 		}

@@ -14,6 +14,7 @@ import (
 const (
 	maxCodeArtifactMetadataBytes = 64 << 20
 	codeArtifactCargoFormat      = "cargo"
+	codeArtifactMavenFormat      = "maven"
 	codeArtifactSwiftFormat      = "swift"
 )
 
@@ -42,15 +43,7 @@ func codeArtifactPackageFormat(path string) string {
 }
 
 func normalizeCodeArtifactMetadataRequestHeaders(headers http.Header, path string) {
-	for _, name := range []string{
-		"Accept-Encoding",
-		"If-Match",
-		"If-Modified-Since",
-		"If-None-Match",
-		"If-Range",
-		"If-Unmodified-Since",
-		"Range",
-	} {
+	for _, name := range append([]string{headerAcceptEncoding}, rangeAndConditionalHeaders()...) {
 		headers.Del(name)
 	}
 	if codeArtifactPackageFormat(path) != codeArtifactSwiftFormat {
@@ -161,7 +154,7 @@ func codeArtifactRewrittenMetadataHeaders(headers http.Header) http.Header {
 	for _, name := range []string{
 		"Accept-Ranges",
 		"Content-Encoding",
-		"Content-Length",
+		headerContentLength,
 		"Content-MD5",
 		"Content-Range",
 		"Digest",

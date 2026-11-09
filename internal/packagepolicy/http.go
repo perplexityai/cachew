@@ -27,7 +27,7 @@ func AllowRequest(w http.ResponseWriter, decision Decision, err error) bool {
 	}
 	if errors.Is(err, ErrOverloaded) {
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set(policyHeader, "overloaded")
+		w.Header().Set(policyHeader, outcomeOverloaded)
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "Package policy capacity unavailable", http.StatusServiceUnavailable)
 		return false
