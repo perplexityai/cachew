@@ -165,10 +165,7 @@ func NewECR(ctx context.Context, config ECRConfig, c cache.Cache, mux Mux, spool
 		return nil, err
 	}
 	tokens := newOriginTokenManager("ECR", config.CredentialTimeout, ecrTokenMinter(client), time.Now)
-	base := http.DefaultTransport.(*http.Transport).Clone() //nolint:forcetypeassert // the default is always *http.Transport
-	base.DisableCompression = true
-	base.ResponseHeaderTimeout = config.OriginHeaderTimeout
-	return newECR(config, tokens, base, c, mux, spools)
+	return newECR(config, tokens, newTunedOriginTransport(config.OriginHeaderTimeout), c, mux, spools)
 }
 
 func ecrConfigWithDefaults(config ECRConfig) ECRConfig {

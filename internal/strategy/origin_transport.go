@@ -3,6 +3,8 @@ package strategy
 import (
 	"context"
 	"net"
+	"net/http"
+	"time"
 
 	"github.com/alecthomas/errors"
 )
@@ -26,4 +28,25 @@ func originTransportStatus(ctx context.Context, err error) string {
 		return "transport_connection"
 	}
 	return "transport_error"
+}
+
+// newTunedOriginTransport returns a transport with net/http's default settings
+// for an origin that needs its own compression and header timeout. cachewd
+// replaces http.DefaultTransport with a wrapper, so it cannot be cloned.
+func newTunedOriginTransport(headerTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		// Proxy origin bytes as sent so cached bodies keep their encoding.
+		DisableCompression:    true,
+		ResponseHeaderTimeout: headerTimeout,
+	}
 }

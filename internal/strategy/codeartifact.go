@@ -126,9 +126,7 @@ func newCodeArtifactWithAssets(
 		return nil, err
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DisableCompression = true
-	transport.ResponseHeaderTimeout = config.OriginHeaderTimeout
+	transport := newTunedOriginTransport(config.OriginHeaderTimeout)
 
 	namespace := cache.Namespace("codeartifact")
 	if config.AssetAPI {
