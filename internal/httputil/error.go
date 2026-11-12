@@ -12,8 +12,11 @@ import (
 )
 
 // ErrorResponse creates an error response with the given code and format, and also logs a message.
+// URL queries are removed from the log record and the response: they can carry
+// credentials, and msg often quotes an upstream URL the client never saw.
 func ErrorResponse(w http.ResponseWriter, r *http.Request, status int, msg string, args ...any) {
-	logger := logging.FromContext(r.Context()).With("url", r.URL, "status", status)
+	msg = logging.RedactText(msg)
+	logger := logging.FromContext(r.Context()).With("url", logging.RedactURL(r.URL), "status", status)
 	logger.ErrorContext(r.Context(), msg, args...)
 	http.Error(w, msg, status)
 }

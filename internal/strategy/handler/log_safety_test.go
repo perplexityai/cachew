@@ -118,3 +118,48 @@ func TestErrorLogsDoNotExposeSignedCacheURL(t *testing.T) {
 		})
 	}
 }
+
+func TestFetchFailureDoesNotExposeSignedURLs(t *testing.T) {
+	const query = "?X-Amz-Credential=synthetic-credential&X-Amz-Signature=synthetic-signature"
+	// A closed listener makes the client fail with an error that quotes the URL.
+	origin := httptest.NewServer(http.NotFoundHandler())
+	originURL := origin.URL
+	origin.Close()
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			ctx := logging.ContextWithLogger(t.Context(), logger)
+			h := handler.New(http.DefaultClient, mustNewMemoryCache(t), newTestSpools(t)).
+				Transform(func(r *http.Request) (*http.Request, error) {
+					return http.NewRequestWithContext(r.Context(), http.MethodGet, originURL+"/object"+query, nil)
+				})
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, httptest.NewRequest(method, "/downloads.example.invalid/object"+query, nil).WithContext(ctx))
+
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("got status %d, want %d", recorder.Code, http.StatusBadGateway)
+			}
+			var record struct {
+				Level   string `json:"level"`
+				Message string `json:"msg"`
+				URL     string `json:"url"`
+			}
+			if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+				t.Fatalf("expected one error log: %v", err)
+			}
+			if record.Level != "ERROR" || !strings.Contains(record.Message, originURL+"/object?REDACTED") {
+				t.Errorf("fetch failure was not logged with its redacted origin URL: %s", logs.String())
+			}
+			if record.URL != "/downloads.example.invalid/object?REDACTED" {
+				t.Errorf("fetch failure was not logged with its redacted request URL: %q", record.URL)
+			}
+			for _, output := range []string{logs.String(), recorder.Body.String()} {
+				if strings.Contains(output, "synthetic") || strings.Contains(output, "X-Amz") {
+					t.Errorf("fetch failure exposed a signed-URL query: %s", output)
+				}
+			}
+		})
+	}
+}
