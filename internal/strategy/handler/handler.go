@@ -245,7 +245,8 @@ func (h *Handler) ParallelFetch(chunkSize int64, concurrency int) *Handler {
 // 5. Cache the response while streaming to the client.
 //
 // HEAD misses are forwarded upstream without caching, so metadata probes
-// never trigger full downloads.
+// never trigger full downloads. An upstream that rejects HEAD is probed with
+// GET instead.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := h.metrics.WithRequest(r.Context(), h.strategy, h.registry, h.external)
 	r = r.WithContext(ctx)
@@ -526,21 +527,46 @@ func (h *Handler) upstreamRequest(r *http.Request) (*http.Request, error) {
 	return req, nil
 }
 
+// forwardHead answers a HEAD miss with the upstream's headers. Some upstreams,
+// such as presigned URLs and download endpoints, reject HEAD for objects that
+// GET returns, so a rejected HEAD is retried as a GET whose body is not read.
 func (h *Handler) forwardHead(w http.ResponseWriter, r *http.Request) {
-	req, err := h.upstreamRequest(r)
+	status, headers, err := h.probe(r, http.MethodHead)
+	if err == nil && headRejected(status) {
+		status, headers, err = h.probe(r, http.MethodGet)
+	}
 	if err != nil {
 		h.errorHandler(err, w, r)
 		return
 	}
-	req.Method = http.MethodHead
+	maps.Copy(w.Header(), upstreamHeaders(headers))
+	w.WriteHeader(status)
+}
+
+// probe sends r upstream as method and returns the response status and
+// headers. The body is never read.
+func (h *Handler) probe(r *http.Request, method string) (int, http.Header, error) {
+	req, err := h.upstreamRequest(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Method = method
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.errorHandler(httputil.Errorf(http.StatusBadGateway, "failed to fetch: %w", err), w, r)
-		return
+		return 0, nil, httputil.Errorf(http.StatusBadGateway, "failed to fetch: %w", err)
 	}
-	_ = resp.Body.Close() //nolint:errcheck // HEAD has no body to lose
-	maps.Copy(w.Header(), upstreamHeaders(resp.Header))
-	w.WriteHeader(resp.StatusCode)
+	_ = resp.Body.Close() //nolint:errcheck // Only the headers are used.
+	return resp.StatusCode, resp.Header, nil
+}
+
+// headRejected reports whether status can mean that the upstream refuses HEAD
+// rather than that the object is unavailable. Rate limits and server errors
+// are left alone so a struggling upstream is not asked twice.
+func headRejected(status int) bool {
+	if status == http.StatusNotImplemented {
+		return true
+	}
+	return status >= http.StatusBadRequest && status < http.StatusInternalServerError && status != http.StatusTooManyRequests
 }
 
 func (h *Handler) fetchAndCache(w http.ResponseWriter, r *http.Request, key cache.Key) error {

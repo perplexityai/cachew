@@ -642,6 +642,66 @@ func TestHeadRequests(t *testing.T) {
 	assert.Equal(t, []string{http.MethodHead, http.MethodGet}, methods)
 }
 
+func TestHeadMissFallsBackToGet(t *testing.T) {
+	tests := []struct {
+		name         string
+		headStatus   int
+		getStatus    int
+		expectStatus int
+		expectLength string
+		expectCalls  []string
+	}{
+		{name: "HeadSupported", headStatus: http.StatusOK, getStatus: http.StatusOK,
+			expectStatus: http.StatusOK, expectLength: "7", expectCalls: []string{http.MethodHead}},
+		{name: "HeadForbidden", headStatus: http.StatusForbidden, getStatus: http.StatusOK,
+			expectStatus: http.StatusOK, expectLength: "7", expectCalls: []string{http.MethodHead, http.MethodGet}},
+		{name: "HeadNotFound", headStatus: http.StatusNotFound, getStatus: http.StatusOK,
+			expectStatus: http.StatusOK, expectLength: "7", expectCalls: []string{http.MethodHead, http.MethodGet}},
+		{name: "HeadNotImplemented", headStatus: http.StatusNotImplemented, getStatus: http.StatusOK,
+			expectStatus: http.StatusOK, expectLength: "7", expectCalls: []string{http.MethodHead, http.MethodGet}},
+		{name: "ObjectMissing", headStatus: http.StatusNotFound, getStatus: http.StatusNotFound,
+			expectStatus: http.StatusNotFound, expectLength: "0", expectCalls: []string{http.MethodHead, http.MethodGet}},
+		{name: "RateLimited", headStatus: http.StatusTooManyRequests, getStatus: http.StatusOK,
+			expectStatus: http.StatusTooManyRequests, expectCalls: []string{http.MethodHead}},
+		{name: "ServerError", headStatus: http.StatusBadGateway, getStatus: http.StatusOK,
+			expectStatus: http.StatusBadGateway, expectCalls: []string{http.MethodHead}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls = append(calls, r.Method)
+				status := tt.getStatus
+				if r.Method == http.MethodHead {
+					status = tt.headStatus
+				}
+				if status != http.StatusOK {
+					w.WriteHeader(status)
+					return
+				}
+				w.Header().Set("Content-Length", "7")
+				if r.Method == http.MethodGet {
+					_, _ = fmt.Fprint(w, "content")
+				}
+			}))
+			defer upstream.Close()
+			c := mustNewMemoryCache(t)
+			defer c.Close()
+			h := handler.New(http.DefaultClient, c, newTestSpools(t)).Transform(upstreamTransform(upstream.URL))
+
+			w := serve(t, h, http.MethodHead, "http://example.com/a", nil)
+			assert.Equal(t, tt.expectStatus, w.Code)
+			assert.Equal(t, tt.expectLength, w.Header().Get("Content-Length"))
+			assert.Equal(t, "", w.Body.String())
+			assert.Equal(t, tt.expectCalls, calls)
+
+			// A probe never fills the cache.
+			_, err := c.Stat(t.Context(), cache.NewKey("http://example.com/a"))
+			assert.IsError(t, err, os.ErrNotExist)
+		})
+	}
+}
+
 func TestRangeMissCachesFullObject(t *testing.T) {
 	const payload = "0123456789"
 	tests := []struct {
