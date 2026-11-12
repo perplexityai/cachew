@@ -1,6 +1,7 @@
 package httputil_test
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -292,5 +293,52 @@ func TestBackoffWithoutCooldown(t *testing.T) {
 			assert.Equal(t, tt.status, resp.StatusCode, "%s exempt=%v", tt.path, tt.exempt)
 		}
 		assert.Equal(t, 4, calls)
+	})
+}
+
+func TestBackoffForwardedCredentialCooldown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			status := http.StatusOK
+			if r.URL.Path == "/limited" {
+				status = http.StatusTooManyRequests
+			}
+			return &http.Response{StatusCode: status, Header: make(http.Header), Body: http.NoBody, Request: r}, nil
+		})
+		var logs strings.Builder
+		client := &http.Client{Transport: httputil.NewBackoffTransport(base, time.Minute, time.Hour, slog.New(slog.NewTextHandler(&logs, nil)))}
+		forwarded := httputil.WithForwardedCredentialCooldown(t.Context())
+		for _, tt := range []struct {
+			name          string
+			ctx           context.Context
+			path          string
+			authorization string
+			status        int
+		}{
+			{"CredentialLimited", forwarded, "/limited", "Bearer a", http.StatusTooManyRequests},
+			{"SameCredentialCools", forwarded, "/other", "Bearer a", http.StatusTooManyRequests},
+			{"OtherCredentialPasses", forwarded, "/other", "Bearer b", http.StatusOK},
+			{"AnonymousPasses", forwarded, "/other", "", http.StatusOK},
+			{"UnmarkedCredentialSharesHost", t.Context(), "/other", "Bearer a", http.StatusOK},
+			{"ExplicitScopeWins", httputil.WithCooldownScope(forwarded, "installation"), "/other", "Bearer a", http.StatusOK},
+			{"HostLimited", forwarded, "/limited", "", http.StatusTooManyRequests},
+			{"AnonymousCoolsWithHost", forwarded, "/other", "", http.StatusTooManyRequests},
+			{"CredentialOutlivesHostCooldown", forwarded, "/other", "Bearer b", http.StatusOK},
+		} {
+			req, err := http.NewRequestWithContext(tt.ctx, http.MethodGet, "https://api.example"+tt.path, nil)
+			assert.NoError(t, err)
+			if tt.authorization != "" {
+				req.Header.Set("Authorization", tt.authorization)
+			}
+			resp, err := client.Do(req)
+			assert.NoError(t, err)
+			assert.NoError(t, resp.Body.Close())
+			assert.Equal(t, tt.status, resp.StatusCode, tt.name)
+		}
+		assert.Equal(t, 7, calls)
+		assert.Contains(t, logs.String(), "scope=forwarded-credential:")
+		assert.NotContains(t, logs.String(), "Bearer", "the cooldown log names the scope without the credential")
 	})
 }

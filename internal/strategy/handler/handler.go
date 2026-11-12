@@ -516,6 +516,11 @@ func (h *Handler) upstreamRequest(r *http.Request) (*http.Request, error) {
 			req.Header[key] = values
 		}
 	}
+	// A credential that the client supplies cools down on its own. A credential
+	// that the transform attached keeps the scope the transform chose.
+	if authorization := r.Header.Get("Authorization"); authorization != "" && req.Header.Get("Authorization") == authorization {
+		req = req.WithContext(httputil.WithForwardedCredentialCooldown(ctx))
+	}
 	req.Header.Del("Range")
 	req.Header.Del("If-Range")
 	return req, nil

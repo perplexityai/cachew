@@ -273,6 +273,7 @@ func (g *GitHubObjects) fetchBatch(r *http.Request, request githubObjectsRequest
 	upstream.Header.Set("Content-Type", "application/json")
 	upstream.Header.Set("X-Github-Api-Version", "2022-11-28")
 	upstream.Header.Set("Authorization", r.Header.Get("Authorization"))
+	upstream = upstream.WithContext(httputil.WithForwardedCredentialCooldown(upstream.Context()))
 	response, err := g.client.Do(upstream)
 	if err != nil {
 		result = "transport_error"
