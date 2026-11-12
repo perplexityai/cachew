@@ -50,7 +50,7 @@ type GlobalConfig struct {
 	State                  string        `hcl:"state" default:"./state" help:"Base directory for all state (git mirrors, cache, etc.)."`
 	Bind                   string        `hcl:"bind" default:"127.0.0.1:8080" help:"Bind address for the server."`
 	URL                    string        `hcl:"url" default:"http://127.0.0.1:8080/" help:"Base URL for cachewd."`
-	UpstreamBackoff        time.Duration `hcl:"upstream-backoff,optional" default:"1m" help:"Cooldown after an upstream 429 with missing or invalid Retry-After; must be positive."`
+	UpstreamBackoff        time.Duration `hcl:"upstream-backoff,optional" default:"1m" help:"Cooldown after an upstream 429 with missing or invalid Retry-After; 0 disables cooldowns."`
 	UpstreamBackoffMax     time.Duration `hcl:"upstream-backoff-max,optional" default:"15m" help:"Longest cooldown after an upstream 429, whatever its Retry-After; raised to upstream-backoff when lower."`
 	ShutdownReadinessDelay time.Duration `hcl:"shutdown-readiness-delay,optional" default:"5s" help:"Delay between flipping readiness to 503 on SIGTERM and starting graceful shutdown."`
 	// ShutdownTimeout must be less than the pod's terminationGracePeriodSeconds
@@ -507,10 +507,21 @@ func configureProcess(logger *slog.Logger, mutexProfileFraction int, upstreamBac
 	// side-effect import; OPA gates external access.
 	runtime.SetMutexProfileFraction(mutexProfileFraction)
 
-	// Every strategy that uses http.DefaultTransport shares one set of
-	// per-hostname and per-credential 429 cooldowns. Origin metrics sit below the cooldowns so that
-	// requests rejected during a cooldown are not counted as origin traffic.
-	http.DefaultTransport = httputil.NewBackoffTransport(metrics.NewOriginTransport(http.DefaultTransport), upstreamBackoff, upstreamBackoffMax, logger) //nolint:reassign
+	http.DefaultTransport = upstreamTransport(http.DefaultTransport, logger, upstreamBackoff, upstreamBackoffMax) //nolint:reassign
+}
+
+// upstreamTransport is the transport of every strategy that uses
+// http.DefaultTransport, so they share one set of per-hostname and
+// per-credential 429 cooldowns. Origin metrics sit below the cooldowns so that
+// requests rejected during a cooldown are not counted as origin traffic. A zero
+// backoff leaves cooldowns out: every request reaches the origin, and its 429
+// reaches the client as the origin sent it.
+func upstreamTransport(base http.RoundTripper, logger *slog.Logger, backoff, backoffMax time.Duration) http.RoundTripper {
+	origin := metrics.NewOriginTransport(base)
+	if backoff == 0 {
+		return origin
+	}
+	return httputil.NewBackoffTransport(origin, backoff, backoffMax, logger)
 }
 
 // loadGlobalConfig unmarshals the global config from HCL, using a two-pass
@@ -553,8 +564,8 @@ func loadGlobalConfig(ast *hcl.AST) (GlobalConfig, map[string]string, error) {
 	if err := hcl.UnmarshalAST(ast, &cfg, hcl.HydratedImplicitBlocks(true), expanding); err != nil {
 		return cfg, nil, errors.Errorf("load global config: %w", err)
 	}
-	if cfg.UpstreamBackoff <= 0 {
-		return cfg, nil, errors.New("upstream-backoff must be positive")
+	if cfg.UpstreamBackoff < 0 {
+		return cfg, nil, errors.New("upstream-backoff must not be negative")
 	}
 	// Keeps configs that set only a long upstream-backoff valid.
 	cfg.UpstreamBackoffMax = max(cfg.UpstreamBackoffMax, cfg.UpstreamBackoff)

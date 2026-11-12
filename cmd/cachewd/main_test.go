@@ -113,3 +113,60 @@ func TestServerWiresAuthorizationBeforeRequestAdmission(t *testing.T) {
 	server.Handler.ServeHTTP(afterDrain, httptest.NewRequest(http.MethodGet, "/artifact/after-drain", nil).WithContext(ctx))
 	assert.Equal(t, http.StatusNoContent, afterDrain.Code)
 }
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+const upstreamBackoffTestConfig = `
+log {
+  level = "info"
+}
+`
+
+func TestUpstreamBackoffConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		config       string
+		originCalls  int
+		cacheControl string
+		remaining    string
+	}{
+		// The second request is answered locally, without the origin's headers.
+		{name: "DefaultCoolsDown", originCalls: 1, cacheControl: "no-store"},
+		// Both requests get the origin's own response.
+		{name: "ZeroDisablesCooldowns", config: `upstream-backoff = "0"`, originCalls: 2, cacheControl: "private", remaining: "0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ast, err := hcl.Parse(strings.NewReader(tt.config + upstreamBackoffTestConfig))
+			assert.NoError(t, err)
+			config, _, err := loadGlobalConfig(ast)
+			assert.NoError(t, err)
+
+			var originCalls int
+			origin := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				originCalls++
+				header := http.Header{"Retry-After": {"120"}, "Cache-Control": {"private"}, "X-Ratelimit-Remaining": {"0"}}
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header, Body: http.NoBody, Request: r}, nil
+			})
+			transport := upstreamTransport(origin, slog.New(slog.DiscardHandler), config.UpstreamBackoff, config.UpstreamBackoffMax)
+			var last *http.Response
+			for range 2 {
+				request := httptest.NewRequest(http.MethodGet, "https://example.com/artifact", nil)
+				last, err = transport.RoundTrip(request)
+				assert.NoError(t, err)
+				assert.NoError(t, last.Body.Close())
+				assert.Equal(t, http.StatusTooManyRequests, last.StatusCode)
+			}
+			assert.Equal(t, tt.originCalls, originCalls)
+			assert.Equal(t, "120", last.Header.Get("Retry-After"))
+			assert.Equal(t, tt.cacheControl, last.Header.Get("Cache-Control"))
+			assert.Equal(t, tt.remaining, last.Header.Get("X-Ratelimit-Remaining"))
+		})
+	}
+
+	ast, err := hcl.Parse(strings.NewReader(`upstream-backoff = "-1s"` + upstreamBackoffTestConfig))
+	assert.NoError(t, err)
+	_, _, err = loadGlobalConfig(ast)
+	assert.EqualError(t, err, "upstream-backoff must not be negative")
+}
