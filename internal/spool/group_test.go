@@ -125,6 +125,50 @@ func TestFillOutlivesItsRequests(t *testing.T) {
 	assert.Equal(t, "first second", string(body))
 }
 
+func TestClientLeavingAfterFullBodyIsComplete(t *testing.T) {
+	ctx, registry, _ := newTestRegistry(t, spool.Config{})
+	group := registry.NewGroup(spool.ReleaseCompleted)
+	release := make(chan struct{})
+	defer close(release)
+	fill := func(_ context.Context, w *spool.Writer) error {
+		w.Header().Set("Content-Length", "4")
+		w.WriteHeader(http.StatusOK)
+		_, err := io.WriteString(w, "body")
+		<-release
+		return err
+	}
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	w := &signalingRecorder{ResponseRecorder: httptest.NewRecorder(), wrote: make(chan struct{}, 1)}
+	served := make(chan error, 1)
+	var result spool.Result
+	go func() {
+		req := httptest.NewRequestWithContext(reqCtx, http.MethodGet, "/object", nil)
+		var err error
+		result, err = group.Serve(w, req, key, fill)
+		served <- err
+	}()
+	<-w.wrote
+	cancel()
+	assert.NoError(t, <-served)
+	assert.Equal(t, int64(4), result.Bytes)
+	assert.Equal(t, "body", w.Body.String())
+}
+
+type signalingRecorder struct {
+	*httptest.ResponseRecorder
+	wrote chan struct{}
+}
+
+func (r *signalingRecorder) Write(p []byte) (int, error) {
+	n, err := r.ResponseRecorder.Write(p)
+	select {
+	case r.wrote <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
 func TestRequestsFollowPendingCacheWrite(t *testing.T) {
 	ctx, registry, dir := newTestRegistry(t, spool.Config{})
 	group := registry.NewGroup(spool.ReleaseCompleted)
