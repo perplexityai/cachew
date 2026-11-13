@@ -104,7 +104,7 @@ func NewGitHubObjects(_ context.Context, config GitHubObjectsConfig, objectCache
 	strategy := &GitHubObjects{
 		target:  target,
 		cache:   objectCache,
-		client:  &http.Client{Timeout: githubObjectsUpstreamTimeout},
+		client:  &http.Client{Transport: httputil.UpstreamTransport(), Timeout: githubObjectsUpstreamTimeout},
 		metrics: newGitHubObjectsMetrics(),
 	}
 	mux.Handle("POST /api.github.com/repos/{owner}/{repo}/git/objects:batch", http.HandlerFunc(strategy.handle))
