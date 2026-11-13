@@ -12,6 +12,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
+
+	"github.com/block/cachew/internal/httputil"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -83,6 +85,28 @@ func newBlockedSocketTestHarness(t *testing.T, metrics metricRecorder) *blockedS
 	client.metrics = metrics
 	harness.client = client
 	return harness
+}
+
+func TestSocketUsesSharedUpstreamTransport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(testAllowResponse))
+	}))
+	t.Cleanup(server.Close)
+	var calls atomic.Int32
+	httputil.SetUpstreamTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return server.Client().Transport.RoundTrip(request)
+	}))
+	t.Cleanup(func() { httputil.SetUpstreamTransport(nil) })
+	client, err := newSocketEvaluator(SocketConfig{
+		APIURL: server.URL, Organization: testOrganization, Token: testToken,
+	}, true)
+	assert.NoError(t, err)
+
+	decision, err := client.Evaluate(t.Context(), testPURL)
+	assert.NoError(t, err)
+	assert.Equal(t, VerdictAllow, decision.Verdict)
+	assert.Equal(t, int32(1), calls.Load())
 }
 
 func TestNewSelectsSocketProvider(t *testing.T) {

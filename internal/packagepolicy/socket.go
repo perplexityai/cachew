@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+
+	"github.com/block/cachew/internal/httputil"
 )
 
 const (
@@ -119,7 +121,8 @@ func newSocketEvaluator(config SocketConfig, allowHTTP bool) (*socketEvaluator, 
 		queueTimeout: config.QueueTimeout,
 		label:        config.Label,
 		httpClient: &http.Client{
-			Timeout: config.Timeout,
+			Transport: httputil.UpstreamTransport(),
+			Timeout:   config.Timeout,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
