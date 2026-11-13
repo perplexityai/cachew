@@ -507,11 +507,11 @@ func configureProcess(logger *slog.Logger, mutexProfileFraction int, upstreamBac
 	// side-effect import; OPA gates external access.
 	runtime.SetMutexProfileFraction(mutexProfileFraction)
 
-	http.DefaultTransport = upstreamTransport(http.DefaultTransport, logger, upstreamBackoff, upstreamBackoffMax) //nolint:reassign
+	httputil.SetUpstreamTransport(upstreamTransport(http.DefaultTransport, logger, upstreamBackoff, upstreamBackoffMax))
 }
 
 // upstreamTransport is the transport of every strategy that uses
-// http.DefaultTransport, so they share one set of per-hostname and
+// httputil.UpstreamTransport, so they share one set of per-hostname and
 // per-credential 429 cooldowns. Origin metrics sit below the cooldowns so that
 // requests rejected during a cooldown are not counted as origin traffic. A zero
 // backoff leaves cooldowns out: every request reaches the origin, and its 429
