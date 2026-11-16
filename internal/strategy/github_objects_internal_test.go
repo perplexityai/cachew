@@ -43,9 +43,10 @@ func TestGitHubObjectsCoolsDownPerCredential(t *testing.T) {
 	assert.NoError(t, err)
 	defer memory.Close()
 	mux := http.NewServeMux()
-	objects, err := NewGitHubObjects(ctx, GitHubObjectsConfig{Target: upstream.URL}, memory, mux)
+	httputil.SetUpstreamTransport(httputil.NewBackoffTransport(http.DefaultTransport, time.Minute, time.Hour, slog.New(slog.DiscardHandler)))
+	t.Cleanup(func() { httputil.SetUpstreamTransport(nil) })
+	_, err = NewGitHubObjects(ctx, GitHubObjectsConfig{Target: upstream.URL}, memory, mux)
 	assert.NoError(t, err)
-	objects.client.Transport = httputil.NewBackoffTransport(http.DefaultTransport, time.Minute, time.Hour, slog.New(slog.DiscardHandler))
 
 	post := func(authorization string) int {
 		t.Helper()

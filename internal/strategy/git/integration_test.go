@@ -497,21 +497,6 @@ func TestIntegrationSpoolReusesDuringClone(t *testing.T) {
 	assert.Equal(t, firstCloneCount, totalCount, "second clone should not have made additional upstream upload-pack requests")
 }
 
-// TestIntegrationNotOurRefFallsBackToUpstream reproduces the force-push race
-// condition that causes "not our ref" errors and verifies that cachew falls back
-// to upstream rather than returning the git protocol error to the client.
-//
-// The race is:
-//  1. Client receives /info/refs showing commit A as the tip of a branch.
-//  2. A concurrent background fetch runs, incorporating a force-push that makes
-//     commit A unreachable from all refs in the local mirror.
-//  3. Client sends POST /git-upload-pack requesting commit A.
-//  4. git upload-pack rejects the request: "not our ref <A>".
-//
-// After the fix, cachew detects the stderr error before any bytes reach the
-// client and transparently forwards the request to upstream.
-//
-// Run with: go test -v -run TestIntegrationNotOurRefFallsBackToUpstream -tags integration -timeout 30s
 func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found in PATH")
@@ -565,14 +550,30 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 	out, _ := branchContains.CombinedOutput()
 	assert.Equal(t, "", strings.TrimSpace(string(out)), "orphaned SHA should not be reachable from any branch")
 
+	// Mirrors allow any existing SHA, even if unreachable. Remove the object
+	// to exercise the missing-object fallback rather than a valid local read.
+	runGit(t, mirrorPath, "reflog", "expire", "--expire=now", "--all")
+	runGit(t, mirrorPath, "prune", "--expire=now")
+	assert.Error(t, exec.Command("git", "-C", mirrorPath, "cat-file", "-e", orphanedSHA).Run())
+
+	const (
+		uploadPackContentType = "application/x-git-upload-pack-result"
+		upstreamResponse      = "0008NAK\n"
+	)
+	body := pktLine("want "+orphanedSHA+"\n") + "0000" + pktLine("done\n")
+
 	// --- Mock upstream: records requests, returns a minimal git flush response ---
 	var upstreamHits atomic.Int32
 	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
-		t.Logf("Mock upstream received: %s %s", r.Method, r.URL.Path)
-		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+		forwardedBody, readErr := io.ReadAll(r.Body)
+		if readErr != nil || r.Method != http.MethodPost || r.URL.Path != "/repo/git-upload-pack" || string(forwardedBody) != body {
+			http.Error(w, "unexpected upstream request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", uploadPackContentType)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("0008NAK\n")) // minimal NAK response
+		_, _ = w.Write([]byte(upstreamResponse))
 	}))
 	defer mockUpstream.Close()
 
@@ -584,12 +585,14 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 	}, nil)
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, memCache.Close()) })
 	strategy, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc,
 		func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 	// The warm-up goroutine uses context.WithoutCancel so it survives
 	// t.Context() cancellation. Wait for it before TempDir cleanup.
 	t.Cleanup(func() { waitForReady(t, strategy) })
+	waitForReady(t, strategy)
 
 	// Redirect all upstream proxy requests to the mock server.
 	var redirectHits atomic.Int32
@@ -604,21 +607,22 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 
 	// --- Send a raw upload-pack POST requesting the orphaned SHA ---
 	// This mirrors what a git client does after receiving /info/refs that
-	// advertised orphanedSHA (before the force-push fetch updated the mirror).
-	body := pktLine("want "+orphanedSHA+"\n") + "0000" + pktLine("done\n")
+	// advertised orphanedSHA before the force-push and local pruning.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		cachewServer.URL+"/git/local/repo/git-upload-pack",
 		strings.NewReader(body))
 	assert.NoError(t, err)
 	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := cachewServer.Client().Do(req)
 	assert.NoError(t, err)
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	responseBody, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
 
-	// After the fix: the request must have been forwarded to upstream.
-	// Before the fix: upstreamHits == 0 and this assertion fails.
-	assert.True(t, upstreamHits.Load() > 0,
-		"cachew should fall back to upstream when git upload-pack returns 'not our ref'")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, uploadPackContentType, resp.Header.Get("Content-Type"))
+	assert.Equal(t, upstreamResponse, string(responseBody))
+	assert.Equal(t, int32(1), upstreamHits.Load())
+	assert.Equal(t, int32(1), redirectHits.Load())
 }

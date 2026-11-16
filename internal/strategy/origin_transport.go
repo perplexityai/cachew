@@ -31,8 +31,8 @@ func originTransportStatus(ctx context.Context, err error) string {
 }
 
 // newTunedOriginTransport returns a transport with net/http's default settings
-// for an origin that needs its own compression and header timeout. cachewd
-// replaces http.DefaultTransport with a wrapper, so it cannot be cloned.
+// for an origin that needs its own compression and header timeout, independent
+// of the process-wide default and shared upstream transport.
 func newTunedOriginTransport(headerTimeout time.Duration) *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
