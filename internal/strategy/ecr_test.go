@@ -874,11 +874,13 @@ func TestECRMetricsRecordWhyARequestFailed(t *testing.T) {
 		"inline blob bytes that do not match": {
 			configure: func(e *ecrTest) { e.fake.noRedirect = true },
 			method:    http.MethodGet, kind: ecrKindBlob, reason: ecrFailureDigestMismatch,
-			path:      func(*ecrTest) string { return "/v2/" + testECRName + "/blobs/" + testDigest([]byte("other")) },
+			path: func(*ecrTest) string { return "/v2/" + testECRName + "/blobs/" + testDigest([]byte("other")) },
 		},
 		"large blob bytes instead of a redirect": {
-			configure: func(e *ecrTest) { e.fake.noRedirect, e.fake.blob = true, []byte(strings.Repeat("x", ecrInlineBlobLimit+1)) },
-			method:    http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureUpstreamStatus,
+			configure: func(e *ecrTest) {
+				e.fake.noRedirect, e.fake.blob = true, []byte(strings.Repeat("x", ecrInlineBlobLimit+1))
+			},
+			method: http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureUpstreamStatus,
 		},
 		"ECR unreachable": {
 			configure: func(e *ecrTest) { e.fake.server.Close() },
