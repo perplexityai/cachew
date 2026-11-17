@@ -19,6 +19,7 @@ const (
 	ecrResultHit         ecrResult = "hit"
 	ecrResultMiss        ecrResult = "miss"
 	ecrResultRedirect    ecrResult = "redirect"
+	ecrResultInline      ecrResult = "inline"
 	ecrResultMetadata    ecrResult = "metadata"
 	ecrResultNotFound    ecrResult = "not_found"
 	ecrResultRateLimited ecrResult = "rate_limited"
@@ -169,6 +170,8 @@ func (o *ecrObservation) outcome(kind, method string, status int, cacheResult st
 		outcome.result = ecrResultHit
 	case status >= http.StatusBadRequest:
 		outcome.result, outcome.reason = ecrResultFailure, ecrFailureUpstreamStatus
+	case kind == ecrKindBlob && method == http.MethodGet:
+		outcome.result = ecrResultInline
 	case kind == ecrKindBlob:
 		outcome.result = ecrResultMetadata
 	default:

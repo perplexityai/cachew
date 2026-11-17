@@ -407,9 +407,29 @@ func TestECRRefusesUnusableBlobRedirects(t *testing.T) {
 	assert.NotContains(t, w.Body.String(), "presigned-secret")
 	assert.NotContains(t, w.Body.String(), "X-Amz-Signature")
 
-	e = setupECRTest(t, func(f *fakeECR) { f.noRedirect = true })
-	w = e.do(http.MethodGet, "/v2/"+testECRName+"/blobs/"+testDigest(e.fake.blob))
-	assert.Equal(t, http.StatusBadGateway, w.Code, "blob bytes are never streamed or cached")
+	large := []byte(strings.Repeat("x", ecrInlineBlobLimit+1))
+	e = setupECRTest(t, func(f *fakeECR) { f.noRedirect, f.blob = true, large })
+	w = e.do(http.MethodGet, "/v2/"+testECRName+"/blobs/"+testDigest(large))
+	assert.Equal(t, http.StatusBadGateway, w.Code, "layers are never streamed through the proxy")
+	assert.NotContains(t, w.Body.String(), string(large))
+}
+
+func TestECRServesTinyInlineBlobsAfterVerifying(t *testing.T) {
+	// ECR answers the 32-byte empty gzip layer with its bytes, not a redirect.
+	e := setupECRTest(t, func(f *fakeECR) { f.noRedirect = true })
+	digest := testDigest(e.fake.blob)
+	for _, path := range []string{"/v2/" + testECRName + "/blobs/" + digest, "/" + testECRRegistry + "/v2/" + testECRName + "/blobs/" + digest} {
+		w := e.do(http.MethodGet, path)
+		assert.Equal(t, http.StatusOK, w.Code, path)
+		assert.Equal(t, e.fake.blob, w.Body.Bytes(), path)
+		assert.Equal(t, digest, w.Header().Get("Docker-Content-Digest"), path)
+		assert.Equal(t, strconv.Itoa(len(e.fake.blob)), w.Header().Get("Content-Length"), path)
+	}
+	registry, _ := e.fake.counts()
+	assert.Equal(t, 2, registry, "inline blobs are not cached")
+
+	w := e.do(http.MethodGet, "/v2/"+testECRName+"/blobs/"+testDigest([]byte("other")))
+	assert.Equal(t, http.StatusBadGateway, w.Code, "bytes that do not match the digest are never sent")
 	assert.NotContains(t, w.Body.String(), string(e.fake.blob))
 }
 
@@ -851,9 +871,16 @@ func TestECRMetricsRecordWhyARequestFailed(t *testing.T) {
 			configure: func(e *ecrTest) { e.fake.headDigest = testDigest([]byte("other")) },
 			method:    http.MethodHead, path: blob, kind: ecrKindBlob, reason: ecrFailureDigestMismatch,
 		},
-		"blob bytes instead of a redirect": {
+		"inline blob bytes that do not match": {
 			configure: func(e *ecrTest) { e.fake.noRedirect = true },
-			method:    http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureUpstreamStatus,
+			method:    http.MethodGet, kind: ecrKindBlob, reason: ecrFailureDigestMismatch,
+			path: func(*ecrTest) string { return "/v2/" + testECRName + "/blobs/" + testDigest([]byte("other")) },
+		},
+		"large blob bytes instead of a redirect": {
+			configure: func(e *ecrTest) {
+				e.fake.noRedirect, e.fake.blob = true, []byte(strings.Repeat("x", ecrInlineBlobLimit+1))
+			},
+			method: http.MethodGet, path: blob, kind: ecrKindBlob, reason: ecrFailureUpstreamStatus,
 		},
 		"ECR unreachable": {
 			configure: func(e *ecrTest) { e.fake.server.Close() },
