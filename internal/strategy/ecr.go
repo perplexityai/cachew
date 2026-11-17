@@ -62,6 +62,12 @@ const (
 	// upstream declared a length, so ecrTransport rejects 200 responses without
 	// one: a chunked body could be terminated cleanly after wrong bytes.
 	digestHoldback = 4096
+
+	// ECR answers some tiny blobs, such as the 32-byte empty gzip layer, with
+	// the bytes instead of a redirect. Blobs up to this size are verified in
+	// memory and served; larger inline answers are still refused so layers
+	// never stream through the proxy.
+	ecrInlineBlobLimit = 4096
 )
 
 // RegisterECR adds the ecr strategy to the registry.
@@ -101,7 +107,8 @@ type ECRConfig struct {
 // assumed role; the body is hashed while it streams, and a digest mismatch
 // aborts the cache write and truncates the response. A blob GET answers with
 // ECR's redirect to a presigned S3 URL and a blob HEAD with ECR's metadata, so
-// layers never stream through the proxy.
+// layers never stream through the proxy. The few tiny blobs ECR answers inline
+// are verified and served from memory.
 type ECR struct {
 	registry     string
 	repositories []string
@@ -361,6 +368,8 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		// The presigned URL expires; it must not outlive it in any client cache.
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusTemporaryRedirect)
+	case r.Method == http.MethodGet && resp.StatusCode == http.StatusOK:
+		s.serveInlineBlob(w, r, ref, resp)
 	case r.Method == http.MethodHead && resp.StatusCode == http.StatusOK:
 		if digest := resp.Header.Get("Docker-Content-Digest"); digest != ref.digest {
 			s.blobFailure(w, r, ecrFailureDigestMismatch, "ECR reported a different digest for the blob", resp.StatusCode)
@@ -382,6 +391,33 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		http.Error(w, http.StatusText(resp.StatusCode), resp.StatusCode)
 	default:
 		s.blobFailure(w, r, ecrFailureUpstreamStatus, "unexpected ECR blob response", resp.StatusCode)
+	}
+}
+
+// serveInlineBlob serves a blob ECR answered with its bytes. The whole body is
+// read and checked against the digest before anything is sent, so a client
+// never receives a partial or wrong blob. Nothing is cached.
+func (s *ECR) serveInlineBlob(w http.ResponseWriter, r *http.Request, ref ecrRef, resp *http.Response) {
+	if resp.ContentLength < 0 || resp.ContentLength > ecrInlineBlobLimit {
+		s.blobFailure(w, r, ecrFailureUpstreamStatus, "ECR answered a blob GET with bytes instead of a redirect", resp.StatusCode)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, ecrInlineBlobLimit+1))
+	if err != nil {
+		writeECRError(errors.Errorf("%w: %s: read inline blob: %w", errECRTransport, s.registry, err), w, r)
+		return
+	}
+	sum := sha256.Sum256(body)
+	if int64(len(body)) != resp.ContentLength || "sha256:"+hex.EncodeToString(sum[:]) != ref.digest {
+		s.blobFailure(w, r, ecrFailureDigestMismatch, "ECR returned blob bytes that do not match the digest", resp.StatusCode)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Docker-Content-Digest", ref.digest)
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		logging.FromContext(r.Context()).DebugContext(r.Context(), "Failed to write inline ECR blob", "error", err)
 	}
 }
 
