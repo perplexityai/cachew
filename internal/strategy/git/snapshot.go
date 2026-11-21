@@ -1644,7 +1644,7 @@ func (s *Strategy) handleLFSSnapshotRequest(w http.ResponseWriter, r *http.Reque
 	repoPath := ExtractRepoPath(strings.TrimSuffix(pathValue, "/lfs-snapshot.tar.zst"))
 	upstreamURL := "https://" + host + "/" + repoPath
 	if s.repositoryFor(upstreamURL).DisableLFSSnapshot {
-		http.NotFound(w, r)
+		http.Error(w, "LFS snapshot disabled for this repository", http.StatusNotFound)
 		return
 	}
 	cacheKey := lfsSnapshotCacheKey(upstreamURL)
