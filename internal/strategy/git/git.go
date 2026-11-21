@@ -177,7 +177,7 @@ func New(
 	// /_liveness) come up immediately. /_readiness gates on Ready() so the
 	// Service load balancer holds traffic until warming completes.
 	go func() {
-		warmCtx := context.WithoutCancel(ctx)
+		warmCtx := ctx
 		// Coordination only matters when warm-up will schedule snapshot
 		// jobs; with snapshots disabled, warm immediately.
 		if s.config.SnapshotInterval > 0 {
@@ -201,7 +201,7 @@ func New(
 			cancel()
 		}
 		if err := s.warmExistingRepos(warmCtx); err != nil {
-			logger.WarnContext(warmCtx, "Failed to warm existing repos", "error", err)
+			return
 		}
 		s.ready.Store(true)
 		logger.InfoContext(warmCtx, "Git strategy ready")
@@ -310,40 +310,64 @@ func (s *Strategy) SetMetadataStore(store *metadatadb.Store) {
 
 func (s *Strategy) warmExistingRepos(ctx context.Context) error {
 	logger := logging.FromContext(ctx)
-	existing, err := s.cloneManager.DiscoverExisting(ctx)
-	if err != nil {
-		return errors.Wrap(err, "discover existing clones")
+	var pending []*gitclone.Repository
+	discovered := false
+	for delay := time.Second; ctx.Err() == nil; delay = min(2*delay, 30*time.Second) {
+		if !discovered {
+			var err error
+			pending, err = s.cloneManager.DiscoverExisting(ctx)
+			discovered = err == nil
+			if err != nil {
+				logger.WarnContext(ctx, "Failed to discover existing mirrors; retrying", "error", err)
+			}
+		}
+		remaining := pending[:0]
+		for _, repo := range pending {
+			if err := s.warmMirror(ctx, repo); err != nil {
+				logger.WarnContext(ctx, "Startup fetch failed for existing repo; retrying", "upstream", repo.UpstreamURL(), "error", err)
+				remaining = append(remaining, repo)
+			}
+		}
+		pending = remaining
+		if discovered && len(pending) == 0 {
+			return ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
 	}
-	for _, repo := range existing {
-		logger.InfoContext(ctx, "Running startup fetch for existing repo", "upstream", repo.UpstreamURL())
+	return ctx.Err()
+}
 
-		preRefs, err := repo.GetLocalRefs(ctx)
-		if err != nil {
-			return errors.Wrapf(err, "get pre-fetch refs for %s", repo.UpstreamURL())
-		}
+func (s *Strategy) warmMirror(ctx context.Context, repo *gitclone.Repository) error {
+	logger := logging.FromContext(ctx)
+	logger.InfoContext(ctx, "Running startup fetch for existing repo", "upstream", repo.UpstreamURL())
+	preRefs, err := repo.GetLocalRefs(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "get pre-fetch refs for %s", repo.UpstreamURL())
+	}
 
-		start := time.Now()
-		if err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout); err != nil {
-			logger.ErrorContext(ctx, "Startup fetch failed for existing repo", "upstream", repo.UpstreamURL(), "error", err,
-				"duration", time.Since(start))
-			continue
-		}
-		logger.InfoContext(ctx, "Startup fetch completed for existing repo", "upstream", repo.UpstreamURL(),
-			"duration", time.Since(start))
+	start := time.Now()
+	if err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout); err != nil {
+		return errors.Wrapf(err, "fetch after %s", time.Since(start))
+	}
+	logger.InfoContext(ctx, "Startup fetch completed for existing repo", "upstream", repo.UpstreamURL(),
+		"duration", time.Since(start))
 
-		postRefs, err := repo.GetLocalRefs(ctx)
-		if err != nil {
-			return errors.Wrapf(err, "get post-fetch refs for %s", repo.UpstreamURL())
-		}
-		maps.DeleteFunc(postRefs, func(k, v string) bool { return preRefs[k] == v })
-		logger.InfoContext(ctx, "Post-fetch changed refs for existing repo", "upstream", repo.UpstreamURL(), "refs", postRefs)
+	postRefs, err := repo.GetLocalRefs(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "get post-fetch refs for %s", repo.UpstreamURL())
+	}
+	maps.DeleteFunc(postRefs, func(k, v string) bool { return preRefs[k] == v })
+	logger.InfoContext(ctx, "Post-fetch changed refs for existing repo", "upstream", repo.UpstreamURL(), "refs", postRefs)
 
-		if s.config.SnapshotInterval > 0 {
-			s.scheduleSnapshotJobs(repo)
-		}
-		if s.config.RepackInterval > 0 {
-			s.scheduleRepackJobs(repo)
-		}
+	if s.config.SnapshotInterval > 0 {
+		s.scheduleSnapshotJobs(repo)
+	}
+	if s.config.RepackInterval > 0 {
+		s.scheduleRepackJobs(repo)
 	}
 	return nil
 }
