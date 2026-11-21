@@ -1128,6 +1128,25 @@ func (c *fullReadCountingCache) Open(ctx context.Context, key cache.Key, opts ..
 	return c.Cache.Open(ctx, key, opts...)
 }
 
+func TestProbeByteSkipsWholeObjectBackfill(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	local, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	origin, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	counted := &fullReadCountingCache{Cache: origin}
+	tiered := newTiered(ctx, local, counted)
+	key := cache.NewKey("published")
+	seedTier(ctx, t, tiered, key, []byte("published checkout"))
+	assert.NoError(t, local.Invalidate(ctx, key))
+	r, h, err := cache.OpenProbeByte(ctx, tiered, key)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("p"), readAllAndClose(t, r))
+	assert.Equal(t, "bytes 0-0/18", h.Get("Content-Range"))
+	assert.NoError(t, tiered.Close())
+	assert.Equal(t, int32(0), counted.opens.Load())
+}
+
 func TestTieredRangedReadSkipsDeclinedMemoryFill(t *testing.T) {
 	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
 	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 4, InflightLimitMB: 1, MaxTTL: time.Hour})

@@ -1068,6 +1068,19 @@ already refreshed mirrors do not repeat their startup fetch. With no local
 mirrors, normal on-demand initialization is unchanged. Snapshot publication
 is not part of this readiness check.
 
+For a deployment whose only Git consumer restores published checkouts, set
+`startup-snapshot-repository = "https://example.com/org/repo"` in `strategy git`
+alongside a positive `snapshot-interval`. Cachew reuses the local mirror (or
+restores/clones a missing one) and fetches upstream `HEAD` on this daemon.
+This fetch downloads unfiltered objects and updates the mirror's default
+branch, not its other refs. A successful fetch and a readable, previously published
+checkout allow readiness while the normal all-ref refresh continues. Without
+a usable publication, startup waits for full warm-up. No new archive is
+required. Until full warm-up finishes, only cached GET/HEAD requests for that
+checkout are served by the Git strategy; other Git requests return 503.
+Leave this option unset on general Git proxies. Removing it restores the
+all-ref readiness gate without changing the mirror format or backup policy.
+
 ### Memory readiness
 
 Memory-cache readiness is local and shard-aware. Cachew keeps one private
