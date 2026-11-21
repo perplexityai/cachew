@@ -158,6 +158,51 @@ func TestJobSchedulerQueueIsolation(t *testing.T) {
 		"queue2 should never run more than 1 job concurrently")
 }
 
+func TestJobSchedulerDedupesWaitingJobs(t *testing.T) {
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	scheduler := newTestScheduler(ctx, t, jobscheduler.Config{Concurrency: 4})
+
+	release := make(chan struct{})
+	var started, fetches, others atomic.Int32
+	submitFetch := func() {
+		scheduler.Submit("repo", "fetch", func(_ context.Context) error {
+			if started.Add(1) == 1 {
+				<-release
+			}
+			fetches.Add(1)
+			return nil
+		})
+	}
+
+	submitFetch()
+	eventually(t, time.Second, func() bool { return started.Load() == 1 }, "first fetch should start")
+
+	// The running fetch doesn't absorb new submissions, but every one after the first waiting copy is dropped.
+	for range 5 {
+		submitFetch()
+	}
+	scheduler.Submit("repo", "repack", func(_ context.Context) error {
+		others.Add(1)
+		return nil
+	})
+	assert.True(t, scheduler.TrySubmit("repo", "fetch", 1, func(_ context.Context) error {
+		t.Error("deduped TrySubmit job should not run")
+		return nil
+	}))
+	close(release)
+
+	eventually(t, time.Second, func() bool { return fetches.Load() == 2 && others.Load() == 1 },
+		"one running and one waiting fetch should run, plus the repack")
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(2), fetches.Load())
+
+	submitFetch()
+	eventually(t, time.Second, func() bool { return fetches.Load() == 3 }, "fetch submitted after the queue drained should run")
+}
+
 func TestJobSchedulerJobOrdering(t *testing.T) {
 	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
 	ctx, cancel := context.WithCancel(ctx)
@@ -282,11 +327,9 @@ func TestJobSchedulerPeriodicJobWithError(t *testing.T) {
 	}, "periodic job should continue executing even after errors")
 }
 
-// TestJobSchedulerPeriodicJobStopsOnCancel verifies that the periodic re-arm
-// goroutine exits cleanly when the scheduler's context is cancelled. Without
-// this, a SIGTERM would leave the re-arm goroutine to wake and submit to a
-// dead scheduler — and on a real pod that goroutine dies with the process,
-// causing the periodic job to skip a full interval after every restart.
+// TestJobSchedulerPeriodicJobStopsOnCancel verifies the periodic re-arm goroutine exits on cancellation.
+//
+// Otherwise a SIGTERM leaves it to submit to a dead scheduler, and the job skips an interval after each restart.
 func TestJobSchedulerPeriodicJobStopsOnCancel(t *testing.T) {
 	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
 	ctx, cancel := context.WithCancel(ctx)
@@ -313,9 +356,9 @@ func TestJobSchedulerPeriodicJobStopsOnCancel(t *testing.T) {
 		"periodic job should not fire after scheduler context is cancelled")
 }
 
-// TestJobSchedulerSubmitDroppedAfterShutdown verifies that submissions made
-// after the scheduler has been shut down are silently dropped rather than
-// accumulating in the queue (which would leak the closure capture forever).
+// TestJobSchedulerSubmitDroppedAfterShutdown verifies submissions after shutdown are dropped, not queued.
+//
+// Queued submissions would leak their closure captures forever.
 func TestJobSchedulerSubmitDroppedAfterShutdown(t *testing.T) {
 	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
 	ctx, cancel := context.WithCancel(ctx)
@@ -395,17 +438,14 @@ func TestJobSchedulerDrainLetsInFlightFinish(t *testing.T) {
 		"in-flight job should finish after drain")
 }
 
-// TestJobSchedulerSurvivesParentCancel verifies the shutdown ordering fix:
-// when the scheduler is created with context.WithoutCancel, cancelling the
-// parent (simulating SIGTERM) does NOT kill workers. Jobs submitted after the
-// parent cancel still execute. Only cancelling the scheduler's own context
-// stops the workers.
+// TestJobSchedulerSurvivesParentCancel verifies workers survive parent cancellation, as on SIGTERM.
+//
+// The scheduler context uses context.WithoutCancel, so only cancelling it stops the workers.
 func TestJobSchedulerSurvivesParentCancel(t *testing.T) {
 	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
 	parentCtx, cancelParent := context.WithCancel(ctx)
 
-	// Simulate the production fix: scheduler gets context.WithoutCancel so
-	// it is decoupled from the signal context.
+	// As in production, decouple the scheduler from the signal context with context.WithoutCancel.
 	schedulerCtx, cancelScheduler := context.WithCancel(context.WithoutCancel(parentCtx))
 	defer cancelScheduler()
 
@@ -462,11 +502,9 @@ func TestJobSchedulerMultipleQueues(t *testing.T) {
 		queueExecutions = make(map[string]bool)
 	)
 
-	// Pre-populate the map before any Submit so the worker goroutines that
-	// later write to it under mu don't race with the main goroutine on map
-	// writes. scheduler.Submit synchronises internally (sync.Cond+sync.Mutex),
-	// which establishes happens-before from these writes to the eventual
-	// worker reads/writes.
+	// Pre-populate the map before Submit so workers writing it under mu don't race the main goroutine.
+	//
+	// Submit's internal locking orders these writes before the workers' reads and writes.
 	for _, queue := range queues {
 		queueExecutions[queue] = false
 	}

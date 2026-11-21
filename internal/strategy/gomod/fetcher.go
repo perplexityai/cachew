@@ -18,6 +18,7 @@ type CompositeFetcher struct {
 	patterns       []string
 }
 
+// NewCompositeFetcher returns a CompositeFetcher that uses privateFetcher for module paths matching patterns.
 func NewCompositeFetcher(
 	publicFetcher goproxy.Fetcher,
 	privateFetcher goproxy.Fetcher,
@@ -30,6 +31,7 @@ func NewCompositeFetcher(
 	}
 }
 
+// IsPrivate reports whether modulePath matches a pattern as a glob, exactly, or as a path prefix.
 func (c *CompositeFetcher) IsPrivate(modulePath string) bool {
 	return isPrivateModule(c.patterns, modulePath)
 }
@@ -38,6 +40,7 @@ func isPrivateModule(patterns []string, modulePath string) bool {
 	return module.MatchPrefixPatterns(strings.Join(patterns, ","), modulePath)
 }
 
+// Query implements goproxy.Fetcher.
 func (c *CompositeFetcher) Query(ctx context.Context, path, query string) (version string, t time.Time, err error) {
 	if c.IsPrivate(path) {
 		v, tm, err := c.privateFetcher.Query(ctx, path, query)
@@ -47,6 +50,7 @@ func (c *CompositeFetcher) Query(ctx context.Context, path, query string) (versi
 	return v, tm, errors.Wrap(err, "public fetcher query")
 }
 
+// List implements goproxy.Fetcher.
 func (c *CompositeFetcher) List(ctx context.Context, path string) (versions []string, err error) {
 	if c.IsPrivate(path) {
 		v, err := c.privateFetcher.List(ctx, path)
@@ -56,6 +60,7 @@ func (c *CompositeFetcher) List(ctx context.Context, path string) (versions []st
 	return v, errors.Wrap(err, "public fetcher list")
 }
 
+// Download implements goproxy.Fetcher.
 func (c *CompositeFetcher) Download(ctx context.Context, path, version string) (info, mod, zip io.ReadSeekCloser, err error) {
 	if c.IsPrivate(path) {
 		i, m, z, err := c.privateFetcher.Download(ctx, path, version)

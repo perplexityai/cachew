@@ -16,6 +16,7 @@ import (
 	"github.com/block/cachew/internal/logging"
 )
 
+// Config configures worker concurrency, the clone job limit, and where periodic job state persists.
 type Config struct {
 	Concurrency         int    `hcl:"concurrency" help:"The maximum number of concurrent jobs to run (0 means number of cores)." default:"4"`
 	MaxCloneConcurrency int    `hcl:"max-clone-concurrency" help:"Maximum number of concurrent clone jobs. Remaining worker slots are reserved for fetch/repack/snapshot jobs. 0 means no limit." default:"0"`
@@ -33,12 +34,9 @@ func jobKey(queue, id string) string { return id + ":" + queue }
 func (j *queueJob) String() string                { return jobKey(j.queue, j.id) }
 func (j *queueJob) Run(ctx context.Context) error { return errors.WithStack(j.run(ctx)) }
 
-// Scheduler runs background jobs concurrently across multiple serialised queues.
+// Scheduler runs background jobs concurrently across serialised queues, each running one job at a time.
 //
-// That is, each queue can have at most one job running at a time, but multiple queues can run concurrently.
-//
-// Its primary role is to rate limit concurrent background tasks so that we don't DoS the host when, for example,
-// generating git snapshots, GCing git repos, etc.
+// It rate limits background tasks, such as git snapshots and GC, so they don't DoS the host.
 type Scheduler interface {
 	// WithQueuePrefix creates a new Scheduler that prefixes all queue names with the given prefix.
 	//
@@ -46,9 +44,12 @@ type Scheduler interface {
 	WithQueuePrefix(prefix string) Scheduler
 	// Submit a job to the queue.
 	//
-	// Jobs run concurrently across queues, but never within a queue.
+	// Jobs run concurrently across queues, but never within a queue. A job is dropped when one with the same queue
+	// and id is already waiting to run.
 	Submit(queue, id string, run func(ctx context.Context) error)
 	// TrySubmit adds a job only if fewer than maxQueued jobs wait across all queues.
+	//
+	// A job with the same queue and id that is already waiting counts as accepted.
 	TrySubmit(queue, id string, maxQueued int, run func(ctx context.Context) error) bool
 	// SubmitPeriodicJob submits a job to the queue that runs immediately, and then periodically after the interval.
 	//
@@ -80,18 +81,18 @@ func (p *prefixedScheduler) WithQueuePrefix(prefix string) Scheduler {
 	}
 }
 
+// RootScheduler is the Scheduler implementation that owns the worker pool and the shared job queue.
 type RootScheduler struct {
 	cond                *sync.Cond
 	lock                sync.Mutex
 	done                bool
 	draining            bool
 	queue               []queueJob
-	active              map[string]string // queue -> job id
+	queued              map[string]struct{} // jobKey of every waiting job
+	active              map[string]string   // queue -> job id
 	activeClones        int
 	maxCloneConcurrency int
-	// ctx is cancelled when the scheduler is torn down; periodic re-arm
-	// goroutines select on it so they exit instead of submitting to a dead
-	// scheduler.
+	// ctx is cancelled at teardown so periodic re-arm goroutines exit instead of submitting to a dead scheduler.
 	ctx    context.Context //nolint:containedctx
 	cancel context.CancelFunc
 	// drain is closed by Drain so intake stops while workers keep running.
@@ -103,6 +104,7 @@ type RootScheduler struct {
 
 var _ Scheduler = &RootScheduler{}
 
+// Provider returns the shared RootScheduler, creating it on first call.
 type Provider func() (*RootScheduler, error)
 
 // NewProvider returns a scheduler singleton provider function.
@@ -132,6 +134,7 @@ func New(ctx context.Context, config Config) (*RootScheduler, error) {
 	}
 	m := newSchedulerMetrics()
 	q := &RootScheduler{
+		queued:              make(map[string]struct{}),
 		active:              make(map[string]string),
 		maxCloneConcurrency: maxClones,
 		store:               store,
@@ -157,9 +160,9 @@ func New(ctx context.Context, config Config) (*RootScheduler, error) {
 	return q, nil
 }
 
-// Drain stops the scheduler accepting new submissions and re-arming periodic
-// jobs, while leaving workers running to finish in-flight and queued jobs. The
-// worker pool is torn down later by cancelling the context passed to New.
+// Drain stops new submissions and periodic re-arms, leaving workers to finish in-flight and queued jobs.
+//
+// Workers are torn down later by cancelling the context passed to New.
 func (q *RootScheduler) Drain() {
 	q.lock.Lock()
 	defer q.lock.Unlock()
@@ -170,6 +173,7 @@ func (q *RootScheduler) Drain() {
 	close(q.drain)
 }
 
+// Close closes the schedule store; it does not stop workers.
 func (q *RootScheduler) Close() error {
 	if q.store != nil {
 		return errors.WithStack(q.store.Close())
@@ -177,6 +181,7 @@ func (q *RootScheduler) Close() error {
 	return nil
 }
 
+// WithQueuePrefix implements Scheduler.
 func (q *RootScheduler) WithQueuePrefix(prefix string) Scheduler {
 	return &prefixedScheduler{
 		prefix:    prefix + "-",
@@ -184,32 +189,53 @@ func (q *RootScheduler) WithQueuePrefix(prefix string) Scheduler {
 	}
 }
 
+// Submit implements Scheduler. It drops the job if the scheduler is shutting down.
 func (q *RootScheduler) Submit(queue, id string, run func(ctx context.Context) error) {
 	q.lock.Lock()
 	if q.done || q.draining {
 		q.lock.Unlock()
 		return
 	}
-	q.queue = append(q.queue, queueJob{queue: queue, id: id, run: run})
-	q.metrics.queueDepth.Record(context.Background(), int64(len(q.queue)))
+	enqueued := q.enqueueLocked(queue, id, run)
 	q.lock.Unlock()
-	q.cond.Signal()
+	if enqueued {
+		q.cond.Signal()
+	}
 }
 
 // TrySubmit limits the queue size without a wait. It rejects new jobs during shutdown.
 func (q *RootScheduler) TrySubmit(queue, id string, maxQueued int, run func(ctx context.Context) error) bool {
 	q.lock.Lock()
-	if q.done || q.draining || maxQueued <= 0 || len(q.queue) >= maxQueued {
+	if q.done || q.draining || maxQueued <= 0 {
 		q.lock.Unlock()
 		return false
 	}
-	q.queue = append(q.queue, queueJob{queue: queue, id: id, run: run})
-	q.metrics.queueDepth.Record(context.Background(), int64(len(q.queue)))
+	if _, waiting := q.queued[jobKey(queue, id)]; waiting {
+		q.lock.Unlock()
+		return true
+	}
+	if len(q.queue) >= maxQueued {
+		q.lock.Unlock()
+		return false
+	}
+	q.enqueueLocked(queue, id, run)
 	q.lock.Unlock()
 	q.cond.Signal()
 	return true
 }
 
+func (q *RootScheduler) enqueueLocked(queue, id string, run func(ctx context.Context) error) bool {
+	key := jobKey(queue, id)
+	if _, waiting := q.queued[key]; waiting {
+		return false
+	}
+	q.queued[key] = struct{}{}
+	q.queue = append(q.queue, queueJob{queue: queue, id: id, run: run})
+	q.metrics.queueDepth.Record(context.Background(), int64(len(q.queue)))
+	return true
+}
+
+// SubmitPeriodicJob implements Scheduler, delaying the first run until an interval after the stored last run.
 func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Duration, run func(ctx context.Context) error) {
 	if q.ctx.Err() != nil || q.isDraining() {
 		return
@@ -224,10 +250,9 @@ func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Durati
 					logging.FromContext(ctx).WarnContext(ctx, "Failed to record job last run", "key", key, "error", storeErr)
 				}
 			}
-			// Re-arm the next firing on a cancellation-aware timer. Without
-			// this select, a SIGTERM during the sleep would leave the goroutine
-			// to wake and submit to a dead scheduler. The new pod's
-			// warmExistingRepos re-registers periodic jobs on startup.
+			// Use a cancellation-aware timer so SIGTERM doesn't leave a goroutine submitting to a dead scheduler.
+			//
+			// The new pod's warmExistingRepos re-registers periodic jobs on startup.
 			go q.sleepThenSubmit(interval, func() {
 				q.SubmitPeriodicJob(queue, id, interval, run)
 			})
@@ -247,8 +272,6 @@ func (q *RootScheduler) isDraining() bool {
 	return q.draining
 }
 
-// sleepThenSubmit waits for d, then runs fn — unless the scheduler is draining
-// or being torn down, in which case it returns immediately.
 func (q *RootScheduler) sleepThenSubmit(d time.Duration, fn func()) {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -276,8 +299,7 @@ func (q *RootScheduler) periodicDelay(key string, interval time.Duration) time.D
 	return 0
 }
 
-// Wait blocks until all worker goroutines have exited. The caller should
-// cancel the context passed to New first, otherwise Wait blocks forever.
+// Wait blocks until all workers exit. Cancel the context passed to New first, or Wait blocks forever.
 func (q *RootScheduler) Wait() { q.wg.Wait() }
 
 func (q *RootScheduler) worker(ctx context.Context, id int) {
@@ -294,11 +316,10 @@ func (q *RootScheduler) worker(ctx context.Context, id int) {
 }
 
 // waitForJob blocks until a job is available or the scheduler is shut down.
-// cond.Wait() atomically releases the lock and suspends the goroutine, so the
-// lock is only held during the brief check-and-take, never while sleeping.
-// On context cancellation, the goroutine in New() sets done and broadcasts,
-// waking all sleeping workers so they can exit.
-func (q *RootScheduler) waitForJob() (queueJob, bool) {
+//
+// cond.Wait releases the lock while sleeping, so it is held only for the check-and-take. On
+// cancellation, the goroutine in New sets done and broadcasts so sleeping workers exit.
+func (q *RootScheduler) waitForJob() (queueJob, bool) { //nolint:privatedoc // documents a locking requirement
 	q.lock.Lock()
 	defer q.lock.Unlock()
 	for {
@@ -347,7 +368,6 @@ func (q *RootScheduler) runJob(ctx context.Context, logger *slog.Logger, job que
 	q.metrics.jobDuration.Record(ctx, elapsed.Seconds(), metric.WithAttributes(jobAttrs...))
 }
 
-// jobType extracts a normalised job type from the job ID for metric labels.
 func jobType(id string) string {
 	switch {
 	case strings.HasSuffix(id, "clone"):
@@ -376,14 +396,11 @@ func (q *RootScheduler) markQueueInactive(queue string) {
 	q.cond.Signal()
 }
 
-// isCloneJob returns true for job IDs that represent long-running clone operations
-// which should be subject to concurrency limits.
 func isCloneJob(id string) bool {
 	return strings.HasSuffix(id, "clone") || strings.HasSuffix(id, "deferred-mirror-restore")
 }
 
-// takeNextJobLocked takes the next job for any queue that is not already running a job.
-// Must be called with q.lock held.
+// takeNextJobLocked takes the next job for any queue not already running one. q.lock must be held.
 func (q *RootScheduler) takeNextJobLocked() (queueJob, bool) {
 	for i, job := range q.queue {
 		if _, active := q.active[job.queue]; active {
@@ -393,6 +410,7 @@ func (q *RootScheduler) takeNextJobLocked() (queueJob, bool) {
 			continue
 		}
 		q.queue = append(q.queue[:i], q.queue[i+1:]...)
+		delete(q.queued, jobKey(job.queue, job.id))
 		q.active[job.queue] = job.id
 		if isCloneJob(job.id) {
 			q.activeClones++
@@ -405,7 +423,7 @@ func (q *RootScheduler) takeNextJobLocked() (queueJob, bool) {
 }
 
 // recordGaugesLocked updates gauge metrics. Must be called with q.lock held.
-func (q *RootScheduler) recordGaugesLocked() {
+func (q *RootScheduler) recordGaugesLocked() { //nolint:privatedoc // documents a locking requirement
 	ctx := context.Background()
 	q.metrics.queueDepth.Record(ctx, int64(len(q.queue)))
 	q.metrics.activeWorkers.Record(ctx, int64(len(q.active)))

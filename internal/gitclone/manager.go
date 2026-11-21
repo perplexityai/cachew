@@ -3,6 +3,7 @@ package gitclone
 import (
 	"context"
 	"io/fs"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
@@ -19,20 +20,21 @@ import (
 	"github.com/block/cachew/internal/logging"
 )
 
+// State is a Repository's position in the mirror clone lifecycle.
 type State int
 
 var errUnsafeMirrorMetadata = errors.New("unsafe mirror metadata")
 
+// Repository lifecycle states.
 const (
 	StateEmpty   State = iota // Not cloned yet
 	StateCloning              // Clone in progress
 	StateReady                // Ready to use
 )
 
-// cloneTempPrefix is the prefix for the temporary directory created during a
-// clone before it is atomically renamed into place. Interrupted clones (e.g. a
-// killed process) can leave these behind, so they are skipped and removed by
-// DiscoverExisting on startup.
+// cloneTempPrefix prefixes the temporary clone directory that is renamed into place once complete.
+//
+// Interrupted clones can leave these behind, so DiscoverExisting skips and removes them on startup.
 const cloneTempPrefix = ".clone-"
 
 func (s State) String() string {
@@ -48,12 +50,14 @@ func (s State) String() string {
 	}
 }
 
+// GitTuningConfig holds git HTTP transfer settings applied to clone and fetch commands.
 type GitTuningConfig struct {
 	PostBuffer    int           // http.postBuffer size in bytes
 	LowSpeedLimit int           // http.lowSpeedLimit in bytes/sec
 	LowSpeedTime  time.Duration // http.lowSpeedTime
 }
 
+// DefaultGitTuningConfig returns the tuning used for clones and fetches.
 func DefaultGitTuningConfig() GitTuningConfig {
 	return GitTuningConfig{
 		PostBuffer:    524288000, // 500MB buffer
@@ -62,6 +66,7 @@ func DefaultGitTuningConfig() GitTuningConfig {
 	}
 }
 
+// Config configures the git mirror Manager.
 type Config struct {
 	MirrorRoot       string        `hcl:"mirror-root,optional" help:"Directory to store git clones." default:"${CACHEW_STATE}/git-mirrors"`
 	FetchInterval    time.Duration `hcl:"fetch-interval,optional" help:"How often to fetch from upstream in minutes." default:"15m"`
@@ -80,25 +85,31 @@ type CredentialProvider interface {
 	GetTokenForURL(ctx context.Context, url string) (string, error)
 }
 
+// CredentialProviderProvider lazily constructs the CredentialProvider when the Manager is first created.
 type CredentialProviderProvider func() (CredentialProvider, error)
 
+// Repository is a local bare mirror of one upstream repository, tracking its clone state and fetch history.
 type Repository struct {
-	// mu guards state and is read-held for minutes during snapshot
-	// generation; a queued writer would park every new reader behind it.
+	// mu guards state.
+	//
+	// It is read-held for minutes during snapshot generation; a queued writer would park every new reader behind it.
 	mu          sync.RWMutex
 	config      Config
 	state       State
 	path        string
 	upstreamURL string
 	// metaMu guards per-request/per-fetch bookkeeping so it never writes mu.
-	metaMu             sync.Mutex
-	lastFetch          time.Time
-	lastRefCheck       time.Time
-	refCheckValid      bool
+	metaMu        sync.Mutex
+	lastFetch     time.Time
+	lastRefCheck  time.Time
+	refCheckValid bool
+	// unsatisfiable records when upstream last could not satisfy an EnsureRefs entry, so repeats skip the round trip.
+	unsatisfiable      map[string]time.Time
 	fetchSem           chan struct{}
 	credentialProvider CredentialProvider
 }
 
+// Manager owns the git mirrors under Config.MirrorRoot, keyed by upstream URL.
 type Manager struct {
 	config             Config
 	gitTuningConfig    GitTuningConfig
@@ -110,6 +121,7 @@ type Manager struct {
 // ManagerProvider is a function that lazily creates a singleton Manager.
 type ManagerProvider func() (*Manager, error)
 
+// NewManagerProvider returns a ManagerProvider that builds the Manager and its credential provider on first call.
 func NewManagerProvider(ctx context.Context, config Config, credentialProviderProvider CredentialProviderProvider) ManagerProvider {
 	return sync.OnceValues(func() (*Manager, error) {
 		var credentialProvider CredentialProvider
@@ -124,6 +136,7 @@ func NewManagerProvider(ctx context.Context, config Config, credentialProviderPr
 	})
 }
 
+// NewManager creates a Manager, filling unset Config durations and thread counts with defaults.
 func NewManager(ctx context.Context, config Config, credentialProvider CredentialProvider) (*Manager, error) {
 	if config.MirrorRoot == "" {
 		return nil, errors.New("mirror-root is required")
@@ -178,10 +191,14 @@ func NewManager(ctx context.Context, config Config, credentialProvider Credentia
 	}, nil
 }
 
+// Config returns the Manager's configuration with defaults applied.
 func (m *Manager) Config() Config {
 	return m.config
 }
 
+// GetOrCreate returns the Repository for upstreamURL, registering it on first use.
+//
+// An existing mirror on disk is sanitized and marked ready; one with unsafe metadata is removed so it is re-cloned.
 func (m *Manager) GetOrCreate(ctx context.Context, upstreamURL string) (*Repository, error) {
 	m.clonesMu.RLock()
 	repo, exists := m.clones[upstreamURL]
@@ -236,12 +253,16 @@ func (m *Manager) GetOrCreate(ctx context.Context, upstreamURL string) (*Reposit
 	return repo, nil
 }
 
+// Get returns the registered Repository for upstreamURL, or nil if none exists.
 func (m *Manager) Get(upstreamURL string) *Repository {
 	m.clonesMu.RLock()
 	defer m.clonesMu.RUnlock()
 	return m.clones[upstreamURL]
 }
 
+// DiscoverExisting registers mirrors already under MirrorRoot and returns those that are ready.
+//
+// It also removes temporary clone directories left by interrupted clones.
 func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 	var discovered []*Repository
 	err := filepath.Walk(m.config.MirrorRoot, func(path string, info os.FileInfo, err error) error {
@@ -313,8 +334,7 @@ func (m *Manager) isStagingDirectory(path string) bool {
 		name == ".snapshots" || name == ".snapshot-spools" || name == ".spools")
 }
 
-// RepoPathFromURL extracts a normalised "host/path" from an upstream Git URL,
-// stripping any ".git" suffix.
+// RepoPathFromURL extracts a normalised "host/path" from an upstream Git URL, stripping any ".git" suffix.
 func RepoPathFromURL(upstreamURL string) (string, error) {
 	parsed, err := url.Parse(upstreamURL)
 	if err != nil {
@@ -348,20 +368,24 @@ func (m *Manager) clonePathForURL(upstreamURL string) (string, error) {
 	return filepath.Join(m.config.MirrorRoot, repoPath), nil
 }
 
+// State returns the repository's current lifecycle state.
 func (r *Repository) State() State {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.state
 }
 
+// Path returns the filesystem path of the bare mirror.
 func (r *Repository) Path() string {
 	return r.path
 }
 
+// UpstreamURL returns the upstream URL the mirror tracks.
 func (r *Repository) UpstreamURL() string {
 	return r.upstreamURL
 }
 
+// LastFetch returns when the mirror last completed a clone or fetch, or the zero time if never.
 func (r *Repository) LastFetch() time.Time {
 	r.metaMu.Lock()
 	defer r.metaMu.Unlock()
@@ -374,26 +398,28 @@ func (r *Repository) setLastFetch(at time.Time) {
 	r.lastFetch = at
 }
 
+// NeedsFetch reports whether at least fetchInterval has passed since LastFetch.
 func (r *Repository) NeedsFetch(fetchInterval time.Duration) bool {
 	return time.Since(r.LastFetch()) >= fetchInterval
 }
 
+// WithReadLock runs fn while holding the state read lock, blocking state transitions such as ResetToEmpty.
 func (r *Repository) WithReadLock(fn func() error) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return fn()
 }
 
+// WithReadLockReturn is WithReadLock for a function that returns a value.
 func WithReadLockReturn[T any](repo *Repository, fn func() (T, error)) (T, error) {
 	repo.mu.RLock()
 	defer repo.mu.RUnlock()
 	return fn()
 }
 
-// ResetToEmpty transitions the repository back to StateEmpty so that a
-// subsequent call to TryStartCloning can re-attempt the clone. Use this
-// when a restored snapshot turns out to be corrupt or empty and needs to
-// be replaced with a fresh clone.
+// ResetToEmpty transitions the repository back to StateEmpty so TryStartCloning can re-attempt the clone.
+//
+// Use it when a restored snapshot is corrupt or empty and must be replaced with a fresh clone.
 func (r *Repository) ResetToEmpty() {
 	r.mu.Lock()
 	r.state = StateEmpty
@@ -401,9 +427,9 @@ func (r *Repository) ResetToEmpty() {
 	r.setLastFetch(time.Time{})
 }
 
-// TryStartCloning atomically transitions the repository from StateEmpty to
-// StateCloning. Returns true if this goroutine won the transition and should
-// proceed with the clone/restore; false if another goroutine already claimed it.
+// TryStartCloning atomically transitions the repository from StateEmpty to StateCloning.
+//
+// It returns true if this goroutine won the transition and should proceed with the clone or restore.
 func (r *Repository) TryStartCloning() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -414,9 +440,9 @@ func (r *Repository) TryStartCloning() bool {
 	return true
 }
 
-// WithFetchExclusion runs fn while holding the fetch semaphore, preventing
-// concurrent git fetch operations. Use this for operations like tar that
-// read the repository directory non-atomically and need a consistent view.
+// WithFetchExclusion runs fn while holding the fetch semaphore, preventing concurrent git fetches.
+//
+// Use it for operations like tar that read the repository non-atomically and need a consistent view.
 func (r *Repository) WithFetchExclusion(ctx context.Context, fn func() error) error {
 	select {
 	case <-r.fetchSem:
@@ -563,8 +589,7 @@ func mirrorConfigValues(ctx context.Context, configPath string) (map[string]stri
 	return values, nil
 }
 
-// MarkReady transitions the repository to StateReady, indicating it is
-// up-to-date and can serve requests from the local mirror.
+// MarkReady transitions the repository to StateReady, so requests are served from the local mirror.
 func (r *Repository) MarkReady() {
 	r.mu.Lock()
 	r.state = StateReady
@@ -578,6 +603,7 @@ func (r *Repository) Clone(ctx context.Context) error {
 }
 
 // CloneWithWaitTimeout limits how long a caller waits for another clone.
+//
 // The limit does not apply to the caller that starts the clone.
 func (r *Repository) CloneWithWaitTimeout(ctx context.Context, waitTimeout time.Duration) error {
 	return r.clone(ctx, waitTimeout)
@@ -639,8 +665,7 @@ func (r *Repository) CloneClaimed(ctx context.Context) error {
 	return nil
 }
 
-// mirrorConfigSettings returns git config key-value pairs applied to mirror
-// clones to optimise upload-pack serving performance.
+// mirrorConfigSettings returns git config pairs applied to mirror clones to optimise upload-pack serving.
 func mirrorConfigSettings(packThreads int) [][2]string {
 	//nolint:goconst // Literal values keep the git config table readable.
 	return [][2]string{
@@ -668,8 +693,8 @@ func mirrorConfigSettings(packThreads int) [][2]string {
 		{"pack.deltaCacheSize", "512m"},
 		{"pack.windowMemory", "1g"},
 		// LFS fetches are I/O-bound; the git-lfs default of 8 is too low.
-		// See git-lfs/git-lfs#6241 for an upstream change (unreleased) that
-		// raises the default to 3×NCPU.
+		//
+		// git-lfs/git-lfs#6241 (unreleased) raises the default to 3×NCPU.
 		{"lfs.concurrenttransfers", "100"},
 	}
 }
@@ -720,18 +745,16 @@ func (r *Repository) executeClone(ctx context.Context) error {
 	}
 	defer os.RemoveAll(tmpDir) //nolint:errcheck // best-effort cleanup on failure
 
-	// git clone --mirror creates a directory inside tmpDir; we point it at a
-	// known subdirectory so we can rename it atomically afterwards.
+	// Clone into a known subdirectory of tmpDir so it can be renamed atomically afterwards.
 	cloneDest := filepath.Join(tmpDir, "repo")
 
 	cloneCtx, cancel := context.WithTimeout(ctx, r.config.CloneTimeout)
 	defer cancel()
 
 	config := DefaultGitTuningConfig()
-	// lowSpeedLimit is intentionally omitted: during initial clone of large
-	// repos the server-side pack computation can take minutes at near-zero
-	// transfer rate, which would trip the speed check. The cloneTimeout
-	// provides the overall safety net instead.
+	// lowSpeedLimit is intentionally omitted; cloneTimeout is the overall safety net instead.
+	//
+	// Server-side pack computation for large initial clones can run for minutes at near-zero transfer rate.
 	// #nosec G204 - r.upstreamURL and cloneDest are controlled by us
 	args := []string{
 		"clone", "--mirror",
@@ -759,31 +782,32 @@ func (r *Repository) executeClone(ctx context.Context) error {
 	return nil
 }
 
+// Fetch fetches from upstream with Config.FetchTimeout.
+//
+// If another fetch holds the semaphore and completes first, Fetch returns nil without fetching again.
 func (r *Repository) Fetch(ctx context.Context) error {
 	return r.FetchWithTimeout(ctx, r.config.FetchTimeout)
 }
 
-// FetchWithTimeout fetches from upstream with a configurable timeout. Use this
-// for catch-up fetches after snapshot restore where the delta may be large and
-// the default Config.FetchTimeout is too short.
+// FetchWithTimeout fetches from upstream with a configurable timeout.
+//
+// Use it for catch-up fetches after snapshot restore, where the delta may need longer than Config.FetchTimeout.
 func (r *Repository) FetchWithTimeout(ctx context.Context, timeout time.Duration) error {
 	return r.fetchInternal(ctx, timeout, true, true)
 }
 
-// FetchLenient fetches from upstream with the given timeout but without the
-// low-speed transfer check. Use this for post-restore catch-up fetches where
-// the delta may be very large and GitHub's server-side pack computation can
-// stall at near-zero transfer rate for minutes — the same situation that
-// executeClone handles by omitting lowSpeedLimit.
+// FetchLenient fetches from upstream with the given timeout but without the low-speed transfer check.
+//
+// Post-restore catch-up deltas can stall at near-zero transfer rate for minutes while GitHub computes the pack,
+// the same reason executeClone omits lowSpeedLimit.
 func (r *Repository) FetchLenient(ctx context.Context, timeout time.Duration) error {
 	return r.fetchInternal(ctx, timeout, false, true)
 }
 
-// FetchVerified fetches from upstream, waiting for the fetch semaphore if
-// another operation holds it. Unlike Fetch, it never coalesces with a
-// concurrent semaphore holder — the holder may not be fetching at all (e.g.
-// WithFetchExclusion) or its fetch may have failed — so a nil return
-// guarantees this call ran a successful git fetch.
+// FetchVerified fetches from upstream, waiting for the fetch semaphore if another operation holds it.
+//
+// Unlike Fetch, it never coalesces with the semaphore holder, which may not be fetching (e.g. WithFetchExclusion)
+// or may fail, so a nil return guarantees this call ran a successful git fetch.
 func (r *Repository) FetchVerified(ctx context.Context) error {
 	return r.fetchInternal(ctx, r.config.FetchTimeout, true, false)
 }
@@ -911,9 +935,8 @@ func (r *Repository) runFetch(ctx context.Context, args ...string) error {
 }
 
 // EnsureRefsUpToDate checks whether the local mirror's refs match upstream.
-// If refs are stale it returns NeedsFetch=true so the caller can schedule a
-// background fetch via the job scheduler, rather than fetching synchronously
-// on the request path.
+//
+// If refs are stale it returns needsFetch=true so the caller can schedule a background fetch off the request path.
 func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, err error) {
 	r.metaMu.Lock()
 	if r.refCheckValid && time.Since(r.lastRefCheck) < r.config.RefCheckInterval {
@@ -928,28 +951,15 @@ func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, e
 		return false, errors.Wrap(err, "get local refs")
 	}
 
-	lsCtx, cancel := context.WithTimeout(ctx, r.config.LsRemoteTimeout)
-	defer cancel()
-
-	upstreamRefs, err := r.GetUpstreamRefs(lsCtx)
+	behind, err := r.behindUpstream(ctx, localRefs, isBranch)
 	if err != nil {
-		return false, errors.Wrap(err, "get upstream refs")
+		return false, err
 	}
-
-	for ref, upstreamSHA := range upstreamRefs {
-		if strings.HasSuffix(ref, "^{}") {
-			continue
-		}
-		if !strings.HasPrefix(ref, "refs/heads/") {
-			continue
-		}
-		localSHA, exists := localRefs[ref]
-		if !exists || localSHA != upstreamSHA {
-			r.metaMu.Lock()
-			r.refCheckValid = false
-			r.metaMu.Unlock()
-			return true, nil
-		}
+	if behind {
+		r.metaMu.Lock()
+		r.refCheckValid = false
+		r.metaMu.Unlock()
+		return true, nil
 	}
 
 	r.metaMu.Lock()
@@ -959,19 +969,29 @@ func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, e
 	return false, nil
 }
 
-// EnsureRefs guarantees the local mirror satisfies the caller's freshness
-// requirements. A ref entry is satisfied when the local mirror has the ref
-// at the given SHA (or any SHA, if the value is empty). A commit entry is
-// satisfied when the commit exists in the local object database, regardless
-// of which ref points at it. If anything is unsatisfied, EnsureRefs
-// synchronously fetches from upstream once and then re-checks.
+func (r *Repository) behindUpstream(
+	ctx context.Context, localRefs map[string]string, compared func(ref string) bool,
+) (bool, error) {
+	lsCtx, cancel := context.WithTimeout(ctx, r.config.LsRemoteTimeout)
+	defer cancel()
+	upstreamRefs, err := r.GetUpstreamRefs(lsCtx)
+	if err != nil {
+		return false, errors.Wrap(err, "get upstream refs")
+	}
+	for ref, upstreamSHA := range upstreamRefs {
+		if strings.HasSuffix(ref, "^{}") || !compared(ref) {
+			continue
+		}
+		if localSHA, exists := localRefs[ref]; !exists || localSHA != upstreamSHA {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// EnsureRefs makes the mirror satisfy the caller's refs and commits.
 //
-// Resolved maps each requested ref to its current local SHA (empty if the
-// ref is still missing after the fetch). MissingCommits lists requested
-// commits that still are not present locally after the fetch.
-//
-// This bypasses RefCheckInterval because callers are explicitly asserting
-// they require these refs/commits to be fresh right now.
+// It fetches at most once, and only when upstream has something the mirror lacks.
 func (r *Repository) EnsureRefs(
 	ctx context.Context, refs map[string]string, commits []string,
 ) (resolved map[string]string, missingCommits []string, fetched bool, err error) {
@@ -979,20 +999,21 @@ func (r *Repository) EnsureRefs(
 	if err != nil {
 		return nil, nil, false, errors.Wrap(err, "get local refs")
 	}
+	entries, missingCommits := r.unsatisfied(ctx, localRefs, refs, commits)
 
-	if refsSatisfied(localRefs, refs) {
-		missing := r.missingCommitsLocked(ctx, commits)
-		if len(missing) == 0 {
-			return resolvedRefs(localRefs, refs), nil, false, nil
-		}
+	needsFetch, err := r.ensureNeedsFetch(ctx, localRefs, refs, entries)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !needsFetch {
+		return resolvedRefs(localRefs, refs), missingCommits, false, nil
 	}
 
 	if err := r.FetchWithTimeout(ctx, r.config.FetchTimeout); err != nil {
 		return nil, nil, false, errors.Wrap(err, "fetch upstream")
 	}
 
-	// Invalidate the cached ref-check so the normal transparent path also
-	// re-evaluates after our forced fetch.
+	// Invalidate the cached ref-check so the transparent path also re-evaluates after this forced fetch.
 	r.metaMu.Lock()
 	r.refCheckValid = false
 	r.metaMu.Unlock()
@@ -1001,13 +1022,121 @@ func (r *Repository) EnsureRefs(
 	if err != nil {
 		return nil, nil, true, errors.Wrap(err, "get local refs after fetch")
 	}
-	return resolvedRefs(localRefs, refs), r.missingCommitsLocked(ctx, commits), true, nil
+	entries, missingCommits = r.unsatisfied(ctx, localRefs, refs, commits)
+	r.rememberUnsatisfiable(entries)
+	return resolvedRefs(localRefs, refs), missingCommits, true, nil
 }
 
-// missingCommitsLocked returns the subset of commits that are absent from
-// the local object database. It takes the repository's read lock to stay
-// consistent with concurrent fetches.
-func (r *Repository) missingCommitsLocked(ctx context.Context, commits []string) []string {
+func (r *Repository) ensureNeedsFetch(
+	ctx context.Context, localRefs, refs map[string]string, entries []string,
+) (bool, error) {
+	if pending := r.notKnownUnsatisfiable(entries); len(pending) > 0 {
+		behind, err := r.behindUpstream(ctx, localRefs, func(ref string) bool { return strings.HasPrefix(ref, "refs/") })
+		if err != nil || behind {
+			return behind, err
+		}
+		r.rememberUnsatisfiable(pending)
+		return false, nil
+	}
+	branches, others := wantsCurrent(localRefs, refs)
+	if len(others) > 0 {
+		behind, err := r.behindUpstream(ctx, localRefs, func(ref string) bool { return others[ref] })
+		if err != nil || behind {
+			return behind, err
+		}
+	}
+	if !branches {
+		return false, nil
+	}
+	needsFetch, err := r.EnsureRefsUpToDate(ctx)
+	return needsFetch, errors.Wrap(err, "check upstream refs")
+}
+
+func wantsCurrent(localRefs, refs map[string]string) (branches bool, others map[string]bool) {
+	others = map[string]bool{}
+	for ref, wantSHA := range refs {
+		if _, ok := localRefs[ref]; !ok || wantSHA != "" {
+			continue
+		}
+		// HEAD follows a branch, so the cached branch check covers it.
+		if ref == "HEAD" || isBranch(ref) {
+			branches = true
+		} else {
+			others[ref] = true
+		}
+	}
+	return branches, others
+}
+
+func isBranch(ref string) bool {
+	return strings.HasPrefix(ref, "refs/heads/")
+}
+
+func (r *Repository) unsatisfied(
+	ctx context.Context, localRefs, refs map[string]string, commits []string,
+) (entries, missingCommits []string) {
+	for ref, wantSHA := range refs {
+		if !r.refSatisfied(ctx, localRefs, ref, wantSHA) {
+			entries = append(entries, "ref "+ref+" "+wantSHA)
+		}
+	}
+	missingCommits = r.missingCommitsLocked(ctx, commits)
+	for _, sha := range missingCommits {
+		entries = append(entries, "commit "+sha)
+	}
+	return entries, missingCommits
+}
+
+func (r *Repository) refSatisfied(ctx context.Context, localRefs map[string]string, ref, wantSHA string) bool {
+	localSHA, ok := localRefs[ref]
+	if !ok {
+		return false
+	}
+	if wantSHA == "" || localSHA == wantSHA {
+		return true
+	}
+	// wantSHA comes from the request; anything but hex could be read as a git option.
+	if strings.Trim(wantSHA, "0123456789abcdef") != "" {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	// #nosec G204 - r.path is controlled by us, localSHA comes from git and wantSHA is hex
+	cmd := exec.CommandContext(ctx, "git", "-C", r.path, "merge-base", "--is-ancestor", wantSHA, localSHA)
+	return cmd.Run() == nil
+}
+
+func (r *Repository) notKnownUnsatisfiable(entries []string) []string {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	var pending []string
+	for _, entry := range entries {
+		if checked, ok := r.unsatisfiable[entry]; !ok || time.Since(checked) >= r.config.RefCheckInterval {
+			pending = append(pending, entry)
+		}
+	}
+	return pending
+}
+
+func (r *Repository) rememberUnsatisfiable(entries []string) {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	if r.unsatisfiable == nil {
+		r.unsatisfiable = map[string]time.Time{}
+	}
+	maps.DeleteFunc(r.unsatisfiable, func(_ string, checked time.Time) bool {
+		return time.Since(checked) >= r.config.RefCheckInterval
+	})
+	now := time.Now()
+	for _, entry := range entries {
+		r.unsatisfiable[entry] = now
+	}
+}
+
+// missingCommitsLocked returns the commits that are absent from the local object database.
+//
+// It takes the repository's read lock to stay consistent with concurrent fetches.
+func (r *Repository) missingCommitsLocked(ctx context.Context, commits []string) []string { //nolint:privatedoc // documents a locking requirement
 	if len(commits) == 0 {
 		return nil
 	}
@@ -1027,21 +1156,6 @@ func (r *Repository) missingCommitsLocked(ctx context.Context, commits []string)
 	return missing
 }
 
-// refsSatisfied reports whether every ref in expect is present in localRefs at
-// the expected SHA (or at any SHA when the expected SHA is empty).
-func refsSatisfied(localRefs, expect map[string]string) bool {
-	for ref, wantSHA := range expect {
-		localSHA, ok := localRefs[ref]
-		if !ok {
-			return false
-		}
-		if wantSHA != "" && localSHA != wantSHA {
-			return false
-		}
-	}
-	return true
-}
-
 func resolvedRefs(localRefs, expect map[string]string) map[string]string {
 	if len(expect) == 0 {
 		return nil
@@ -1053,23 +1167,29 @@ func resolvedRefs(localRefs, expect map[string]string) map[string]string {
 	return out
 }
 
+// GetLocalRefs returns the SHA of every local mirror ref, including HEAD, matching GetUpstreamRefs.
 func (r *Repository) GetLocalRefs(ctx context.Context) (map[string]string, error) {
 	var output []byte
 	var err error
 
 	r.mu.RLock()
 	// #nosec G204 - r.path is controlled by us
-	cmd := exec.CommandContext(ctx, "git", "-C", r.path, "for-each-ref", "--format=%(objectname) %(refname)")
+	cmd := exec.CommandContext(ctx, "git", "-C", r.path, "show-ref", "--head")
 	output, err = cmd.CombinedOutput()
 	r.mu.RUnlock()
 
+	// show-ref exits 1 with no output when the repository has no refs.
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 1 && len(output) == 0 {
+		return map[string]string{}, nil
+	}
 	if err != nil {
-		return nil, errors.Wrap(err, "git for-each-ref")
+		return nil, errors.Wrapf(err, "git show-ref: %s", output)
 	}
 
 	return ParseGitRefs(output), nil
 }
 
+// GetUpstreamRefs runs git ls-remote against upstream and returns a map of ref name to SHA.
 func (r *Repository) GetUpstreamRefs(ctx context.Context) (map[string]string, error) {
 	// #nosec G204 - r.upstreamURL is controlled by us
 	cmd, err := r.GitCommand(ctx, "ls-remote", r.upstreamURL)
@@ -1084,26 +1204,16 @@ func (r *Repository) GetUpstreamRefs(ctx context.Context) (map[string]string, er
 	return ParseGitRefs(output), nil
 }
 
-// Repack consolidates pack files using geometric repacking. Unlike a full
-// repack (-a), geometric repacking only merges packs when there is significant
-// fragmentation (many small packs), making it orders of magnitude faster on
-// large repositories in steady state. The --write-midx and --write-bitmap-index
-// flags maintain the multi-pack index and reachability bitmaps for efficient
-// serving via git http-backend.
+// Repack geometrically merges fragmented packs, which is fast in steady state, and rewrites the MIDX and bitmaps.
 //
-// git repack installs its new pack before writing the bitmap and deletes the
-// packs it replaced only after that succeeds, so a failed repack leaves a
-// duplicate of every repacked object. Each duplicate slows the next repack, so
-// after a failure the next attempt may run for CloneTimeout to clear them. A
-// marker file under the mirror root records an unfinished repack, so the state
-// survives a process killed mid-repack and covers repacks still running.
+// A failed repack leaves a duplicate of every repacked object, so the next attempt may run for CloneTimeout. A
+// marker file under the mirror root records running or unfinished repacks, surviving a process killed mid-repack.
 func (r *Repository) Repack(ctx context.Context) error {
 	logger := logging.FromContext(ctx)
 	logger.InfoContext(ctx, "Geometric repack started", "upstream", r.upstreamURL)
 
 	packDir := filepath.Join(r.path, "objects", "pack")
-	// Temporary packs older than the longest git operation timeout belong to
-	// killed processes rather than a concurrent fetch.
+	// Temp packs older than the longest git timeout belong to killed processes, not a concurrent fetch.
 	maxAge := max(r.config.CloneTimeout, r.config.FetchTimeout, r.config.RepackTimeout)
 	if err := removeStaleTempPacks(packDir, time.Now().Add(-maxAge)); err != nil {
 		return err
@@ -1133,15 +1243,9 @@ func (r *Repository) Repack(ctx context.Context) error {
 		threads = r.config.PackThreads
 	}
 
-	// Override pack settings for repack to bound memory usage. The repo-level
-	// config uses high values (512m deltaCacheSize, 1g windowMemory) tuned for
-	// serving performance with many threads. Repack is a background task that
-	// can afford to be slower in exchange for bounded memory.
+	// Bound memory: the repo config's large pack settings are tuned for serving, and repack can afford to be slower.
 	//
-	// packKeptObjects stops pack-objects from omitting objects that a
-	// concurrent fetch's .keep pack also holds. That pack is not in the new
-	// multi-pack index, so omitting them fails the bitmap with "Packfile
-	// doesn't have full closure".
+	// packKeptObjects stops omitting objects held by a concurrent fetch's .keep pack, which the new MIDX excludes.
 	// #nosec G204 - r.path is controlled by us
 	cmd := exec.CommandContext(repackCtx, "git", "-C", r.path,
 		"-c", "pack.threads="+strconv.Itoa(threads),
@@ -1155,10 +1259,7 @@ func (r *Repository) Repack(ctx context.Context) error {
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// When git repack is killed (e.g. by our timeout), it cannot clean up
-		// the multi-pack-index.lock it holds. A stale lock blocks all future
-		// repacks, causing pack fragmentation that eventually degrades snapshot
-		// serving performance. Remove it so the next attempt can proceed.
+		// A killed git repack cannot remove its multi-pack-index.lock, which would block every future repack.
 		lockPath := filepath.Join(packDir, "multi-pack-index.lock")
 		if rmErr := os.Remove(lockPath); rmErr == nil {
 			logger.WarnContext(ctx, "Removed stale multi-pack-index.lock after repack failure", "upstream", r.upstreamURL)
@@ -1173,9 +1274,9 @@ func (r *Repository) Repack(ctx context.Context) error {
 	return nil
 }
 
-// RepackPending reports whether a repack is running or the last one did not
-// finish. Until a repack succeeds the mirror can hold duplicate packs, so
-// copies of it can be much larger than the repository.
+// RepackPending reports whether a repack is running or the last one did not finish.
+//
+// Until a repack succeeds the mirror can hold duplicate packs, so copies of it can be much larger than the repo.
 func (r *Repository) RepackPending() bool {
 	markerPath, err := r.repackMarkerPath()
 	if err != nil {
@@ -1185,10 +1286,10 @@ func (r *Repository) RepackPending() bool {
 	return !errors.Is(err, os.ErrNotExist)
 }
 
-// repackMarkerPath lives in its own namespace under the mirror root, like
-// snapshot work directories, so it cannot collide with another mirror and
-// mirror snapshots never carry it to other replicas.
-func (r *Repository) repackMarkerPath() (string, error) {
+// repackMarkerPath returns the repack marker's path, in its own namespace under the mirror root.
+//
+// There it cannot collide with another mirror, and mirror snapshots never carry it to other replicas.
+func (r *Repository) repackMarkerPath() (string, error) { //nolint:privatedoc // explains why
 	rel, err := filepath.Rel(r.config.MirrorRoot, r.path)
 	if err != nil || !filepath.IsLocal(rel) {
 		return "", errors.Errorf("mirror %s is outside mirror root %s", r.path, r.config.MirrorRoot)
@@ -1196,9 +1297,9 @@ func (r *Repository) repackMarkerPath() (string, error) {
 	return filepath.Join(r.config.MirrorRoot, ".repack-pending", rel), nil
 }
 
-// removeStaleTempPacks removes temporary pack files last modified before
-// cutoff. Killed pack-objects and index-pack processes leave tmp_* files, and
-// a repack killed between writing and installing its pack leaves .tmp-* files.
+// removeStaleTempPacks removes temporary pack files last modified before cutoff.
+//
+// Killed pack-objects/index-pack processes leave tmp_*; a repack killed before installing its pack leaves .tmp-*.
 func removeStaleTempPacks(packDir string, cutoff time.Time) error {
 	entries, err := os.ReadDir(packDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1229,6 +1330,7 @@ func removeStaleTempPacks(packDir string, cutoff time.Time) error {
 	return nil
 }
 
+// HasCommit reports whether ref names an object present in the local mirror; any git error counts as absent.
 func (r *Repository) HasCommit(ctx context.Context, ref string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

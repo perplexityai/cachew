@@ -26,9 +26,8 @@ import (
 	"github.com/block/cachew/internal/s3client/s3clienttest"
 )
 
-// seedTier writes content to a single tier directly, so tests can diverge the
-// versions held by each tier.
-func seedTier(ctx context.Context, t *testing.T, c cache.Cache, key cache.Key, content []byte, rawETag ...string) {
+// seedTier writes content to a single tier directly, so tests can diverge the versions held by each tier.
+func seedTier(ctx context.Context, t *testing.T, c cache.Cache, key cache.Key, content []byte, rawETag ...string) { //nolint:privatedoc // explains why
 	t.Helper()
 	var opts []cache.Option
 	if len(rawETag) > 0 {
@@ -464,8 +463,9 @@ func TestTieredBackfillDiscardsIncompleteStreams(t *testing.T) {
 	})
 }
 
-// midStreamFailingCache serves failAfter bytes of each opened object and then
-// fails the read with err, simulating an upstream stream dying mid-transfer.
+// midStreamFailingCache serves failAfter bytes of each opened object and then fails the read with err.
+//
+// It simulates an upstream stream dying mid-transfer.
 type midStreamFailingCache struct {
 	cache.Cache
 	failAfter int
@@ -685,8 +685,7 @@ func TestStatAuthoritativeBypassesLocalTiers(t *testing.T) {
 	_, err = cache.StatAuthoritative(ctx, tiered, key)
 	assert.NoError(t, err)
 
-	// A lost shared object must be reported missing even while a local tier
-	// still holds a copy.
+	// A lost shared object must be reported missing even while a local tier still holds a copy.
 	assert.NoError(t, shared.Delete(ctx, key))
 	_, err = tiered.Stat(ctx, key)
 	assert.NoError(t, err)
@@ -1004,8 +1003,7 @@ func TestTieredDivergentValidatorPermutations(t *testing.T) {
 				assert.Equal(t, "bytes 2-5/10", headers.Get("Content-Range"))
 				assert.Equal(t, pinnedETag, headers.Get(cache.ETagKey))
 
-				// A partial body must never be backfilled: the lower tier keeps
-				// its own version.
+				// A partial body must never be backfilled: the lower tier keeps its own version.
 				r2, _, err := lower.Open(ctx, keyBoth)
 				assert.NoError(t, err)
 				assert.Equal(t, stale, readAllAndClose(t, r2))

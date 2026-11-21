@@ -38,9 +38,9 @@ type BackoffTransport struct {
 	until    map[string]time.Time
 }
 
-// NewBackoffTransport uses delay when a 429 has no valid Retry-After header,
-// never cools down for longer than maxDelay, and reports cooldowns to logger,
-// because outbound requests do not always carry a logger in their context.
+// NewBackoffTransport cools down for delay on a 429 without a valid Retry-After, and never longer than maxDelay.
+//
+// logger is passed explicitly because outbound requests do not always carry one in their context.
 func NewBackoffTransport(base http.RoundTripper, delay, maxDelay time.Duration, logger *slog.Logger) *BackoffTransport {
 	meter := otel.Meter("cachew.upstream")
 	cooldowns, err := meter.Int64Counter("cachew.upstream.cooldowns", metric.WithUnit("{cooldown}"),
@@ -61,11 +61,10 @@ type noCooldownKey struct{}
 type cooldownScopeKey struct{}
 type forwardedCredentialKey struct{}
 
-// WithCooldownScope gives requests their own cooldown on each host. Set it
-// where a request gets a credential whose rate limit is separate from the
-// host's other callers, such as a GitHub App installation token. Requests
-// without a scope, or without an Authorization header, share their host's
-// cooldown.
+// WithCooldownScope gives requests their own cooldown on each host.
+//
+// Use it for credentials rate limited apart from the host's other callers, such as GitHub App tokens.
+// Requests without a scope or an Authorization header share their host's cooldown.
 func WithCooldownScope(ctx context.Context, scope string) context.Context {
 	return context.WithValue(ctx, cooldownScopeKey{}, scope)
 }
