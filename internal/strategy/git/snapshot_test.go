@@ -41,15 +41,13 @@ func TestSnapshotHTTPEndpoint(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{
 		MirrorRoot: mirrorRoot,
-	}, nil)
+	})
 	// SnapshotInterval=0 disables periodic snapshot jobs so they don't
 	// overwrite the fake cached snapshot we insert below.
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
-	// The warm-up goroutine uses context.WithoutCancel so it survives
-	// t.Context() cancellation. Wait for it before TempDir cleanup.
 	t.Cleanup(func() { waitForReady(t, s) })
 
 	// Create a fake snapshot in the cache with a Last-Modified after the
@@ -115,7 +113,7 @@ func TestSnapshotOnDemandGenerationViaHTTP(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -253,7 +251,7 @@ func TestSnapshotUnchangedSkipsRegeneration(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{SnapshotMaxAge: time.Hour}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 	s.SetMetadataStore(metadatadb.New(ctx, metadatadb.NewMemoryBackend()))
@@ -312,7 +310,7 @@ func TestSnapshotGenerationViaLocalClone(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -377,7 +375,7 @@ func TestSnapshotGenerationWithFilter(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{SnapshotFilters: map[string]string{"github.com/org/repo": "blob:none"}}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -433,7 +431,7 @@ func TestSnapshotGenerationWithFilterFailsWhenMirrorIgnoresFilter(t *testing.T) 
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{SnapshotFilters: map[string]string{"github.com/org/repo": "blob:none"}}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -525,7 +523,7 @@ func TestSnapshotGenerationExcludesGitGarbage(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -573,7 +571,7 @@ func TestSnapshotsRefusedAfterFailedRepack(t *testing.T) {
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	mux := newTestMux()
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 	manager, err := cm()
@@ -624,7 +622,7 @@ func TestMirrorSnapshotRestoreDirectly(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -701,7 +699,7 @@ func TestMirrorSnapshotWithMultipleBranches(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -792,7 +790,7 @@ func TestSnapshotServesFreshSnapshotWithCommitHeader(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -847,7 +845,7 @@ func TestSnapshotHeadServesMetadataWithoutBody(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -921,7 +919,7 @@ func TestSnapshotGetHonorsIfNoneMatch(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -978,7 +976,7 @@ func TestSnapshotServesBundleURLWhenStale(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -1048,7 +1046,7 @@ func TestColdSnapshotServesWithoutCommitHeader(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -1103,7 +1101,7 @@ func TestDeferredRestoreOnlyScheduledOnce(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -1158,7 +1156,7 @@ func TestCacheBundleAbortsOnWriteFailure(t *testing.T) {
 	failCache := &failWriteCache{Cache: memCache}
 
 	mux := newTestMux()
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), failCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 	waitForReady(t, s)
@@ -1225,7 +1223,7 @@ func TestSnapshotRemoteURLUsesUpstreamURL(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -1267,7 +1265,7 @@ func TestSnapshotGetHonorsRange(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
@@ -1446,7 +1444,7 @@ func newBundleTestStrategy(ctx context.Context, t *testing.T, mirrorRoot string,
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	mux := newTestMux()
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot, RefCheckInterval: refCheckInterval}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot, RefCheckInterval: refCheckInterval})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 	waitForReady(t, s)
@@ -1620,7 +1618,7 @@ func TestSnapshotMissDefersCachingToActivePublisher(t *testing.T) {
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	mux := newTestMux()
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 	waitForReady(t, s)

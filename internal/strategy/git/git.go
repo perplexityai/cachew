@@ -330,15 +330,15 @@ func (s *Strategy) warmExistingRepos(ctx context.Context) error {
 		}
 		pending = remaining
 		if discovered && len(pending) == 0 {
-			return ctx.Err()
+			return errors.WithStack(ctx.Err())
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return errors.WithStack(ctx.Err())
 		case <-time.After(delay):
 		}
 	}
-	return ctx.Err()
+	return errors.WithStack(ctx.Err())
 }
 
 func (s *Strategy) warmMirror(ctx context.Context, repo *gitclone.Repository) error {

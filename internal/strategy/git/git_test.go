@@ -63,6 +63,21 @@ func newTestSpools(t *testing.T) *spool.Registry {
 	return spools
 }
 
+func fixtureMirrorManager(ctx context.Context, t *testing.T, config gitclone.Config) gitclone.ManagerProvider {
+	t.Helper()
+	provider := gitclone.NewManagerProvider(ctx, config, nil)
+	manager, err := provider()
+	assert.NoError(t, err)
+	repos, err := manager.DiscoverExisting(ctx)
+	assert.NoError(t, err)
+	for _, repo := range repos {
+		origin := filepath.Join(t.TempDir(), "origin.git")
+		runInfoRefsGit(t, "clone", "--mirror", "--no-local", repo.Path(), origin)
+		runInfoRefsGit(t, "-C", repo.Path(), "remote", "set-url", "origin", origin)
+	}
+	return provider
+}
+
 // waitForReady blocks until the strategy reports Ready() — used by tests that
 // operate directly on the mirror directory to avoid racing with the background
 // warm-up goroutine started in git.New.

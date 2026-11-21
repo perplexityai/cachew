@@ -59,7 +59,7 @@ func TestEnsureRefsHandler(t *testing.T) {
 	assert.NoError(t, err)
 	mux := newTestMux()
 
-	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm,
 		func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
