@@ -59,6 +59,32 @@ func (s *snapshotScheduleRecorder) SubmitPeriodicJob(_, id string, _ time.Durati
 	s.jobs <- id
 }
 
+func TestSnapshotSchedulingWithLFSOptOut(t *testing.T) {
+	ctx := logging.ContextWithLogger(t.Context(), slog.Default())
+	manager, err := gitclone.NewManager(ctx, gitclone.Config{MirrorRoot: t.TempDir()}, nil)
+	assert.NoError(t, err)
+	scheduler := &snapshotScheduleRecorder{jobs: make(chan string, 4)}
+	s := &Strategy{scheduler: scheduler, config: Config{
+		SnapshotInterval: time.Hour, DisableLFSSnapshotsFor: []string{"example.test/org/repo"},
+	}}
+	for _, tc := range []struct {
+		url  string
+		jobs []string
+	}{
+		{"https://example.test/org/repo.git", []string{"snapshot-periodic", "mirror-snapshot-periodic"}},
+		{"https://example.test/org/repo-fork", []string{"snapshot-periodic", "lfs-snapshot-periodic", "mirror-snapshot-periodic"}},
+	} {
+		repo, err := manager.GetOrCreate(ctx, tc.url)
+		assert.NoError(t, err)
+		s.scheduleSnapshotJobs(repo)
+		var jobs []string
+		for range len(scheduler.jobs) {
+			jobs = append(jobs, <-scheduler.jobs)
+		}
+		assert.Equal(t, tc.jobs, jobs, tc.url)
+	}
+}
+
 type coldSnapshotSlowCache struct {
 	cache.Cache
 	beforeCreate func() error

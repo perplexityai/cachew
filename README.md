@@ -41,6 +41,15 @@ git {
 }
 ```
 
+If clients of a repository only need the checkout archive, set
+`disable-lfs-snapshots-for = ["github.com/org/repo"]` in `strategy git`.
+Use exact repository keys without a scheme or `.git` suffix. Cachew no longer
+fetches LFS objects for the separate archive or schedules its generation for
+those repositories. Their `lfs-snapshot.tar.zst` endpoint returns 404, even
+for a previously cached archive. Existing objects are left to the cache's
+retention policy; no shared data is deleted. Checkout snapshots, mirror
+backups, and unlisted repositories are unchanged.
+
 ### GitHub Releases
 
 Caches public and private GitHub release assets. Private orgs use a token or GitHub App for authentication.

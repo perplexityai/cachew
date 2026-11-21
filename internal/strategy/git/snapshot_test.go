@@ -1406,6 +1406,36 @@ func TestLFSSnapshotGetHonorsRangeAndIfMatch(t *testing.T) {
 	assert.Equal(t, http.StatusNotModified, notModified.Code)
 }
 
+func TestDisabledLFSSnapshotSkipsExistingArchiveAndColdWarmup(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{})
+	mem, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	const key = "github.com/org/repo"
+	w, err := mem.Create(ctx, cache.NewKey("https://"+key+".lfs-snapshot"), http.Header{}, time.Hour)
+	assert.NoError(t, err)
+	_, err = w.Write([]byte("old archive"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+
+	mux := newTestMux()
+	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: t.TempDir()}, nil)
+	manager, err := cm()
+	assert.NoError(t, err)
+	cfg := git.Config{DisableLFSSnapshotsFor: []string{key, "github.com/org/cold"}}
+	_, err = git.New(ctx, cfg, newTestScheduler(ctx, t), mem, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
+	assert.NoError(t, err)
+	for _, repo := range []string{"repo.git", "cold"} {
+		path := "org/" + repo + "/lfs-snapshot.tar.zst"
+		req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/git/github.com/"+path, nil)
+		req.SetPathValue("host", "github.com")
+		req.SetPathValue("path", path)
+		rec := httptest.NewRecorder()
+		mux.handlers["GET /git/{host}/{path...}"].ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+	}
+	assert.Zero(t, manager.Get("https://github.com/org/cold"))
+}
+
 // createUpstreamAndMirror creates a working upstream repo with one commit and
 // a mirror clone of it, returning the upstream work dir so tests can add
 // commits upstream after the mirror is created.

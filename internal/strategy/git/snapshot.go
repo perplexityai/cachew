@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -191,6 +192,14 @@ func (s *Strategy) snapshotFilterFor(upstreamURL string) string {
 		return ""
 	}
 	return s.config.SnapshotFilters[repoPath]
+}
+
+func (s *Strategy) lfsSnapshotsDisabled(upstreamURL string) bool {
+	if len(s.config.DisableLFSSnapshotsFor) == 0 {
+		return false
+	}
+	path, err := gitclone.RepoPathFromURL(upstreamURL)
+	return err == nil && slices.Contains(s.config.DisableLFSSnapshotsFor, filepath.ToSlash(path))
 }
 
 func (s *Strategy) withSnapshotClone(ctx context.Context, repo *gitclone.Repository, suffix, filter string, fn func(workDir string) error) error {
@@ -434,9 +443,11 @@ func (s *Strategy) scheduleSnapshotJobsAfter(repo *gitclone.Repository, baseDela
 		}
 		return s.generateAndUploadSnapshot(ctx, repo)
 	})
-	submit(snapshotJobLFS, s.config.SnapshotInterval, func(ctx context.Context) (string, error) {
-		return s.generateAndUploadLFSSnapshot(ctx, repo)
-	})
+	if !s.lfsSnapshotsDisabled(upstream) {
+		submit(snapshotJobLFS, s.config.SnapshotInterval, func(ctx context.Context) (string, error) {
+			return s.generateAndUploadLFSSnapshot(ctx, repo)
+		})
+	}
 	mirrorInterval := s.config.MirrorSnapshotInterval
 	if mirrorInterval == 0 {
 		mirrorInterval = s.config.SnapshotInterval
@@ -1654,6 +1665,10 @@ func (s *Strategy) handleLFSSnapshotRequest(w http.ResponseWriter, r *http.Reque
 
 	repoPath := ExtractRepoPath(strings.TrimSuffix(pathValue, "/lfs-snapshot.tar.zst"))
 	upstreamURL := "https://" + host + "/" + repoPath
+	if s.lfsSnapshotsDisabled(upstreamURL) {
+		http.NotFound(w, r)
+		return
+	}
 	cacheKey := lfsSnapshotCacheKey(upstreamURL)
 
 	// Try cache first so we can serve even when the mirror isn't ready (cold
