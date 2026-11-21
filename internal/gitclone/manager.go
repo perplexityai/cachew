@@ -743,10 +743,7 @@ func (r *Repository) executeClone(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "create git command")
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
+	cancelGitProcessGroup(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.Wrapf(err, "git clone --mirror: %s", string(output))
@@ -830,24 +827,86 @@ func (r *Repository) fetchInternal(ctx context.Context, timeout time.Duration, e
 		)
 	}
 	args = append(args, "fetch", "--prune", "--prune-tags")
+	if err := r.runFetch(fetchCtx, args...); err != nil {
+		return err
+	}
+	r.setLastFetch(time.Now())
+	return nil
+}
 
-	cmd, err := r.GitCommand(fetchCtx, args...)
+// FetchSnapshotHead refreshes only the advertised default branch. It does not
+// advance the timestamp used to assert freshness of the entire mirror.
+func (r *Repository) FetchSnapshotHead(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, r.config.FetchTimeout)
+	defer cancel()
+	return r.WithFetchExclusion(ctx, func() error {
+		out, err := r.snapshotHeadAdvertisement(ctx)
+		if err != nil {
+			return errors.Wrap(err, "discover upstream default branch")
+		}
+		for line := range strings.SplitSeq(string(out), "\n") {
+			target, isHEAD := strings.CutSuffix(line, "\tHEAD")
+			ref, symbolic := strings.CutPrefix(target, "ref: ")
+			if !isHEAD || !symbolic || !strings.HasPrefix(ref, "refs/heads/") {
+				continue
+			}
+			if err := exec.CommandContext(ctx, "git", "check-ref-format", ref).Run(); err != nil { // #nosec G204
+				return errors.Wrap(err, "invalid upstream default branch")
+			}
+			if err := r.runFetch(ctx, "-C", r.path, "-c", "fetch.writeCommitGraph=false", "fetch", "--no-auto-maintenance",
+				"--no-tags", "--no-prune", "--no-prune-tags", "--refmap=", "origin", "+"+ref+":"+ref); err != nil {
+				return err
+			}
+			return errors.Wrap(exec.CommandContext(ctx, "git", "-C", r.path, "symbolic-ref", "HEAD", ref).Run(), "align mirror HEAD") // #nosec G204
+		}
+		return errors.New("upstream HEAD does not identify a default branch")
+	})
+}
+
+func (r *Repository) snapshotHeadAdvertisement(ctx context.Context) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.config.LsRemoteTimeout)
+	defer cancel()
+	cmd, err := r.GitCommand(ctx, "-C", r.path, "ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return nil, errors.Wrap(err, "create default branch lookup")
+	}
+	cancelGitProcessGroup(cmd)
+	cmd.WaitDelay = time.Second
+	out, err := cmd.Output()
+	return out, errors.WithStack(err)
+}
+
+// A transport helper can inherit the output pipe and keep Wait blocked after
+// the top-level Git process exits.
+func cancelGitProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+}
+
+// ConnectivityFailure reports a positive local integrity failure, not an
+// inability to run fsck. An inconclusive check must not destroy a restored seed.
+func (r *Repository) ConnectivityFailure(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "git", "-C", r.path, "fsck", "--connectivity-only", "--no-dangling") // #nosec G204
+	cancelGitProcessGroup(cmd)
+	err := cmd.Run()
+	var exit *exec.ExitError
+	if ctx.Err() == nil && errors.As(err, &exit) && exit.ExitCode() > 0 && exit.ExitCode() < 128 {
+		return errors.Wrap(err, "restored mirror failed connectivity check")
+	}
+	return nil
+}
+
+func (r *Repository) runFetch(ctx context.Context, args ...string) error {
+	cmd, err := r.GitCommand(ctx, args...)
 	if err != nil {
 		return errors.Wrap(err, "create git command")
 	}
-	// Start the process in its own process group so we can kill the entire
-	// tree (git spawns child processes like git-remote-https that inherit
-	// stdout/stderr pipes and prevent CombinedOutput from returning).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
+	cancelGitProcessGroup(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return errors.Wrapf(err, "git fetch: %s", string(output))
 	}
 
-	r.setLastFetch(time.Now())
 	return nil
 }
 

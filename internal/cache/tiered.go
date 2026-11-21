@@ -402,7 +402,23 @@ func (t Tiered) Open(ctx context.Context, key Key, opts ...Option) (io.ReadClose
 
 // OpenWithTier reports the source before a tier-zero backfill can obscure which
 // backend supplied the representation.
-func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, BackendType, error) { //nolint:funlen // Conditional tier probing is clearer as one state machine.
+func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, BackendType, error) {
+	return t.openWithTier(ctx, key, true, opts...)
+}
+
+// OpenProbeByte reads a one-byte range without triggering a full tier-zero backfill.
+func OpenProbeByte(ctx context.Context, c Cache, key Key) (io.ReadCloser, http.Header, error) {
+	if tiered, ok := c.(interface {
+		openWithTier(context.Context, Key, bool, ...Option) (io.ReadCloser, http.Header, BackendType, error)
+	}); ok {
+		body, headers, _, err := tiered.openWithTier(ctx, key, false, Range(0, 1))
+		return body, headers, err
+	}
+	body, headers, err := c.Open(ctx, key, Range(0, 1))
+	return body, headers, errors.WithStack(err)
+}
+
+func (t Tiered) openWithTier(ctx context.Context, key Key, fill bool, opts ...Option) (io.ReadCloser, http.Header, BackendType, error) { //nolint:funlen // Conditional tier probing is clearer as one state machine.
 	ro := NewRequestOptions(opts...)
 	// A Range request yields a partial body, which must never be backfilled
 	// into a lower tier as if it were the whole object.
@@ -480,7 +496,10 @@ func (t Tiered) OpenWithTier(ctx context.Context, key Key, opts ...Option) (io.R
 			discardTieredReader(ctx, key, fallback)
 		}
 		metrics.ObserveCacheSource(ctx, BackendName(c))
-		return t.convergeTier0(ctx, key, r, headers, c, i, partial), headers, cacheBackendType(c), nil
+		if fill {
+			r = t.convergeTier0(ctx, key, r, headers, c, i, partial)
+		}
+		return r, headers, cacheBackendType(c), nil
 	}
 	if len(probeErrs) > 0 {
 		if fallback != nil {

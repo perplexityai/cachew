@@ -65,7 +65,8 @@ type Config struct {
 	BundleCacheTTL         time.Duration `hcl:"bundle-cache-ttl,optional" help:"TTL of cached server-side git bundles." default:"2h"`
 	MaxRequestBodyMB       int           `hcl:"max-request-body-mb,optional" help:"Maximum size in megabytes of git request bodies that are buffered in memory (upload-pack negotiation and ensure-refs). Pushes and other requests streamed to upstream are not limited. 0 disables the limit." default:"100"`
 
-	SnapshotFilters map[string]string `hcl:"snapshot-filters,optional" help:"Per-repository git partial-clone filter applied to workstation snapshots, keyed by host/org/repo (e.g. {\"github.com/org/repo\": \"blob:none\"}). Filtered snapshots contain full history metadata but only the blobs needed for the HEAD checkout; clients lazily fetch historical blobs through cachew on demand."`
+	SnapshotFilters           map[string]string `hcl:"snapshot-filters,optional" help:"Per-repository git partial-clone filter applied to workstation snapshots, keyed by host/org/repo (e.g. {\"github.com/org/repo\": \"blob:none\"}). Filtered snapshots contain full history metadata but only the blobs needed for the HEAD checkout; clients lazily fetch historical blobs through cachew on demand."`
+	StartupSnapshotRepository string            `hcl:"startup-snapshot-repository,optional" help:"Qualify cached checkout reads for one canonical HTTPS repository after fetching its upstream HEAD. Other Git routes stay unavailable until all mirrors are refreshed."`
 }
 
 type Strategy struct {
@@ -96,6 +97,7 @@ type Strategy struct {
 	metadataWired        chan struct{} // closed by SetMetadataStore; gates warm-up
 	wiredOnce            sync.Once
 	ready                atomic.Bool
+	snapshotProbeUntil   atomic.Pointer[time.Time]
 }
 
 func New(
@@ -108,6 +110,12 @@ func New(
 	tokenManagerProvider githubapp.TokenManagerProvider,
 	spools *spool.Registry,
 ) (*Strategy, error) {
+	if up := config.StartupSnapshotRepository; up != "" {
+		path, err := gitclone.RepoPathFromURL(up)
+		if err != nil || up != "https://"+filepath.ToSlash(path) || config.SnapshotInterval <= 0 {
+			return nil, errors.New("startup-snapshot-repository requires a canonical HTTPS repository URL and a positive snapshot-interval")
+		}
+	}
 	if _, err := exec.LookPath("git"); err != nil {
 		return nil, errors.New("git is required but not found in PATH")
 	}
@@ -176,36 +184,7 @@ func New(
 	// Run startup fetches in the background so the HTTP listener (and
 	// /_liveness) come up immediately. /_readiness gates on Ready() so the
 	// Service load balancer holds traffic until warming completes.
-	go func() {
-		warmCtx := ctx
-		// Coordination only matters when warm-up will schedule snapshot
-		// jobs; with snapshots disabled, warm immediately.
-		if s.config.SnapshotInterval > 0 {
-			// Wait for SetMetadataStore so warm-up never schedules snapshot
-			// jobs before cross-replica coordination is installed.
-			// config.Load wires every MetadataConsumer immediately after
-			// construction.
-			select {
-			case <-s.metadataWired:
-			case <-ctx.Done():
-				return
-			}
-			// Sync shared coordination state before scheduling so the first
-			// claim decisions don't run against an empty local view. Bounded
-			// and fail-open (coordination is advisory) so a slow metadata
-			// backend can't wedge readiness.
-			primeCtx, cancel := context.WithTimeout(warmCtx, time.Minute)
-			if err := s.snapshotCoord.Load().Prime(primeCtx); err != nil {
-				logger.WarnContext(warmCtx, "Failed to prime snapshot coordination state", "error", err)
-			}
-			cancel()
-		}
-		if err := s.warmExistingRepos(warmCtx); err != nil {
-			return
-		}
-		s.ready.Store(true)
-		logger.InfoContext(warmCtx, "Git strategy ready")
-	}()
+	go s.warmStartup(ctx)
 
 	s.proxy = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
@@ -278,7 +257,8 @@ var _ strategy.MetadataConsumer = (*Strategy)(nil)
 
 // Ready reports whether startup warm-up has completed.
 func (s *Strategy) Ready() bool {
-	return s.ready.Load()
+	until := s.snapshotProbeUntil.Load()
+	return s.ready.Load() || (until != nil && time.Now().Before(*until))
 }
 
 // SetMetadataStore enables the per-repo clone histogram (and schedules its
@@ -308,7 +288,40 @@ func (s *Strategy) SetMetadataStore(store *metadatadb.Store) {
 	})
 }
 
-func (s *Strategy) warmExistingRepos(ctx context.Context) error {
+func (s *Strategy) warmStartup(ctx context.Context) {
+	logger := logging.FromContext(ctx)
+	if s.config.SnapshotInterval > 0 {
+		// Warm-up schedules jobs. Wait for metadata wiring, but do not let an
+		// unavailable advisory coordination store prevent a local refresh.
+		select {
+		case <-s.metadataWired:
+		case <-ctx.Done():
+			return
+		}
+		primeCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		if err := s.snapshotCoord.Load().Prime(primeCtx); err != nil {
+			logger.WarnContext(ctx, "Failed to prime snapshot coordination state", "error", err)
+		}
+		cancel()
+	}
+	var bootstrapped *gitclone.Repository
+	if s.config.StartupSnapshotRepository != "" {
+		var qualified bool
+		bootstrapped, qualified = s.qualifySnapshotStartup(ctx)
+		if !qualified {
+			return
+		}
+		probeCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go s.watchStartupSnapshot(probeCtx)
+	}
+	if err := s.warmExistingRepos(ctx, bootstrapped); err == nil {
+		s.ready.Store(true)
+		logger.InfoContext(ctx, "Git strategy ready")
+	}
+}
+
+func (s *Strategy) warmExistingRepos(ctx context.Context, bootstrapped *gitclone.Repository) error {
 	logger := logging.FromContext(ctx)
 	var pending []*gitclone.Repository
 	discovered := false
@@ -323,6 +336,10 @@ func (s *Strategy) warmExistingRepos(ctx context.Context) error {
 		}
 		remaining := pending[:0]
 		for _, repo := range pending {
+			if repo == bootstrapped {
+				s.scheduleMirrorJobs(repo)
+				continue
+			}
 			if err := s.warmMirror(ctx, repo); err != nil {
 				logger.WarnContext(ctx, "Startup fetch failed for existing repo; retrying", "upstream", repo.UpstreamURL(), "error", err)
 				remaining = append(remaining, repo)
@@ -363,13 +380,17 @@ func (s *Strategy) warmMirror(ctx context.Context, repo *gitclone.Repository) er
 	maps.DeleteFunc(postRefs, func(k, v string) bool { return preRefs[k] == v })
 	logger.InfoContext(ctx, "Post-fetch changed refs for existing repo", "upstream", repo.UpstreamURL(), "refs", postRefs)
 
+	s.scheduleMirrorJobs(repo)
+	return nil
+}
+
+func (s *Strategy) scheduleMirrorJobs(repo *gitclone.Repository) {
 	if s.config.SnapshotInterval > 0 {
 		s.scheduleSnapshotJobs(repo)
 	}
 	if s.config.RepackInterval > 0 {
 		s.scheduleRepackJobs(repo)
 	}
-	return nil
 }
 
 // SetHTTPTransport overrides the HTTP transport used for upstream requests.
@@ -393,6 +414,10 @@ func (s *Strategy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// host and path are spliced into upstream URLs that may carry GitHub App credentials.
 	if err := errors.Join(cachewhttputil.ValidatePathSegment(host), cachewhttputil.ValidatePath(pathValue)); err != nil {
 		cachewhttputil.ErrorResponse(w, r, http.StatusBadRequest, "invalid git request path")
+		return
+	}
+	if s.config.StartupSnapshotRepository != "" && !s.ready.Load() {
+		s.serveStartupSnapshot(w, r, host, pathValue)
 		return
 	}
 
@@ -726,7 +751,18 @@ func (s *Strategy) ensureCloneReady(ctx context.Context, repo *gitclone.Reposito
 	}
 }
 
-func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (returnErr error) {
+func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) error {
+	return s.bootstrapMirror(ctx, repo, bootstrapOnDemand)
+}
+
+type bootstrapMode int
+
+const (
+	bootstrapOnDemand bootstrapMode = iota
+	bootstrapAtStartup
+)
+
+func (s *Strategy) bootstrapMirror(ctx context.Context, repo *gitclone.Repository, mode bootstrapMode) (returnErr error) {
 	// Atomically claim the clone so only one goroutine performs the restore
 	// or clone. Without this gate, concurrent snapshot requests each call
 	// startClone and extract tarballs over the same directory, corrupting
@@ -770,7 +806,14 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 		// State remains StateCloning until fetch succeeds so that
 		// concurrent requests (via ensureCloneReady) block rather than
 		// serving from a potentially empty or stale mirror.
-		if err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout); err != nil {
+		err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout)
+		if err != nil && mode == bootstrapAtStartup {
+			err = s.retryStartupRestore(ctx, repo, err)
+			if ctx.Err() != nil {
+				return errors.WithStack(ctx.Err())
+			}
+		}
+		if err != nil {
 			logger.WarnContext(ctx, "Post-restore fetch failed, discarding snapshot and falling back to clone",
 				"upstream", upstream, "error", err)
 			// The restored snapshot may be corrupt or empty. Remove it and
@@ -786,11 +829,8 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 
 			logger.InfoContext(ctx, "Post-restore fetch completed, serving", "upstream", upstream)
 
-			if s.config.SnapshotInterval > 0 {
-				s.scheduleSnapshotJobs(repo)
-			}
-			if s.config.RepackInterval > 0 {
-				s.scheduleRepackJobs(repo)
+			if mode == bootstrapOnDemand {
+				s.scheduleMirrorJobs(repo)
 			}
 			return nil
 		}
@@ -813,11 +853,8 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 	s.metrics.recordOperation(ctx, "clone", "success", time.Since(cloneStart))
 	logger.InfoContext(ctx, "Clone completed", "upstream", upstream, "path", repo.Path())
 
-	if s.config.SnapshotInterval > 0 {
-		s.scheduleSnapshotJobs(repo)
-	}
-	if s.config.RepackInterval > 0 {
-		s.scheduleRepackJobs(repo)
+	if mode == bootstrapOnDemand {
+		s.scheduleMirrorJobs(repo)
 	}
 	return nil
 }
