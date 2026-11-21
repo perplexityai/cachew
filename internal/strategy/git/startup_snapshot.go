@@ -17,13 +17,40 @@ import (
 	"github.com/block/cachew/internal/logging"
 )
 
+const startupProbeInterval = 5 * time.Second
+const startupProbeTimeout = 3 * time.Second
+
+// Keep the claim and the restored objects across origin outages. Only discard
+// the seed when Git independently identifies a local connectivity error.
+func (s *Strategy) retryStartupRestore(ctx context.Context, repo *gitclone.Repository, fetchErr error) error {
+	timeout := s.cloneManager.Config().CloneTimeout
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	integrityErr := repo.ConnectivityFailure(checkCtx)
+	cancel()
+	if integrityErr != nil {
+		return errors.WithStack(integrityErr)
+	}
+	for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
+		logging.FromContext(ctx).WarnContext(ctx, "Retaining restored mirror; retrying startup fetch", "upstream", repo.UpstreamURL(), "error", fetchErr)
+		select {
+		case <-ctx.Done():
+			return errors.WithStack(ctx.Err())
+		case <-time.After(delay):
+		}
+		fetchErr = repo.FetchLenient(ctx, timeout)
+		if fetchErr == nil {
+			return nil
+		}
+	}
+}
+
 func (s *Strategy) qualifySnapshotStartup(ctx context.Context) (*gitclone.Repository, bool) {
 	up := s.config.StartupSnapshotRepository
 	var bootstrapped *gitclone.Repository
 	for delay := time.Second; ctx.Err() == nil; delay = min(2*delay, 30*time.Second) {
 		repo, err := s.cloneManager.GetOrCreate(ctx, up)
 		if err == nil && repo.State() != gitclone.StateReady {
-			err = s.bootstrapMirror(ctx, repo, false)
+			err = s.bootstrapMirror(ctx, repo, bootstrapAtStartup)
 			if err == nil && repo.State() == gitclone.StateReady {
 				bootstrapped = repo
 			}
@@ -47,11 +74,17 @@ func (s *Strategy) qualifySnapshotStartup(ctx context.Context) (*gitclone.Reposi
 
 func (s *Strategy) watchStartupSnapshot(ctx context.Context) {
 	key := snapshotCacheKey(s.config.StartupSnapshotRepository)
-	tick := time.NewTicker(5 * time.Second)
+	tick := time.NewTicker(startupProbeInterval)
 	defer tick.Stop()
 	for {
-		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		s.snapshotReady.Store(s.readableStartupSnapshot(probeCtx, key))
+		start := time.Now()
+		probeCtx, cancel := context.WithTimeout(ctx, startupProbeTimeout)
+		if s.readableStartupSnapshot(probeCtx, key) && probeCtx.Err() == nil {
+			until := start.Add(startupProbeInterval + startupProbeTimeout)
+			s.snapshotProbeUntil.Store(&until)
+		} else {
+			s.snapshotProbeUntil.Store(nil)
+		}
 		cancel()
 		select {
 		case <-ctx.Done():

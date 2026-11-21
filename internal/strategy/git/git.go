@@ -97,7 +97,7 @@ type Strategy struct {
 	metadataWired        chan struct{} // closed by SetMetadataStore; gates warm-up
 	wiredOnce            sync.Once
 	ready                atomic.Bool
-	snapshotReady        atomic.Bool
+	snapshotProbeUntil   atomic.Pointer[time.Time]
 }
 
 func New(
@@ -257,7 +257,8 @@ var _ strategy.MetadataConsumer = (*Strategy)(nil)
 
 // Ready reports whether startup warm-up has completed.
 func (s *Strategy) Ready() bool {
-	return s.ready.Load() || s.snapshotReady.Load()
+	until := s.snapshotProbeUntil.Load()
+	return s.ready.Load() || (until != nil && time.Now().Before(*until))
 }
 
 // SetMetadataStore enables the per-repo clone histogram (and schedules its
@@ -751,10 +752,17 @@ func (s *Strategy) ensureCloneReady(ctx context.Context, repo *gitclone.Reposito
 }
 
 func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) error {
-	return s.bootstrapMirror(ctx, repo, true)
+	return s.bootstrapMirror(ctx, repo, bootstrapOnDemand)
 }
 
-func (s *Strategy) bootstrapMirror(ctx context.Context, repo *gitclone.Repository, scheduleJobs bool) (returnErr error) {
+type bootstrapMode int
+
+const (
+	bootstrapOnDemand bootstrapMode = iota
+	bootstrapAtStartup
+)
+
+func (s *Strategy) bootstrapMirror(ctx context.Context, repo *gitclone.Repository, mode bootstrapMode) (returnErr error) {
 	// Atomically claim the clone so only one goroutine performs the restore
 	// or clone. Without this gate, concurrent snapshot requests each call
 	// startClone and extract tarballs over the same directory, corrupting
@@ -798,7 +806,14 @@ func (s *Strategy) bootstrapMirror(ctx context.Context, repo *gitclone.Repositor
 		// State remains StateCloning until fetch succeeds so that
 		// concurrent requests (via ensureCloneReady) block rather than
 		// serving from a potentially empty or stale mirror.
-		if err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout); err != nil {
+		err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout)
+		if err != nil && mode == bootstrapAtStartup {
+			err = s.retryStartupRestore(ctx, repo, err)
+			if ctx.Err() != nil {
+				return errors.WithStack(ctx.Err())
+			}
+		}
+		if err != nil {
 			logger.WarnContext(ctx, "Post-restore fetch failed, discarding snapshot and falling back to clone",
 				"upstream", upstream, "error", err)
 			// The restored snapshot may be corrupt or empty. Remove it and
@@ -814,7 +829,7 @@ func (s *Strategy) bootstrapMirror(ctx context.Context, repo *gitclone.Repositor
 
 			logger.InfoContext(ctx, "Post-restore fetch completed, serving", "upstream", upstream)
 
-			if scheduleJobs {
+			if mode == bootstrapOnDemand {
 				s.scheduleMirrorJobs(repo)
 			}
 			return nil
@@ -838,7 +853,7 @@ func (s *Strategy) bootstrapMirror(ctx context.Context, repo *gitclone.Repositor
 	s.metrics.recordOperation(ctx, "clone", "success", time.Since(cloneStart))
 	logger.InfoContext(ctx, "Clone completed", "upstream", upstream, "path", repo.Path())
 
-	if scheduleJobs {
+	if mode == bootstrapOnDemand {
 		s.scheduleMirrorJobs(repo)
 	}
 	return nil

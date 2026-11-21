@@ -1072,10 +1072,13 @@ For a deployment whose only Git consumer restores published checkouts, set
 `startup-snapshot-repository = "https://example.com/org/repo"` in `strategy git`
 alongside a positive `snapshot-interval`. Cachew reuses the local mirror (or
 restores/clones a missing one) and fetches upstream `HEAD` on this daemon.
+On a cold restore, it first brings the full mirror up to date. An upstream
+outage retries that fetch in place; a local connectivity failure allows a fresh clone.
 This fetch downloads unfiltered objects and updates the mirror's default
 branch, not its other refs. A successful fetch and a readable, previously published
 checkout allow readiness while the normal all-ref refresh continues. Without
-a usable publication, startup waits for full warm-up. No new archive is
+a usable publication, startup waits for full warm-up. Early readiness expires
+if the checkout probe stops succeeding. No new archive is
 required. Until full warm-up finishes, only cached GET/HEAD requests for that
 checkout are served by the Git strategy; other Git requests return 503.
 Leave this option unset on general Git proxies. Removing it restores the

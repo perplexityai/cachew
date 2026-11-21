@@ -18,6 +18,7 @@ import (
 	"github.com/block/cachew/internal/gitclone"
 	"github.com/block/cachew/internal/githubapp"
 	"github.com/block/cachew/internal/logging"
+	"github.com/block/cachew/internal/snapshot"
 	"github.com/block/cachew/internal/strategy/git"
 )
 
@@ -74,6 +75,93 @@ func TestSnapshotStartupBootstrapsMissingRequiredMirror(t *testing.T) {
 	waitForColdCondition(t, s.Ready)
 	mirror := filepath.Join(mirrors, strings.TrimPrefix(url, "https://"))
 	assert.Equal(t, runInfoRefsGit(t, "-C", up, "rev-parse", "HEAD"), runInfoRefsGit(t, "-C", mirror, "rev-parse", "HEAD"))
+}
+
+func TestSnapshotStartupRestoreDuringOutage(t *testing.T) {
+	t.Run("retain connected seed", func(t *testing.T) { testSnapshotStartupRestore(t, false) })
+	t.Run("replace damaged seed", func(t *testing.T) { testSnapshotStartupRestore(t, true) })
+}
+
+func testSnapshotStartupRestore(t *testing.T, damaged bool) {
+	t.Helper()
+	root, mirrors := t.TempDir(), t.TempDir()
+	up := filepath.Join(root, "repo")
+	createTestMirrorRepo(t, up)
+	var failures atomic.Int32
+	var available atomic.Bool
+	url := startupOrigin(t, root, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !available.Load() {
+				failures.Add(1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}) + "/repo"
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	key := cache.NewKey(url + ".mirror-snapshot")
+	const marker = "restore-generation"
+	backup := filepath.Join(t.TempDir(), "backup")
+	runInfoRefsGit(t, "clone", "--mirror", up, backup)
+	assert.NoError(t, os.WriteFile(filepath.Join(backup, marker), []byte("seed"), 0o600))
+	if damaged {
+		assert.NoError(t, os.WriteFile(filepath.Join(backup, "refs", "heads", "broken"), []byte(strings.Repeat("1", 40)+"\n"), 0o600))
+	}
+	assert.NoError(t, snapshot.Create(ctx, c, key, backup, time.Hour, nil, 1))
+	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrors}, nil)
+	s, err := git.New(ctx, git.Config{SnapshotInterval: time.Hour, StartupSnapshotRepository: url},
+		newTestScheduler(ctx, t), c, newTestMux(), cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
+	assert.NoError(t, err)
+	s.SetMetadataStore(nil)
+	waitForColdCondition(t, func() bool { return failures.Load() > 0 })
+	assert.NoError(t, c.Delete(ctx, key))
+	waitForColdCondition(t, func() bool { return failures.Load() >= 2 })
+	assert.False(t, s.Ready())
+	available.Store(true)
+	waitForColdCondition(t, s.Ready)
+	data, err := os.ReadFile(filepath.Join(mirrors, strings.TrimPrefix(url, "https://"), marker))
+	if damaged {
+		assert.True(t, os.IsNotExist(err), "a corrupt seed must be replaced")
+		return
+	}
+	assert.NoError(t, err)
+	assert.Equal(t, "seed", string(data))
+}
+
+func TestSnapshotHeadLookupTimesOutAndReleasesFetchLock(t *testing.T) {
+	root, mirrors := t.TempDir(), t.TempDir()
+	up := filepath.Join(root, "repo")
+	createTestMirrorRepo(t, up)
+	url := startupOrigin(t, root, func(next http.Handler) http.Handler { return next }) + "/repo"
+	runInfoRefsGit(t, "clone", "--mirror", up, filepath.Join(mirrors, strings.TrimPrefix(url, "https://")))
+	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	cm, err := gitclone.NewManager(ctx, gitclone.Config{MirrorRoot: mirrors, LsRemoteTimeout: time.Second}, nil)
+	assert.NoError(t, err)
+	repo, err := cm.GetOrCreate(ctx, url)
+	assert.NoError(t, err)
+	bin := t.TempDir()
+	realGit, err := exec.LookPath("git")
+	assert.NoError(t, err)
+	t.Setenv("REAL_GIT", realGit)
+	t.Setenv("LOOKUP_MARKER", filepath.Join(bin, "entered"))
+	assert.NoError(t, os.WriteFile(filepath.Join(bin, "git"), []byte(`#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = ls-remote ] && [ ! -f "$LOOKUP_MARKER" ]; then
+    touch "$LOOKUP_MARKER"
+    sleep 10 & wait
+    exit 1
+  fi
+done
+exec "$REAL_GIT" "$@"
+`), 0o750))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	start := time.Now()
+	assert.Error(t, repo.FetchSnapshotHead(ctx))
+	assert.True(t, time.Since(start) < 5*time.Second)
+	assert.NoError(t, repo.FetchSnapshotHead(ctx))
 }
 
 func TestSnapshotStartupRequiresFetchAndSeparatesMirrorFreshness(t *testing.T) {
