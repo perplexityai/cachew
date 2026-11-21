@@ -15,6 +15,7 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
+	"github.com/alecthomas/hcl/v2"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/gitclone"
@@ -64,24 +65,50 @@ func TestSnapshotSchedulingWithLFSOptOut(t *testing.T) {
 	manager, err := gitclone.NewManager(ctx, gitclone.Config{MirrorRoot: t.TempDir()}, nil)
 	assert.NoError(t, err)
 	scheduler := &snapshotScheduleRecorder{jobs: make(chan string, 4)}
-	s := &Strategy{scheduler: scheduler, config: Config{
-		SnapshotInterval: time.Hour, DisableLFSSnapshotsFor: []string{"example.test/org/repo"},
-	}}
+	var cfg Config
+	assert.NoError(t, hcl.Unmarshal([]byte(`
+snapshot-interval = "1h"
+snapshot-filters = {"example.test/org/repo": "blob:none"}
+repository "example.test/org/repo" { disable-lfs-snapshot = true }
+repository "example.test/org/repo-fork" { snapshot-filter = "tree:0" }
+`), &cfg))
+	repos, err := cfg.repositoryIndex()
+	assert.NoError(t, err)
+	s := &Strategy{scheduler: scheduler, config: cfg, repositories: repos}
 	for _, tc := range []struct {
-		url  string
-		jobs []string
+		url    string
+		filter string
+		jobs   []string
 	}{
-		{"https://example.test/org/repo.git", []string{"snapshot-periodic", "mirror-snapshot-periodic"}},
-		{"https://example.test/org/repo-fork", []string{"snapshot-periodic", "lfs-snapshot-periodic", "mirror-snapshot-periodic"}},
+		{"https://example.test/org/repo.git", "blob:none", []string{"snapshot-periodic", "mirror-snapshot-periodic"}},
+		{"https://example.test/org/repo-fork", "tree:0", []string{"snapshot-periodic", "lfs-snapshot-periodic", "mirror-snapshot-periodic"}},
+		{"https://example.test/org/repo-extra", "", []string{"snapshot-periodic", "lfs-snapshot-periodic", "mirror-snapshot-periodic"}},
 	} {
 		repo, err := manager.GetOrCreate(ctx, tc.url)
 		assert.NoError(t, err)
+		assert.Equal(t, tc.filter, s.repositoryFor(tc.url).SnapshotFilter)
 		s.scheduleSnapshotJobs(repo)
 		var jobs []string
 		for range len(scheduler.jobs) {
 			jobs = append(jobs, <-scheduler.jobs)
 		}
 		assert.Equal(t, tc.jobs, jobs, tc.url)
+	}
+}
+
+func TestRepositoryConfigRejectsAmbiguousPolicies(t *testing.T) {
+	for name, body := range map[string]string{
+		"noncanonical": `repository "example.test/org/repo.git" {}`,
+		"wildcard":     `repository "example.test/org/*" {}`,
+		"duplicate":    `repository "example.test/org/repo" {} repository "example.test/org/repo" {}`,
+		"two filters":  `snapshot-filters = {"example.test/org/repo": "blob:none"} repository "example.test/org/repo" { snapshot-filter = "tree:0" }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var cfg Config
+			assert.NoError(t, hcl.Unmarshal([]byte(body), &cfg))
+			_, err := cfg.repositoryIndex()
+			assert.Error(t, err)
+		})
 	}
 }
 

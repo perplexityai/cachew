@@ -35,20 +35,28 @@ the process CPU budget); ordinary zstd archives remain readable, but a
 single-frame archive does not gain frame-level parallelism.
 
 ```hcl
-git {
+strategy git {
   snapshot-interval = "1h"
   repack-interval   = "1h"
+
+  repository "github.com/org/repo" {
+    snapshot-filter      = "blob:none"
+    disable-lfs-snapshot = true
+  }
 }
 ```
 
-If clients of a repository only need the checkout archive, set
-`disable-lfs-snapshots-for = ["github.com/org/repo"]` in `strategy git`.
-Use exact repository keys without a scheme or `.git` suffix. Cachew no longer
-fetches LFS objects for the separate archive or schedules its generation for
-those repositories. Their `lfs-snapshot.tar.zst` endpoint returns 404, even
-for a previously cached archive. Existing objects are left to the cache's
-retention policy; no shared data is deleted. Checkout snapshots, mirror
-backups, and unlisted repositories are unchanged.
+Repository blocks use an exact `host/path` key without a scheme or `.git`
+suffix. Both options are independent. `snapshot-filter` controls the checkout's
+partial-clone filter; the legacy `snapshot-filters` map still works. Set the
+filter in only one place for a given repository.
+
+`disable-lfs-snapshot` skips the periodic fetch and build of the separate Git
+LFS archive. Once Git warm-up is complete, GET and HEAD on that repository's
+`lfs-snapshot.tar.zst` return 404 even for a cached archive, without starting a
+mirror warm-up. Existing archives expire under normal retention. This option
+does not disable Git LFS itself, checkout snapshots, or mirror backups.
+Unlisted repositories keep their existing behavior.
 
 ### GitHub Releases
 

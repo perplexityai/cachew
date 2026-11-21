@@ -65,13 +65,14 @@ type Config struct {
 	BundleCacheTTL         time.Duration `hcl:"bundle-cache-ttl,optional" help:"TTL of cached server-side git bundles." default:"2h"`
 	MaxRequestBodyMB       int           `hcl:"max-request-body-mb,optional" help:"Maximum size in megabytes of git request bodies that are buffered in memory (upload-pack negotiation and ensure-refs). Pushes and other requests streamed to upstream are not limited. 0 disables the limit." default:"100"`
 
-	SnapshotFilters           map[string]string `hcl:"snapshot-filters,optional" help:"Per-repository git partial-clone filter applied to workstation snapshots, keyed by host/org/repo (e.g. {\"github.com/org/repo\": \"blob:none\"}). Filtered snapshots contain full history metadata but only the blobs needed for the HEAD checkout; clients lazily fetch historical blobs through cachew on demand."`
-	DisableLFSSnapshotsFor    []string          `hcl:"disable-lfs-snapshots-for,optional" help:"Repositories (host/org/repo) for which to skip generating and serving the separate Git LFS archive. Checkout and mirror snapshots are unaffected."`
-	StartupSnapshotRepository string            `hcl:"startup-snapshot-repository,optional" help:"Qualify cached checkout reads for one canonical HTTPS repository after fetching its upstream HEAD. Other Git routes stay unavailable until all mirrors are refreshed."`
+	SnapshotFilters           map[string]string  `hcl:"snapshot-filters,optional" help:"Legacy per-repository partial-clone filters, keyed by host/org/repo. Prefer snapshot-filter in a repository block for new configuration."`
+	Repositories              []RepositoryConfig `hcl:"repository,block" help:"Snapshot options for an exact repository. Other repositories keep the defaults."`
+	StartupSnapshotRepository string             `hcl:"startup-snapshot-repository,optional" help:"Qualify cached checkout reads for one canonical HTTPS repository after fetching its upstream HEAD. Other Git routes stay unavailable until all mirrors are refreshed."`
 }
 
 type Strategy struct {
 	config                Config
+	repositories          map[string]RepositoryConfig
 	cache                 cache.Cache
 	cloneManager          *gitclone.Manager
 	httpClient            *http.Client
@@ -111,11 +112,9 @@ func New(
 	tokenManagerProvider githubapp.TokenManagerProvider,
 	spools *spool.Registry,
 ) (*Strategy, error) {
-	for _, key := range config.DisableLFSSnapshotsFor {
-		path, err := gitclone.RepoPathFromURL("https://" + key)
-		if err != nil || filepath.ToSlash(path) != key || strings.Contains(key, "*") {
-			return nil, errors.New("disable-lfs-snapshots-for requires canonical repository keys in host/org/repo form")
-		}
+	repositories, err := config.repositoryIndex()
+	if err != nil {
+		return nil, err
 	}
 	if up := config.StartupSnapshotRepository; up != "" {
 		path, err := gitclone.RepoPathFromURL(up)
@@ -173,6 +172,7 @@ func New(
 
 	s := &Strategy{
 		config:         config,
+		repositories:   repositories,
 		cache:          cache,
 		cloneManager:   cloneManager,
 		httpClient:     cachewhttputil.UpstreamClient(),
