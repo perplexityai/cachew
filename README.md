@@ -1060,6 +1060,14 @@ Fills record a terminal outcome, rather than treating an origin 200 as successfu
 
 Use `cachew.cache.result` and `cachew.cache.source` to compare local/shared hits and misses, origin requests by status to measure dependency traffic, and fills/tier writes to find failed publication. An origin error percentage must use origin exchanges as its denominator; client response percentages include cache hits. Idle periods have no percentage.
 
+### Git startup readiness
+
+When a daemon reuses local Git mirrors, `/_readiness` waits for a successful
+upstream refresh of each discovered mirror. Failed mirrors retry with backoff;
+already refreshed mirrors do not repeat their startup fetch. With no local
+mirrors, normal on-demand initialization is unchanged. Snapshot publication
+is not part of this readiness check.
+
 ### Memory readiness
 
 Memory-cache readiness is local and shard-aware. Cachew keeps one private

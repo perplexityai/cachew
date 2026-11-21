@@ -579,18 +579,16 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 
 	// --- Set up cachew pointing at clonesDir ---
 	mux := http.NewServeMux()
-	gc := gitclone.NewManagerProvider(ctx, gitclone.Config{
+	gc := fixtureMirrorManager(ctx, t, gitclone.Config{
 		MirrorRoot:    clonesDir,
 		FetchInterval: 24 * time.Hour, // prevent auto-fetch during the test
-	}, nil)
+	})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, memCache.Close()) })
 	strategy, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc,
 		func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
-	// The warm-up goroutine uses context.WithoutCancel so it survives
-	// t.Context() cancellation. Wait for it before TempDir cleanup.
 	t.Cleanup(func() { waitForReady(t, strategy) })
 	waitForReady(t, strategy)
 

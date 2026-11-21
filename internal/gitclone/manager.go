@@ -264,6 +264,9 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 		headPath := filepath.Join(path, "HEAD")
 		if _, statErr := os.Stat(headPath); statErr != nil {
 			if errors.Is(statErr, os.ErrNotExist) {
+				if m.isStagingDirectory(path) {
+					return fs.SkipDir
+				}
 				return nil
 			}
 			return errors.Wrap(statErr, "stat HEAD file")
@@ -298,6 +301,16 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 	}
 
 	return discovered, nil
+}
+
+func (m *Manager) isStagingDirectory(path string) bool {
+	name := filepath.Base(path)
+	if suffix, ok := strings.CutPrefix(name, ".restore-"); ok && path != m.config.MirrorRoot {
+		_, err := strconv.ParseUint(suffix, 10, 32)
+		return err == nil
+	}
+	return filepath.Dir(path) == m.config.MirrorRoot && (strings.HasPrefix(name, ".snapshot-stream-") ||
+		name == ".snapshots" || name == ".snapshot-spools" || name == ".spools")
 }
 
 // RepoPathFromURL extracts a normalised "host/path" from an upstream Git URL,

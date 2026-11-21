@@ -76,7 +76,6 @@ func newInfoRefsFixtureWithConfig(t *testing.T, config git.Config) *infoRefsFixt
 	runInfoRefsGit(t, "-C", workPath, "commit", "-m", "initial")
 	runInfoRefsGit(t, "-C", workPath, "push", "origin", "HEAD:main")
 	runInfoRefsGit(t, "-C", upstreamPath, "symbolic-ref", "HEAD", "refs/heads/main")
-	runInfoRefsGit(t, "clone", "--mirror", upstreamPath, mirrorPath)
 
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
@@ -87,6 +86,11 @@ func newInfoRefsFixtureWithConfig(t *testing.T, config git.Config) *infoRefsFixt
 		func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 	waitForReady(t, strategy)
+	runInfoRefsGit(t, "clone", "--mirror", upstreamPath, mirrorPath)
+	cm, err := manager()
+	assert.NoError(t, err)
+	_, err = cm.GetOrCreate(ctx, "https://example.test/org/repo")
+	assert.NoError(t, err)
 	runInfoRefsGit(t, "-C", mirrorPath, "config", "remote.origin.url", upstreamPath)
 
 	transport := &infoRefsTransport{}
