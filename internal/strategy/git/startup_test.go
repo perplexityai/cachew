@@ -37,8 +37,12 @@ func TestStartupRetriesOnlyMirrorsThatFailed(t *testing.T) {
 	root, mirrors := t.TempDir(), t.TempDir()
 	var allow atomic.Bool
 	var failures, healthy atomic.Int32
+	var stagingRequests atomic.Int32
 	origin := startupOrigin(t, root, func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, ".restore-") {
+				stagingRequests.Add(1)
+			}
 			if strings.HasPrefix(r.URL.Path, "/a/") && !allow.Load() {
 				failures.Add(1)
 				w.WriteHeader(http.StatusServiceUnavailable)
@@ -60,6 +64,7 @@ func TestStartupRetriesOnlyMirrorsThatFailed(t *testing.T) {
 		runInfoRefsGit(t, "clone", "--mirror", up, filepath.Join(mirrors, host, name))
 		runInfoRefsGit(t, "-C", up, "commit", "--allow-empty", "-m", "advance")
 	}
+	runInfoRefsGit(t, "clone", "--mirror", filepath.Join(root, "a"), filepath.Join(mirrors, host, ".restore-123", "repo"))
 	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
 	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrors}, nil)
 	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), nil, newTestMux(), cm,
@@ -70,6 +75,7 @@ func TestStartupRetriesOnlyMirrorsThatFailed(t *testing.T) {
 	before := healthy.Load()
 	allow.Store(true)
 	waitForReady(t, s)
+	assert.Equal(t, int32(0), stagingRequests.Load())
 	assert.Equal(t, before, healthy.Load())
 	for _, name := range []string{"a", "b"} {
 		assert.Equal(t, runInfoRefsGit(t, "-C", filepath.Join(root, name), "rev-parse", "HEAD"),
