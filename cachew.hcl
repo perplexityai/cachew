@@ -73,8 +73,8 @@ strategy git {
   snapshot-interval = "1h"
   repack-interval = "1h"
   # Serve partial-clone snapshots for repos whose history dwarfs their checkout.
-  #snapshot-filters = {
-  #  "github.com/org/repo": "blob:none",
+  #repository "github.com/org/repo" {
+  #  snapshot-filter = "blob:none"
   #}
 }
 

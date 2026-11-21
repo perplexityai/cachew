@@ -180,19 +180,6 @@ func (s *Strategy) cloneForSnapshot(ctx context.Context, repo *gitclone.Reposito
 	return nil
 }
 
-// snapshotFilterFor reports the partial-clone filter configured for the repo,
-// or empty when the snapshot should be a full clone.
-func (s *Strategy) snapshotFilterFor(upstreamURL string) string {
-	if len(s.config.SnapshotFilters) == 0 {
-		return ""
-	}
-	repoPath, err := gitclone.RepoPathFromURL(upstreamURL)
-	if err != nil {
-		return ""
-	}
-	return s.config.SnapshotFilters[repoPath]
-}
-
 func (s *Strategy) withSnapshotClone(ctx context.Context, repo *gitclone.Repository, suffix, filter string, fn func(workDir string) error) error {
 	logger := logging.FromContext(ctx)
 	mirrorRoot := s.cloneManager.Config().MirrorRoot
@@ -259,7 +246,7 @@ func (s *Strategy) generateAndUploadSnapshot(ctx context.Context, repo *gitclone
 	logger := logging.FromContext(ctx)
 	start := time.Now()
 
-	filter := s.snapshotFilterFor(upstream)
+	filter := s.repositoryFor(upstream).SnapshotFilter
 	if filter != "" {
 		span.SetAttributes(attribute.String("cachew.snapshot.filter", filter))
 	}
@@ -434,9 +421,11 @@ func (s *Strategy) scheduleSnapshotJobsAfter(repo *gitclone.Repository, baseDela
 		}
 		return s.generateAndUploadSnapshot(ctx, repo)
 	})
-	submit(snapshotJobLFS, s.config.SnapshotInterval, func(ctx context.Context) (string, error) {
-		return s.generateAndUploadLFSSnapshot(ctx, repo)
-	})
+	if !s.repositoryFor(upstream).DisableLFSSnapshot {
+		submit(snapshotJobLFS, s.config.SnapshotInterval, func(ctx context.Context) (string, error) {
+			return s.generateAndUploadLFSSnapshot(ctx, repo)
+		})
+	}
 	mirrorInterval := s.config.MirrorSnapshotInterval
 	if mirrorInterval == 0 {
 		mirrorInterval = s.config.SnapshotInterval
@@ -1164,7 +1153,7 @@ func (s *Strategy) streamSnapshotDirect(w http.ResponseWriter, r *http.Request, 
 	defer func() { _ = os.RemoveAll(snapshotDir) }()
 
 	repoDir := filepath.Join(snapshotDir, "repo")
-	if err := s.cloneForSnapshot(ctx, repo, repoDir, s.snapshotFilterFor(repo.UpstreamURL())); err != nil {
+	if err := s.cloneForSnapshot(ctx, repo, repoDir, s.repositoryFor(repo.UpstreamURL()).SnapshotFilter); err != nil {
 		return errors.Wrap(err, "clone for snapshot streaming")
 	}
 
@@ -1200,7 +1189,7 @@ func (s *Strategy) fillSnapshot(ctx context.Context, sw *spool.Writer, repo *git
 		}
 	}()
 	repoDir := filepath.Join(snapshotDir, "repo")
-	if err := s.cloneForSnapshot(ctx, repo, repoDir, s.snapshotFilterFor(upstreamURL)); err != nil {
+	if err := s.cloneForSnapshot(ctx, repo, repoDir, s.repositoryFor(upstreamURL).SnapshotFilter); err != nil {
 		s.failSnapshotFill(ctx, sw, repoName, start, errors.Wrap(err, "clone for snapshot"))
 		return nil
 	}
@@ -1654,6 +1643,10 @@ func (s *Strategy) handleLFSSnapshotRequest(w http.ResponseWriter, r *http.Reque
 
 	repoPath := ExtractRepoPath(strings.TrimSuffix(pathValue, "/lfs-snapshot.tar.zst"))
 	upstreamURL := "https://" + host + "/" + repoPath
+	if s.repositoryFor(upstreamURL).DisableLFSSnapshot {
+		http.Error(w, "LFS snapshot disabled for this repository", http.StatusNotFound)
+		return
+	}
 	cacheKey := lfsSnapshotCacheKey(upstreamURL)
 
 	// Try cache first so we can serve even when the mirror isn't ready (cold

@@ -376,7 +376,8 @@ func TestSnapshotGenerationWithFilter(t *testing.T) {
 	mux := newTestMux()
 
 	cm := fixtureMirrorManager(ctx, t, gitclone.Config{MirrorRoot: mirrorRoot})
-	s, err := git.New(ctx, git.Config{SnapshotFilters: map[string]string{"github.com/org/repo": "blob:none"}}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
+	cfg := git.Config{Repositories: []git.RepositoryConfig{{Name: "github.com/org/repo", SnapshotFilter: "blob:none", DisableLFSSnapshot: true}}}
+	s, err := git.New(ctx, cfg, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
 	assert.NoError(t, err)
 
 	manager, err := cm()
@@ -1404,6 +1405,37 @@ func TestLFSSnapshotGetHonorsRangeAndIfMatch(t *testing.T) {
 
 	notModified := get(map[string]string{"If-None-Match": etag})
 	assert.Equal(t, http.StatusNotModified, notModified.Code)
+}
+
+func TestDisabledLFSSnapshotSkipsExistingArchiveAndColdWarmup(t *testing.T) {
+	_, ctx := logging.Configure(t.Context(), logging.Config{})
+	mem, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	const key = "github.com/org/repo"
+	w, err := mem.Create(ctx, cache.NewKey("https://"+key+".lfs-snapshot"), http.Header{}, time.Hour)
+	assert.NoError(t, err)
+	_, err = w.Write([]byte("old archive"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+
+	mux := http.NewServeMux()
+	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: t.TempDir()}, nil)
+	manager, err := cm()
+	assert.NoError(t, err)
+	cfg := git.Config{Repositories: []git.RepositoryConfig{
+		{Name: key, DisableLFSSnapshot: true}, {Name: "github.com/org/cold", DisableLFSSnapshot: true},
+	}}
+	_, err = git.New(ctx, cfg, newTestScheduler(ctx, t), mem, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, newTestSpools(t)) //nolint:nilnil
+	assert.NoError(t, err)
+	for _, repo := range []string{"repo.git", "cold"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			req := httptest.NewRequestWithContext(ctx, method, "/git/github.com/org/"+repo+"/lfs-snapshot.tar.zst", nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusNotFound, rec.Code, method, repo)
+		}
+	}
+	assert.Zero(t, manager.Get("https://github.com/org/cold"))
 }
 
 // createUpstreamAndMirror creates a working upstream repo with one commit and
