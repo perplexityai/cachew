@@ -58,6 +58,7 @@ func Register(r *strategy.Registry, scheduler jobscheduler.Provider, cloneManage
 
 type Config struct {
 	SnapshotInterval       time.Duration `hcl:"snapshot-interval,optional" help:"How often to generate tar.zstd workstation snapshots. 0 disables snapshots." default:"0"`
+	SnapshotStartupSpread  time.Duration `hcl:"snapshot-startup-spread,optional" help:"Upper bound of the random delay before each coordinated replica's first snapshot run, so replicas deployed together do not claim within one metadata sync window. 0 runs immediately." default:"5m"`
 	SnapshotMaxAge         time.Duration `hcl:"snapshot-max-age,optional" help:"How long an unchanged snapshot (same HEAD commit) may be served before regeneration. Requires shared metadata; keep well below the cache max-ttl. 0 regenerates every interval." default:"24h"`
 	MirrorSnapshotInterval time.Duration `hcl:"mirror-snapshot-interval,optional" help:"How often to generate mirror snapshots for pod bootstrap. 0 uses snapshot-interval. Defaults to 2h." default:"2h"`
 	RepackInterval         time.Duration `hcl:"repack-interval,optional" help:"How often to run full repack. 0 disables." default:"0"`

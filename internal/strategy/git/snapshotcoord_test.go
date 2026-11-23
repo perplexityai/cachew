@@ -496,10 +496,11 @@ func TestJitterInterval(t *testing.T) {
 }
 
 func TestStartupSpreadDelay(t *testing.T) {
+	assert.Equal(t, time.Duration(0), startupSpreadDelay(0))
 	for range 100 {
-		d := startupSpreadDelay()
+		d := startupSpreadDelay(5 * time.Minute)
 		assert.True(t, d >= 0)
-		assert.True(t, d < snapshotStartupSpread)
+		assert.True(t, d < 5*time.Minute)
 	}
 }
 
@@ -509,11 +510,11 @@ func TestSnapshotSchedule(t *testing.T) {
 	assert.Equal(t, time.Duration(0), delay)
 	assert.Equal(t, time.Hour, interval)
 
-	coordinated := &Strategy{}
+	coordinated := &Strategy{config: Config{SnapshotStartupSpread: 5 * time.Minute}}
 	coordinated.snapshotCoord.Store(newTestSnapshotCoordinators(t, time.Now, 1)[0])
 	for range 100 {
 		delay, interval = coordinated.snapshotSchedule(time.Hour)
-		assert.True(t, delay >= 0 && delay < snapshotStartupSpread)
+		assert.True(t, delay >= 0 && delay < 5*time.Minute)
 		assert.True(t, interval >= time.Hour && interval < time.Hour+time.Hour/8)
 	}
 }
