@@ -381,12 +381,6 @@ func (s *Strategy) snapshotUnchanged(ctx context.Context, job string, key cache.
 	return err == nil
 }
 
-// snapshotStartupSpread staggers each replica's first coordinated snapshot
-// run after registration. Periodic jobs run immediately when this pod has no
-// recorded last run, so on a deploy every replica would otherwise decide
-// within the same metadata sync window, before peers' claims propagate.
-const snapshotStartupSpread = 5 * time.Minute
-
 func (s *Strategy) scheduleSnapshotJobs(repo *gitclone.Repository) {
 	if _, preparing := s.mirrorPreparations.Load(repo.UpstreamURL()); preparing {
 		return
@@ -435,8 +429,15 @@ func (s *Strategy) scheduleSnapshotJobsAfter(repo *gitclone.Repository, baseDela
 	})
 }
 
-func startupSpreadDelay() time.Duration {
-	return rand.N(snapshotStartupSpread) //nolint:gosec // scheduling jitter needs no cryptographic randomness
+// startupSpreadDelay staggers each replica's first coordinated snapshot run
+// after registration. Periodic jobs run immediately when this pod has no
+// recorded last run, so on a deploy every replica would otherwise decide
+// within the same metadata sync window, before peers' claims propagate.
+func startupSpreadDelay(spread time.Duration) time.Duration {
+	if spread <= 0 {
+		return 0
+	}
+	return rand.N(spread) //nolint:gosec // scheduling jitter needs no cryptographic randomness
 }
 
 // Spread and jitter only help when replicas coordinate through shared
@@ -446,7 +447,7 @@ func (s *Strategy) snapshotSchedule(interval time.Duration) (delay, jittered tim
 	if s.snapshotCoord.Load() == nil {
 		return 0, interval
 	}
-	return startupSpreadDelay(), jitterInterval(interval)
+	return startupSpreadDelay(s.config.SnapshotStartupSpread), jitterInterval(interval)
 }
 
 // coordinatedSnapshotJob wraps a snapshot generation job with cross-replica
