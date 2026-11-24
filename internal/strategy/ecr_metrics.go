@@ -48,6 +48,8 @@ const (
 const (
 	ecrKindManifest = "manifest"
 	ecrKindBlob     = "blob"
+	// ecrKindTag labels manifest reads by tag, which are never cached.
+	ecrKindTag = "tag"
 	// ecrKindUnknown labels requests refused before the path names a manifest
 	// or blob.
 	ecrKindUnknown = "unknown"
@@ -56,7 +58,7 @@ const (
 // ecrRequestOutcome is what one client request recorded. Every attribute is
 // from a fixed set; repository names and digests are never labels.
 type ecrRequestOutcome struct {
-	kind   string // manifest, blob or unknown
+	kind   string // manifest, blob, tag or unknown
 	method string
 	result ecrResult
 	reason ecrFailureReason // set when result is failure
