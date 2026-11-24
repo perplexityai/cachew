@@ -54,6 +54,8 @@ type fakeECR struct {
 	tooMany       bool   // answer blob reads 429
 	redirectManif bool   // redirect manifest reads to S3, where the bytes are served
 	partial       bool   // answer manifest reads 206
+	manifestType  string // overrides the manifest Content-Type
+	manifestHead  string // a Docker-Content-Digest to send on manifest GETs, which ECR omits
 	denyBody      string
 
 	mu             sync.Mutex
@@ -106,6 +108,12 @@ func (f *fakeECR) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(r.URL.Path, "/manifests/"):
 		// ECR omits Docker-Content-Digest on manifest GETs.
 		w.Header().Set("Content-Type", testOCIManifest)
+		if f.manifestType != "" {
+			w.Header().Set("Content-Type", f.manifestType)
+		}
+		if f.manifestHead != "" {
+			w.Header().Set("Docker-Content-Digest", f.manifestHead)
+		}
 		// An upstream must not choose how long Cachew keeps an entry.
 		w.Header().Set("X-Cachew-Expires-At", "2999-01-01T00:00:00Z")
 		switch {
@@ -230,6 +238,11 @@ func setupECRTest(t *testing.T, configure func(*fakeECR)) *ecrTest {
 
 func setupECRTestWith(t *testing.T, configure func(*fakeECR), override cache.Cache, repositories []string) *ecrTest {
 	t.Helper()
+	return setupECRTestConfig(t, configure, override, ECRConfig{Repositories: repositories})
+}
+
+func setupECRTestConfig(t *testing.T, configure func(*fakeECR), override cache.Cache, base ECRConfig) *ecrTest {
+	t.Helper()
 	fake := &fakeECR{manifest: []byte(`{"schemaVersion":2}`), blob: []byte("chart-tarball-bytes"), acceptedToken: "tok-1"}
 	configure(fake)
 	fake.server = httptest.NewServer(fake)
@@ -246,11 +259,9 @@ func setupECRTestWith(t *testing.T, configure func(*fakeECR), override cache.Cac
 
 	tokens := &fakeTokens{}
 	mux := http.NewServeMux()
-	config := ecrConfigWithDefaults(ECRConfig{
-		Registry:     testECRRegistry,
-		RoleARN:      "arn:aws:iam::123456789012:role/cachew-ecr-read",
-		Repositories: repositories,
-	})
+	base.Registry = testECRRegistry
+	base.RoleARN = "arn:aws:iam::123456789012:role/cachew-ecr-read"
+	config := ecrConfigWithDefaults(base)
 	s, err := newECR(config, tokens, pinTransport{backend: fake.server}, c, mux, newInternalTestSpools(t))
 	assert.NoError(t, err)
 	assert.Equal(t, "ecr:"+testECRRegistry, s.String())
@@ -535,6 +546,74 @@ func TestECRServesOnlyDigestPaths(t *testing.T) {
 	assert.Equal(t, 0, len(e.tokens.rejected))
 }
 
+func setupECRTagTest(t *testing.T, configure func(*fakeECR)) *ecrTest {
+	t.Helper()
+	return setupECRTestConfig(t, configure, nil, ECRConfig{
+		Repositories:    []string{"ecr-public/buildkite/", "docker-hub/library/alpine"},
+		TagRepositories: []string{testECRName},
+	})
+}
+
+func TestECRResolvesTagsAtECROnEveryRequest(t *testing.T) {
+	e := setupECRTagTest(t, func(*fakeECR) {})
+	path := "/v2/" + testECRName + "/manifests/0123456789abcdef"
+
+	w := e.do(http.MethodGet, path)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, e.fake.manifest, w.Body.Bytes())
+	assert.Equal(t, testOCIManifest, w.Header().Get("Content-Type"))
+	assert.Equal(t, testDigest(e.fake.manifest), w.Header().Get("Docker-Content-Digest"), "computed from the bytes, as ECR omits it on GET")
+	assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
+	assert.Equal(t, "Basic tok-1", e.fake.lastRegistry.Get("Authorization"))
+	assert.Contains(t, e.fake.lastRegistry.Get("Accept"), testOCIManifest)
+	assert.Equal(t, "/v2/"+testECRName+"/manifests/0123456789abcdef", e.fake.lastRegistryAt)
+
+	// The tag moves upstream: the next read must see it, not a cached copy.
+	e.fake.mu.Lock()
+	e.fake.manifest = []byte(`{"schemaVersion":2,"moved":true}`)
+	e.fake.mu.Unlock()
+	w = e.do(http.MethodHead, "/"+testECRRegistry+path)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 0, w.Body.Len())
+	assert.Equal(t, testDigest(e.fake.manifest), w.Header().Get("Docker-Content-Digest"))
+	assert.Equal(t, strconv.Itoa(len(e.fake.manifest)), w.Header().Get("Content-Length"))
+	assert.Equal(t, http.MethodGet, e.fake.lastMethod, "a HEAD still GETs so a pull-through repository imports the tag")
+	registry, _ := e.fake.counts()
+	assert.Equal(t, 2, registry)
+	assert.Equal(t, ecrKindTag, e.metrics.requests[1].kind)
+}
+
+func TestECRServesTagsOnlyForTagRepositories(t *testing.T) {
+	e := setupECRTagTest(t, func(*fakeECR) {})
+	for _, path := range []string{
+		"/v2/ecr-public/buildkite/other/manifests/latest",
+		"/v2/docker-hub/library/alpine/manifests/latest",
+		"/v2/" + testECRName + "/manifests/.hidden",
+		"/v2/" + testECRName + "/tags/list",
+	} {
+		w := e.do(http.MethodGet, path)
+		assert.Equal(t, http.StatusNotFound, w.Code, path)
+	}
+	registry, _ := e.fake.counts()
+	assert.Equal(t, 0, registry)
+}
+
+func TestECRRefusesTagManifestsItCannotVouchFor(t *testing.T) {
+	for name, configure := range map[string]func(*fakeECR){
+		"reported digest differs": func(f *fakeECR) { f.manifestHead = testDigest([]byte("other")) },
+		"not a manifest type":     func(f *fakeECR) { f.manifestType = "text/html" },
+		"no length":               func(f *fakeECR) { f.chunked = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setupECRTagTest(t, configure)
+			w := e.do(http.MethodGet, "/v2/"+testECRName+"/manifests/latest")
+			assert.Equal(t, http.StatusBadGateway, w.Code)
+			assert.NotContains(t, w.Body.String(), "schemaVersion")
+			assert.Equal(t, ecrResultFailure, e.metrics.requests[0].result)
+		})
+	}
+}
+
 func TestECRManifestDigestMismatchIsNeitherCachedNorDelivered(t *testing.T) {
 	e := setupECRTest(t, func(*fakeECR) {})
 	wrong := testDigest([]byte("what-the-caller-asked-for"))
@@ -758,6 +837,7 @@ func TestECRRejectsBadConfig(t *testing.T) {
 		{Registry: testECRRegistry},
 		{Registry: testECRRegistry, RoleARN: role, Repositories: []string{"/"}},
 		{Registry: testECRRegistry, RoleARN: role, Repositories: []string{"Upper/"}},
+		{Registry: testECRRegistry, RoleARN: role, TagRepositories: []string{"ghcr/Org/"}},
 		{Registry: testECRRegistry, RoleARN: role, ManifestTTL: -time.Hour},
 	} {
 		_, err := validateECRConfig(config)

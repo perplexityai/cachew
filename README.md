@@ -80,10 +80,11 @@ Read-only proxy for one Amazon ECR registry, including its pull-through cache re
 
 **What is served**
 
-- `GET` and `HEAD` for `/v2/{name}/manifests/sha256:{digest}` and `/v2/{name}/blobs/sha256:{digest}`, at the host root and under `/{registry}/v2/`. Digests only: tags are mutable and resolve at ECR. `GET /v2/` answers the version check locally.
+- `GET` and `HEAD` for `/v2/{name}/manifests/sha256:{digest}` and `/v2/{name}/blobs/sha256:{digest}`, at the host root and under `/{registry}/v2/`. Tags are served only for `tag-repositories`. `GET /v2/` answers the version check locally.
 - **Manifests** are fetched from ECR, verified against their digest while they stream, and cached for `manifest-ttl` (default three days). The lifetime is pinned through every cache tier even though manifests never change: cache hits never reach ECR, so its `lastRecordedPullTime` goes stale and `sinceImagePulled` lifecycle rules could expire images still in use. A mismatch is neither cached nor delivered complete, and a response without `Content-Length`, or a 2xx other than 200, is refused. `Docker-Content-Digest` is set on every successful manifest response; ECR omits it on `GET`s.
 - **Blobs** go to S3 directly. A `GET` answers with ECR's `307` to a presigned S3 URL, with `Cache-Control: no-store`; a `HEAD` answers with ECR's `Content-Length` and `Docker-Content-Digest`. Blob bytes never pass through Cachew's cache. ECR answers a few tiny blobs, such as the 32-byte empty gzip layer, with their bytes instead of a redirect; Cachew serves those up to 4 KiB after checking them against the digest, and refuses larger inline answers. Larger layers always come from S3, so `Range` and resumed downloads work against S3 and large layers do not load the proxy.
 - `repositories` optionally narrows the repositories clients may read (an entry ending in `/` is a prefix); by default, everything the role can read is served.
+- **Tag manifests** (`/v2/{name}/manifests/{tag}`) are served only for repositories in `tag-repositories`, which uses the same entry forms and serves no tags when empty. Tags are mutable and ECR already re-syncs pull-through tags with their upstream, so every tag read, `HEAD` included, is a `GET` to ECR and is never cached: Cachew adds no staleness of its own. The manifest is read whole (up to 4 MiB), must be one of the manifest types Cachew requests, and must match ECR's `Content-Length` and any `Docker-Content-Digest`; it is answered with its computed `Docker-Content-Digest` and `Cache-Control: no-store`, so the client's following digest reads are cached as usual.
 - A pull-through repository is created by its first manifest pull, so a blob read for a repository nobody has pulled yet returns `404`. A `404` is passed through so mirror clients fall back, and a `429` so they back off.
 
 **How it authenticates**
@@ -97,11 +98,11 @@ Read-only proxy for one Amazon ECR registry, including its pull-through cache re
 - Network access to S3 in the registry's region, and to drop `Authorization` when following the redirect to another host (S3 rejects a presigned URL that also carries it). Helm, go-containerregistry and containerd already do, because ECR itself redirects.
 - ECR and S3 to be reachable for blob pulls: a cache hit does not cover an outage. Every blob `GET` calls ECR, so watch the account's ECR request-rate quotas under large fan-outs.
 - The registry at the host root (`go-containerregistry`, Helm, Docker) or under `/{registry}/v2/` (containerd `override_path`). Only one `ecr` block can own the root; set `prefix-only` on the others.
-- Helm needs a release that pulls `oci://<host>/<repo>@sha256:<digest>` without listing tags. Digest pulls arrived in 3.17, and 3.19 is tested; 3.16 calls `tags/list` first and fails on the proxy's `404`, since tags are not served.
+- Helm needs a release that pulls `oci://<host>/<repo>@sha256:<digest>` without listing tags. Digest pulls arrived in 3.17, and 3.19 is tested; 3.16 calls `tags/list` first and fails on the proxy's `404`, since tag lists are not served.
 
 **Metrics**
 
-- `cachew.ecr.requests_total` counts requests by `kind` (`manifest`, `blob`, or `unknown` for a path that names neither), `method` and `result`: `hit` or `miss` for manifests, `redirect` or `inline` for blob `GET`s, `metadata` for blob `HEAD`s, `not_found`, `rate_limited`, `not_served` for paths and repositories the proxy refuses, or `failure`. The version check is not counted.
+- `cachew.ecr.requests_total` counts requests by `kind` (`manifest`, `blob`, `tag`, or `unknown` for a path that names none of them), `method` and `result`: `hit` or `miss` for manifests (always `miss` for tags), `redirect` or `inline` for blob `GET`s, `metadata` for blob `HEAD`s, `not_found`, `rate_limited`, `not_served` for paths and repositories the proxy refuses, or `failure`. The version check is not counted.
 - `cachew.ecr.failures_total` counts each failure by `kind` and `reason`: `digest_mismatch`, `no_length`, `partial`, `rejected` (ECR refused the proxy's token), `authorization` (no token could be minted or refreshed), `bad_redirect`, `upstream_status` (any other ECR error status), `internal` (a cache or request error), `client_canceled` (the client left first), or, when the connection to ECR or S3 failed, the same `transport_timeout`, `transport_dns`, `transport_connection` and `transport_error` statuses the CodeArtifact metrics use. A manifest whose bytes fail verification is a failure even though its `200` was already sent.
 - `cachew.ecr.auth_events_total` counts token `reuse`, `refresh`, `forced_refresh` (after a rejection) and `failure` events.
 
@@ -112,8 +113,9 @@ Cache hits are not re-hashed, so keep remote `/api/v1/object` writes denied for 
 ```hcl
 ecr "123456789012.dkr.ecr.us-east-1.amazonaws.com" {
   role-arn     = "arn:aws:iam::123456789012:role/cachew-ecr-read"
-  repositories = ["ecr-public/buildkite/"] # optional
-  manifest-ttl = "72h"
+  repositories     = ["ecr-public/buildkite/"] # optional
+  tag-repositories = ["ecr-public/buildkite/agent"] # optional
+  manifest-ttl     = "72h"
 }
 ```
 

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -46,13 +47,8 @@ const (
 
 	ecrManifests = "manifests"
 	ecrBlobs     = "blobs"
-
-	// Every manifest type a digest can name, so ECR returns the stored bytes
-	// rather than negotiating a conversion that would not match the digest.
-	ecrManifestAccept = "application/vnd.oci.image.index.v1+json, " +
-		"application/vnd.oci.image.manifest.v1+json, " +
-		"application/vnd.docker.distribution.manifest.list.v2+json, " +
-		"application/vnd.docker.distribution.manifest.v2+json"
+	// ecrRef.kind for a manifest named by tag; the upstream path uses manifests.
+	ecrTagManifests = "tag-manifests"
 
 	emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -68,11 +64,15 @@ const (
 	// memory and served; larger inline answers are still refused so layers
 	// never stream through the proxy.
 	ecrInlineBlobLimit = 4096
+
+	// The distribution spec's recommended manifest size limit. A tag manifest is
+	// read whole so its digest is known before any byte is sent.
+	ecrTagManifestLimit = 4 << 20
 )
 
 // RegisterECR adds the ecr strategy to the registry.
 func RegisterECR(r *Registry, spools spool.Provider) {
-	Register(r, "ecr", "Read-only, digest-addressed proxy for an Amazon ECR registry, including its pull-through cache repositories.",
+	Register(r, "ecr", "Read-only proxy for an Amazon ECR registry, including its pull-through cache repositories. Serves digests, and tags only for listed repositories.",
 		func(ctx context.Context, config ECRConfig, c cache.Cache, mux Mux) (*ECR, error) {
 			registry, err := spools()
 			if err != nil {
@@ -88,14 +88,17 @@ func RegisterECR(r *Registry, spools spool.Provider) {
 //	  role-arn = "arn:aws:iam::123456789012:role/cachew-ecr-read"
 //	}
 //
-// mounts the registry at /v2/ and under /<registry>/v2/. Only manifests and
-// blobs addressed by sha256 digest are served; tags are mutable and ECR already
-// re-syncs them with pull-through upstreams, so clients resolve tags at ECR.
-// One ecr block can own /v2/; the others set prefix-only.
+// mounts the registry at /v2/ and under /<registry>/v2/. Manifests and blobs
+// addressed by sha256 digest are served and manifests cached. Tags are mutable,
+// and ECR already re-syncs them with pull-through upstreams, so a tag manifest
+// is resolved at ECR on every request and never cached: Cachew adds no
+// staleness of its own. Tags are served only for tag-repositories. One ecr
+// block can own /v2/; the others set prefix-only.
 type ECRConfig struct {
 	Registry            string        `hcl:"registry,label" help:"The ECR registry host, <account>.dkr.ecr.<region>.amazonaws.com."`
 	RoleARN             string        `hcl:"role-arn" help:"The read-only IAM role to assume for ECR pulls."`
 	Repositories        []string      `hcl:"repositories,optional" help:"Repository names clients may read, as defense in depth on top of the role's IAM scope: an entry ending in / is a prefix, any other entry is one repository. Empty serves every repository the role can read."`
+	TagRepositories     []string      `hcl:"tag-repositories,optional" help:"Repositories whose manifests may also be read by tag, in the form of repositories. Tag reads are resolved at ECR on every request and never cached. Empty serves digests only."`
 	ManifestTTL         time.Duration `hcl:"manifest-ttl,optional" default:"72h" help:"How long a cached manifest is served. Keep it to days: cache hits never reach ECR, so lastRecordedPullTime goes stale and sinceImagePulled lifecycle rules could expire images still in use. Zero uses the default."`
 	CredentialTimeout   time.Duration `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for ECR credential refresh, including a concurrent refresh. Zero uses the default."`
 	OriginHeaderTimeout time.Duration `hcl:"origin-header-timeout,optional" default:"60s" help:"Maximum time to wait for ECR response headers. A first pull through a pull-through rule imports the image before answering. Zero uses the default."`
@@ -110,16 +113,17 @@ type ECRConfig struct {
 // layers never stream through the proxy. The few tiny blobs ECR answers inline
 // are verified and served from memory.
 type ECR struct {
-	registry     string
-	repositories []string
-	manifestTTL  time.Duration
-	tokens       originTokenSource
-	client       *http.Client // manifests: follows redirects over https
-	blobClient   *http.Client // blobs: returns ECR's redirect unfollowed
-	cache        cache.Cache
-	handler      *handler.Handler
-	metric       ecrMetricRecorder
-	now          func() time.Time
+	registry        string
+	repositories    []string
+	tagRepositories []string
+	manifestTTL     time.Duration
+	tokens          originTokenSource
+	client          *http.Client // manifests: follows redirects over https
+	blobClient      *http.Client // blobs: returns ECR's redirect unfollowed
+	cache           cache.Cache
+	handler         *handler.Handler
+	metric          ecrMetricRecorder
+	now             func() time.Time
 	// lastForcedRefresh is the UnixNano time of the last refresh a rejection
 	// triggered; see ecrForcedRefreshInterval.
 	lastForcedRefresh atomic.Int64
@@ -127,10 +131,24 @@ type ECR struct {
 
 var _ Strategy = (*ECR)(nil)
 
+// ecrManifestTypes is every manifest type a digest can name, sent as Accept so
+// ECR returns the stored bytes rather than negotiating a conversion that would
+// not match the digest. They are also the only types a tag manifest is served as.
+var (
+	ecrManifestTypes = []string{
+		"application/vnd.oci.image.index.v1+json",
+		"application/vnd.oci.image.manifest.v1+json",
+		"application/vnd.docker.distribution.manifest.list.v2+json",
+		"application/vnd.docker.distribution.manifest.v2+json",
+	}
+	ecrManifestAccept = strings.Join(ecrManifestTypes, ", ")
+)
+
 var (
 	// Repository names follow the OCI distribution grammar: lowercase
 	// alphanumerics joined by one period, one or two underscores, or dashes.
 	ecrPath           = regexp.MustCompile(`^([a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*)/(manifests|blobs)/(sha256:[0-9a-f]{64})$`)
+	ecrTagPath        = regexp.MustCompile(`^([a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*)/manifests/([a-zA-Z0-9_][a-zA-Z0-9._-]{0,127})$`) // the spec's tag grammar, which has no colon
 	ecrRegistryHost   = regexp.MustCompile(`^[0-9]{12}\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com$`)
 	ecrRepositoryName = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`)
 	errECRNotDigest   = errors.New("not a manifest or blob digest path")
@@ -202,6 +220,11 @@ func validateECRConfig(config ECRConfig) (string, error) {
 			return "", errors.Errorf("ecr %s: repositories entry %q is not a repository name or a prefix ending in /", config.Registry, repository)
 		}
 	}
+	for _, repository := range config.TagRepositories {
+		if !ecrRepositoryName.MatchString(strings.TrimSuffix(repository, "/")) {
+			return "", errors.Errorf("ecr %s: tag-repositories entry %q is not a repository name or a prefix ending in /", config.Registry, repository)
+		}
+	}
 	if config.ManifestTTL < 0 || config.CredentialTimeout < 0 || config.OriginHeaderTimeout < 0 {
 		return "", errors.Errorf("ecr %s: manifest-ttl, credential-timeout and origin-header-timeout must not be negative", config.Registry)
 	}
@@ -245,11 +268,12 @@ func newECR(config ECRConfig, tokens originTokenSource, base http.RoundTripper, 
 	}
 	transport := ecrTransport{base: base}
 	s := &ECR{
-		registry:     config.Registry,
-		repositories: config.Repositories,
-		manifestTTL:  config.ManifestTTL,
-		tokens:       tokens,
-		client:       &http.Client{Transport: transport, CheckRedirect: checkHTTPSRedirect},
+		registry:        config.Registry,
+		repositories:    config.Repositories,
+		tagRepositories: config.TagRepositories,
+		manifestTTL:     config.ManifestTTL,
+		tokens:          tokens,
+		client:          &http.Client{Transport: transport, CheckRedirect: checkHTTPSRedirect},
 		blobClient: &http.Client{
 			Transport:     transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -293,6 +317,11 @@ func newECR(config ECRConfig, tokens originTokenSource, base http.RoundTripper, 
 		// entry another strategy wrote under a similar key can never be served here.
 		ref, err := parseECRPath(rest)
 		if err != nil {
+			if tag, ok := parseECRTagPath(rest); ok && s.allowed(tag.name) && s.tagAllowed(tag.name) {
+				kind = ecrKindTag
+				s.serveTag(rw, r, tag)
+				return
+			}
 			observation.refuse()
 			http.Error(rw, err.Error()+": only /v2/<name>/manifests/sha256:<digest> and /v2/<name>/blobs/sha256:<digest> are served", http.StatusNotFound)
 			return
@@ -360,7 +389,7 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		raw := resp.Header.Get("Location")
 		location, err := url.Parse(raw)
 		if err != nil || location.Scheme != schemeHTTPS || location.Host == "" {
-			s.blobFailure(w, r, ecrFailureBadRedirect, "ECR blob redirect is not an absolute https URL", resp.StatusCode)
+			s.upstreamFailure(w, r, ecrFailureBadRedirect, "ECR blob redirect is not an absolute https URL", resp.StatusCode)
 			return
 		}
 		// Copied verbatim: re-serializing could change the signed URL.
@@ -372,11 +401,11 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		s.serveInlineBlob(w, r, ref, resp)
 	case r.Method == http.MethodHead && resp.StatusCode == http.StatusOK:
 		if digest := resp.Header.Get("Docker-Content-Digest"); digest != ref.digest {
-			s.blobFailure(w, r, ecrFailureDigestMismatch, "ECR reported a different digest for the blob", resp.StatusCode)
+			s.upstreamFailure(w, r, ecrFailureDigestMismatch, "ECR reported a different digest for the blob", resp.StatusCode)
 			return
 		}
 		if resp.ContentLength < 0 {
-			s.blobFailure(w, r, ecrFailureNoLength, "ECR blob HEAD has no Content-Length", resp.StatusCode)
+			s.upstreamFailure(w, r, ecrFailureNoLength, "ECR blob HEAD has no Content-Length", resp.StatusCode)
 			return
 		}
 		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
@@ -390,7 +419,7 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		}
 		http.Error(w, http.StatusText(resp.StatusCode), resp.StatusCode)
 	default:
-		s.blobFailure(w, r, ecrFailureUpstreamStatus, "unexpected ECR blob response", resp.StatusCode)
+		s.upstreamFailure(w, r, ecrFailureUpstreamStatus, "unexpected ECR blob response", resp.StatusCode)
 	}
 }
 
@@ -399,7 +428,7 @@ func (s *ECR) serveBlob(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 // never receives a partial or wrong blob. Nothing is cached.
 func (s *ECR) serveInlineBlob(w http.ResponseWriter, r *http.Request, ref ecrRef, resp *http.Response) {
 	if resp.ContentLength < 0 || resp.ContentLength > ecrInlineBlobLimit {
-		s.blobFailure(w, r, ecrFailureUpstreamStatus, "ECR answered a blob GET with bytes instead of a redirect", resp.StatusCode)
+		s.upstreamFailure(w, r, ecrFailureUpstreamStatus, "ECR answered a blob GET with bytes instead of a redirect", resp.StatusCode)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, ecrInlineBlobLimit+1))
@@ -409,7 +438,7 @@ func (s *ECR) serveInlineBlob(w http.ResponseWriter, r *http.Request, ref ecrRef
 	}
 	sum := sha256.Sum256(body)
 	if int64(len(body)) != resp.ContentLength || "sha256:"+hex.EncodeToString(sum[:]) != ref.digest {
-		s.blobFailure(w, r, ecrFailureDigestMismatch, "ECR returned blob bytes that do not match the digest", resp.StatusCode)
+		s.upstreamFailure(w, r, ecrFailureDigestMismatch, "ECR returned blob bytes that do not match the digest", resp.StatusCode)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -421,9 +450,80 @@ func (s *ECR) serveInlineBlob(w http.ResponseWriter, r *http.Request, ref ecrRef
 	}
 }
 
-// blobFailure logs the upstream status and answers 502. It never logs or echoes
-// the Location, which carries a presigned credential.
-func (s *ECR) blobFailure(w http.ResponseWriter, r *http.Request, reason ecrFailureReason, msg string, status int) {
+// serveTag resolves a tag manifest at ECR, which keeps a pull-through tag in
+// sync with its upstream, so nothing here can serve a tag staler than ECR's.
+// The upstream request is always a GET, even for a client HEAD: a GET performs
+// a pull-through repository's first import, and the body is needed to vouch
+// for the digest. The manifest is read whole and hashed before anything is
+// sent, and nothing is cached; the client then reads by digest, which is.
+func (s *ECR) serveTag(w http.ResponseWriter, r *http.Request, ref ecrRef) {
+	req, err := s.request(r.Context(), ref, http.MethodGet)
+	if err != nil {
+		writeECRError(err, w, r)
+		return
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		writeECRError(err, w, r)
+		return
+	}
+	defer func() {
+		io.CopyN(io.Discard, resp.Body, 2048) //nolint:errcheck,gosec // best effort
+		_ = resp.Body.Close()
+	}()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusTooManyRequests:
+		if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		http.Error(w, http.StatusText(resp.StatusCode), resp.StatusCode)
+		return
+	default:
+		s.upstreamFailure(w, r, ecrFailureUpstreamStatus, "unexpected ECR tag manifest response", resp.StatusCode)
+		return
+	}
+	mediaType := resp.Header.Get("Content-Type")
+	if !slices.Contains(ecrManifestTypes, mediaType) {
+		s.upstreamFailure(w, r, ecrFailureUpstreamStatus, "ECR answered a tag with an unsupported manifest type", resp.StatusCode)
+		return
+	}
+	if resp.ContentLength < 0 {
+		s.upstreamFailure(w, r, ecrFailureNoLength, "ECR tag manifest has no Content-Length", resp.StatusCode)
+		return
+	}
+	if resp.ContentLength == 0 || resp.ContentLength > ecrTagManifestLimit {
+		s.upstreamFailure(w, r, ecrFailureUpstreamStatus, "ECR tag manifest is empty or over the size limit", resp.StatusCode)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, ecrTagManifestLimit+1))
+	if err != nil {
+		writeECRError(errors.Errorf("%w: %s: read tag manifest: %w", errECRTransport, s.registry, err), w, r)
+		return
+	}
+	sum := sha256.Sum256(body)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	if reported := resp.Header.Get("Docker-Content-Digest"); int64(len(body)) != resp.ContentLength || (reported != "" && reported != digest) {
+		s.upstreamFailure(w, r, ecrFailureDigestMismatch, "ECR tag manifest bytes do not match their length or reported digest", resp.StatusCode)
+		return
+	}
+	w.Header().Set("Content-Type", mediaType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Docker-Content-Digest", digest)
+	// A tag can move; clients and intermediaries must resolve it again.
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if _, err := w.Write(body); err != nil {
+		logging.FromContext(r.Context()).DebugContext(r.Context(), "Failed to write ECR tag manifest", "error", err)
+	}
+}
+
+// upstreamFailure logs the upstream status and answers 502 with msg only. It
+// never logs or echoes a blob Location, which carries a presigned credential.
+func (s *ECR) upstreamFailure(w http.ResponseWriter, r *http.Request, reason ecrFailureReason, msg string, status int) {
 	ecrObservationFrom(r.Context()).fail(reason)
 	logging.FromContext(r.Context()).ErrorContext(r.Context(), msg, "registry", s.registry, "method", r.Method, "status", status)
 	http.Error(w, msg, http.StatusBadGateway)
@@ -562,10 +662,17 @@ func (s *ECR) String() string { return "ecr:" + s.registry }
 // allowed reports whether a client may read the repository. The role's IAM
 // scope is the boundary; a configured list narrows it further.
 func (s *ECR) allowed(name string) bool {
-	if len(s.repositories) == 0 {
-		return true
-	}
-	for _, repository := range s.repositories {
+	return len(s.repositories) == 0 || ecrRepositoryListed(s.repositories, name)
+}
+
+// tagAllowed reports whether a client may read the repository's manifests by
+// tag. Unlike repositories, an empty list allows none.
+func (s *ECR) tagAllowed(name string) bool {
+	return ecrRepositoryListed(s.tagRepositories, name)
+}
+
+func ecrRepositoryListed(repositories []string, name string) bool {
+	for _, repository := range repositories {
 		if strings.HasSuffix(repository, "/") {
 			if strings.HasPrefix(name, repository) {
 				return true
@@ -654,6 +761,9 @@ func servePing(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ecrRef names a manifest or blob. digest holds the reference ECR is asked
+// for: a sha256 digest, or a tag for tag manifests, which ecrFetch never
+// verifies against it.
 type ecrRef struct {
 	name   string
 	kind   string
@@ -666,6 +776,14 @@ func parseECRPath(rest string) (ecrRef, error) {
 		return ecrRef{}, errECRNotDigest
 	}
 	return ecrRef{name: m[1], kind: m[2], digest: m[3]}, nil
+}
+
+func parseECRTagPath(rest string) (ecrRef, bool) {
+	m := ecrTagPath.FindStringSubmatch(rest)
+	if m == nil {
+		return ecrRef{}, false
+	}
+	return ecrRef{name: m[1], kind: ecrTagManifests, digest: m[2]}, true
 }
 
 // request returns the upstream request for ref. Its context carries the token
@@ -685,13 +803,20 @@ func (s *ECR) request(ctx context.Context, ref ecrRef, method string) (*http.Req
 		return nil, httputil.Errorf(http.StatusBadGateway, "could not obtain ECR authorization")
 	}
 	fetch := &ecrFetch{registry: s.registry, repository: ref.name, digest: ref.digest, token: token, strategy: s}
-	if ref.kind == ecrManifests {
+	kind := ref.kind
+	switch ref.kind {
+	case ecrManifests:
 		fetch.accept = ecrManifestAccept
 		fetch.expiresAt = s.now().Add(s.manifestTTL)
-	} else {
+	case ecrTagManifests:
+		// serveTag reads the status and verifies the body itself.
+		fetch.accept = ecrManifestAccept
+		fetch.passthrough = true
+		kind = ecrManifests
+	default:
 		fetch.passthrough = true
 	}
-	target := schemeHTTPS + "://" + s.registry + "/v2/" + ref.name + "/" + ref.kind + "/" + ref.digest
+	target := schemeHTTPS + "://" + s.registry + "/v2/" + ref.name + "/" + kind + "/" + ref.digest
 	req, err := http.NewRequestWithContext(context.WithValue(ctx, ecrFetchKey{}, fetch), method, target, nil)
 	if err != nil {
 		return nil, httputil.Errorf(http.StatusInternalServerError, "create ECR request: %w", err)
