@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -131,18 +130,24 @@ type ECR struct {
 
 var _ Strategy = (*ECR)(nil)
 
-// ecrManifestTypes is every manifest type a digest can name, sent as Accept so
-// ECR returns the stored bytes rather than negotiating a conversion that would
-// not match the digest. They are also the only types a tag manifest is served as.
-var (
-	ecrManifestTypes = []string{
-		"application/vnd.oci.image.index.v1+json",
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.docker.distribution.manifest.list.v2+json",
-		"application/vnd.docker.distribution.manifest.v2+json",
-	}
-	ecrManifestAccept = strings.Join(ecrManifestTypes, ", ")
+// Every manifest type a digest can name, sent as Accept so ECR returns the
+// stored bytes rather than negotiating a conversion that would not match the
+// digest. They are also the only types a tag manifest is served as.
+const (
+	ecrOCIIndex       = "application/vnd.oci.image.index.v1+json"
+	ecrOCIManifest    = "application/vnd.oci.image.manifest.v1+json"
+	ecrDockerList     = "application/vnd.docker.distribution.manifest.list.v2+json"
+	ecrDockerManifest = "application/vnd.docker.distribution.manifest.v2+json"
+	ecrManifestAccept = ecrOCIIndex + ", " + ecrOCIManifest + ", " + ecrDockerList + ", " + ecrDockerManifest
 )
+
+func isECRManifestType(mediaType string) bool {
+	switch mediaType {
+	case ecrOCIIndex, ecrOCIManifest, ecrDockerList, ecrDockerManifest:
+		return true
+	}
+	return false
+}
 
 var (
 	// Repository names follow the OCI distribution grammar: lowercase
@@ -484,7 +489,7 @@ func (s *ECR) serveTag(w http.ResponseWriter, r *http.Request, ref ecrRef) {
 		return
 	}
 	mediaType := resp.Header.Get("Content-Type")
-	if !slices.Contains(ecrManifestTypes, mediaType) {
+	if !isECRManifestType(mediaType) {
 		s.upstreamFailure(w, r, ecrFailureUpstreamStatus, "ECR answered a tag with an unsupported manifest type", resp.StatusCode)
 		return
 	}

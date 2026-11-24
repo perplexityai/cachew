@@ -550,7 +550,7 @@ func setupECRTagTest(t *testing.T, configure func(*fakeECR)) *ecrTest {
 	t.Helper()
 	return setupECRTestConfig(t, configure, nil, ECRConfig{
 		Repositories:    []string{"ecr-public/buildkite/", "docker-hub/library/alpine"},
-		TagRepositories: []string{testECRName},
+		TagRepositories: []string{testECRName, "quay/org/app"},
 	})
 }
 
@@ -588,6 +588,7 @@ func TestECRServesTagsOnlyForTagRepositories(t *testing.T) {
 	for _, path := range []string{
 		"/v2/ecr-public/buildkite/other/manifests/latest",
 		"/v2/docker-hub/library/alpine/manifests/latest",
+		"/v2/quay/org/app/manifests/latest", // a tag repository outside repositories
 		"/v2/" + testECRName + "/manifests/.hidden",
 		"/v2/" + testECRName + "/tags/list",
 	} {
@@ -596,6 +597,18 @@ func TestECRServesTagsOnlyForTagRepositories(t *testing.T) {
 	}
 	registry, _ := e.fake.counts()
 	assert.Equal(t, 0, registry)
+}
+
+// A tag that does not exist yet is how clients detect a cache miss, such as an
+// artifact key nobody has published, so it must stay a 404 rather than a 502.
+func TestECRPassesTagMissesThrough(t *testing.T) {
+	e := setupECRTagTest(t, func(*fakeECR) {})
+	w := e.do(http.MethodHead, "/v2/"+testECRName+"/manifests/"+strings.Repeat("0", 64))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, ecrResultNotFound, e.metrics.requests[0].result)
+	w = e.do(http.MethodGet, "/v2/"+testECRName+"/manifests/"+strings.Repeat("0", 64))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.NotContains(t, w.Body.String(), "123456789012", "ECR's error body names the account")
 }
 
 func TestECRRefusesTagManifestsItCannotVouchFor(t *testing.T) {
