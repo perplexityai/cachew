@@ -97,7 +97,7 @@ type ECRConfig struct {
 	Registry            string        `hcl:"registry,label" help:"The ECR registry host, <account>.dkr.ecr.<region>.amazonaws.com."`
 	RoleARN             string        `hcl:"role-arn" help:"The read-only IAM role to assume for ECR pulls."`
 	Repositories        []string      `hcl:"repositories,optional" help:"Repository names clients may read, as defense in depth on top of the role's IAM scope: an entry ending in / is a prefix, any other entry is one repository. Empty serves every repository the role can read."`
-	TagRepositories     []string      `hcl:"tag-repositories,optional" help:"Repositories whose manifests may also be read by tag, in the form of repositories. Tag reads are resolved at ECR on every request and never cached. Empty serves digests only."`
+	TagRepositories     []string      `hcl:"tag-repositories,optional" help:"Repositories whose manifests may also be read by tag, in the form of repositories and covered by them when repositories is set. Tag reads are resolved at ECR on every request and never cached. Empty serves digests only."`
 	ManifestTTL         time.Duration `hcl:"manifest-ttl,optional" default:"72h" help:"How long a cached manifest is served. Keep it to days: cache hits never reach ECR, so lastRecordedPullTime goes stale and sinceImagePulled lifecycle rules could expire images still in use. Zero uses the default."`
 	CredentialTimeout   time.Duration `hcl:"credential-timeout,optional" default:"15s" help:"Maximum time to wait for ECR credential refresh, including a concurrent refresh. Zero uses the default."`
 	OriginHeaderTimeout time.Duration `hcl:"origin-header-timeout,optional" default:"60s" help:"Maximum time to wait for ECR response headers. A first pull through a pull-through rule imports the image before answering. Zero uses the default."`
@@ -228,6 +228,9 @@ func validateECRConfig(config ECRConfig) (string, error) {
 	for _, repository := range config.TagRepositories {
 		if !ecrRepositoryName.MatchString(strings.TrimSuffix(repository, "/")) {
 			return "", errors.Errorf("ecr %s: tag-repositories entry %q is not a repository name or a prefix ending in /", config.Registry, repository)
+		}
+		if len(config.Repositories) > 0 && !ecrRepositoryListed(config.Repositories, repository) {
+			return "", errors.Errorf("ecr %s: tag-repositories entry %q is not covered by repositories", config.Registry, repository)
 		}
 	}
 	if config.ManifestTTL < 0 || config.CredentialTimeout < 0 || config.OriginHeaderTimeout < 0 {

@@ -56,6 +56,7 @@ type fakeECR struct {
 	partial       bool   // answer manifest reads 206
 	manifestType  string // overrides the manifest Content-Type
 	manifestHead  string // a Docker-Content-Digest to send on manifest GETs, which ECR omits
+	manifestFail  int    // answer manifest reads with this error status
 	denyBody      string
 
 	mu             sync.Mutex
@@ -117,11 +118,17 @@ func (f *fakeECR) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// An upstream must not choose how long Cachew keeps an entry.
 		w.Header().Set("X-Cachew-Expires-At", "2999-01-01T00:00:00Z")
 		switch {
+		case f.manifestFail != 0:
+			w.WriteHeader(f.manifestFail)
+			return
 		case f.partial:
 			w.WriteHeader(http.StatusPartialContent)
 		case f.chunked:
 			w.WriteHeader(http.StatusOK)
 			w.(http.Flusher).Flush()
+		default:
+			// net/http only computes a length for small bodies.
+			w.Header().Set("Content-Length", strconv.Itoa(len(f.manifest)))
 		}
 		_, _ = w.Write(f.manifest)
 	case f.missingRepo:
@@ -550,7 +557,7 @@ func setupECRTagTest(t *testing.T, configure func(*fakeECR)) *ecrTest {
 	t.Helper()
 	return setupECRTestConfig(t, configure, nil, ECRConfig{
 		Repositories:    []string{"ecr-public/buildkite/", "docker-hub/library/alpine"},
-		TagRepositories: []string{testECRName, "quay/org/app"},
+		TagRepositories: []string{testECRName},
 	})
 }
 
@@ -588,7 +595,6 @@ func TestECRServesTagsOnlyForTagRepositories(t *testing.T) {
 	for _, path := range []string{
 		"/v2/ecr-public/buildkite/other/manifests/latest",
 		"/v2/docker-hub/library/alpine/manifests/latest",
-		"/v2/quay/org/app/manifests/latest", // a tag repository outside repositories
 		"/v2/" + testECRName + "/manifests/.hidden",
 		"/v2/" + testECRName + "/tags/list",
 	} {
@@ -612,17 +618,25 @@ func TestECRPassesTagMissesThrough(t *testing.T) {
 }
 
 func TestECRRefusesTagManifestsItCannotVouchFor(t *testing.T) {
-	for name, configure := range map[string]func(*fakeECR){
-		"reported digest differs": func(f *fakeECR) { f.manifestHead = testDigest([]byte("other")) },
-		"not a manifest type":     func(f *fakeECR) { f.manifestType = "text/html" },
-		"no length":               func(f *fakeECR) { f.chunked = true },
+	for name, tc := range map[string]struct {
+		configure func(*fakeECR)
+		reason    ecrFailureReason
+	}{
+		"reported digest differs": {func(f *fakeECR) { f.manifestHead = testDigest([]byte("other")) }, ecrFailureDigestMismatch},
+		"not a manifest type":     {func(f *fakeECR) { f.manifestType = "text/html" }, ecrFailureUpstreamStatus},
+		"no length":               {func(f *fakeECR) { f.chunked = true }, ecrFailureNoLength},
+		"empty":                   {func(f *fakeECR) { f.manifest = []byte{} }, ecrFailureUpstreamStatus},
+		"over the size limit": {func(f *fakeECR) {
+			f.manifest = append([]byte(`{"schemaVersion":2,"pad":"`), make([]byte, ecrTagManifestLimit)...)
+		}, ecrFailureUpstreamStatus},
+		"upstream error": {func(f *fakeECR) { f.manifestFail = http.StatusServiceUnavailable }, ecrFailureUpstreamStatus},
 	} {
 		t.Run(name, func(t *testing.T) {
-			e := setupECRTagTest(t, configure)
+			e := setupECRTagTest(t, tc.configure)
 			w := e.do(http.MethodGet, "/v2/"+testECRName+"/manifests/latest")
 			assert.Equal(t, http.StatusBadGateway, w.Code)
 			assert.NotContains(t, w.Body.String(), "schemaVersion")
-			assert.Equal(t, ecrResultFailure, e.metrics.requests[0].result)
+			assert.Equal(t, ecrRequestOutcome{kind: ecrKindTag, method: http.MethodGet, result: ecrResultFailure, reason: tc.reason}, e.metrics.requests[0])
 		})
 	}
 }
@@ -851,6 +865,8 @@ func TestECRRejectsBadConfig(t *testing.T) {
 		{Registry: testECRRegistry, RoleARN: role, Repositories: []string{"/"}},
 		{Registry: testECRRegistry, RoleARN: role, Repositories: []string{"Upper/"}},
 		{Registry: testECRRegistry, RoleARN: role, TagRepositories: []string{"ghcr/Org/"}},
+		{Registry: testECRRegistry, RoleARN: role, Repositories: []string{"ghcr/org/"}, TagRepositories: []string{"quay/org/app"}},
+		{Registry: testECRRegistry, RoleARN: role, Repositories: []string{"ghcr/org/app"}, TagRepositories: []string{"ghcr/org/"}},
 		{Registry: testECRRegistry, RoleARN: role, ManifestTTL: -time.Hour},
 	} {
 		_, err := validateECRConfig(config)
@@ -859,8 +875,14 @@ func TestECRRejectsBadConfig(t *testing.T) {
 	region, err := validateECRConfig(ECRConfig{Registry: testECRRegistry, RoleARN: role})
 	assert.NoError(t, err, "repositories is optional")
 	assert.Equal(t, "us-east-1", region)
-	_, err = validateECRConfig(ECRConfig{Registry: testECRRegistry, RoleARN: role, Repositories: []string{"ecr-public/", "base/alpine"}})
+	_, err = validateECRConfig(ECRConfig{
+		Registry: testECRRegistry, RoleARN: role,
+		Repositories:    []string{"ecr-public/", "base/alpine"},
+		TagRepositories: []string{"ecr-public/buildkite/", "ecr-public/org/app", "base/alpine"},
+	})
 	assert.NoError(t, err)
+	_, err = validateECRConfig(ECRConfig{Registry: testECRRegistry, RoleARN: role, TagRepositories: []string{"quay/org/app"}})
+	assert.NoError(t, err, "without repositories, every repository the role can read is served")
 }
 
 type fakeECRAuthorization struct {
